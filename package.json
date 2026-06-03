@@ -1,0 +1,46 @@
+{
+  "name": "sanctum-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.4.0",
+  "pnpm": {
+    "onlyBuiltDependencies": ["argon2", "esbuild"]
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node dist/server.js",
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:seed": "tsc -p tsconfig.json && node dist/seed.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.65.0",
+    "@libsql/client": "0.17.3",
+    "argon2": "0.44.0",
+    "cloudinary": "2.10.0",
+    "cookie-parser": "1.4.7",
+    "cors": "2.8.5",
+    "dotenv": "17.2.3",
+    "drizzle-orm": "0.45.2",
+    "express": "5.2.1",
+    "express-rate-limit": "8.2.1",
+    "helmet": "8.1.0",
+    "jose": "6.2.3",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/cookie-parser": "1.4.9",
+    "@types/cors": "2.8.19",
+    "@types/express": "5.0.3",
+    "@types/node": "24.10.1",
+    "drizzle-kit": "0.31.10",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3"
+  }
+}

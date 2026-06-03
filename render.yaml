@@ -1,0 +1,45 @@
+# Render Blueprint for the Sanctum backend (Express 5 + Turso).
+# Deploy: Render Dashboard → New → Blueprint → connect this repo,
+# OR via the Render API/CLI. Secret values are marked sync:false and
+# must be set in the Render dashboard / API (never committed here).
+services:
+  - type: web
+    name: sanctum-backend
+    runtime: node
+    region: singapore
+    plan: free
+    branch: main
+    autoDeploy: true
+    buildCommand: corepack enable && pnpm install --no-frozen-lockfile && pnpm run build
+    startCommand: node dist/server.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: TABLE_PREFIX
+        value: sanctum_
+      - key: AI_PROVIDER
+        value: gemini
+      - key: GEMINI_MODEL
+        value: gemini-flash-latest
+      # ---- secrets / per-environment (set in dashboard or via API) ----
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
+      - key: JWT_ACCESS_SECRET
+        sync: false
+      - key: JWT_REFRESH_SECRET
+        sync: false
+      - key: VAULT_ENC_KEY
+        sync: false
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: FRONTEND_ORIGIN
+        sync: false
