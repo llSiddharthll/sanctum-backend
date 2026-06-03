@@ -4,9 +4,6 @@
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.4.0",
-  "pnpm": {
-    "onlyBuiltDependencies": ["argon2", "esbuild"]
-  },
   "engines": {
     "node": ">=24"
   },

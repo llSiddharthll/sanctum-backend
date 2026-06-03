@@ -1,6 +1,5 @@
-allowBuilds:
-  argon2: set this to true or false
-  esbuild: set this to true or false
+# pnpm 10+/11 reads settings from here (not package.json's "pnpm" field).
+# Approve native build scripts so argon2 (native binding) + esbuild build on install.
 onlyBuiltDependencies:
   - argon2
   - esbuild
