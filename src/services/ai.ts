@@ -358,3 +358,385 @@ export async function generateMonth(
   if (gemini) return gemini;
   return fallbackMonth(input);
 }
+
+// ===========================================================================
+//  Agency-level AI assistant (documents, chat, task breakdown)
+//
+//  These reuse the same Gemini REST endpoint + model as generateMonth and the
+//  same "never throw" philosophy: every public function below resolves to a
+//  sensible result even when GEMINI_API_KEY is missing or the call fails,
+//  using local templates / canned replies as the fallback.
+// ===========================================================================
+
+/**
+ * Low-level single-turn Gemini text call. Returns the model's plain-text
+ * output, or `null` to signal the caller should use its fallback. Never throws.
+ *
+ * `system` is sent via systemInstruction; `contents` is the multi-turn history
+ * (user/model parts). For a single prompt, pass one user turn.
+ */
+async function callGeminiText(opts: {
+  system?: string;
+  contents: Array<{ role: 'user' | 'model'; text: string }>;
+}): Promise<string | null> {
+  if (!aiEnabled || !env.GEMINI_API_KEY || env.AI_PROVIDER !== 'gemini') {
+    return null;
+  }
+
+  const model = env.GEMINI_MODEL;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    model,
+  )}:generateContent`;
+
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'X-goog-api-key': env.GEMINI_API_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        ...(opts.system
+          ? { systemInstruction: { parts: [{ text: opts.system }] } }
+          : {}),
+        contents: opts.contents.map((c) => ({
+          role: c.role,
+          parts: [{ text: c.text }],
+        })),
+      }),
+    });
+
+    if (!resp.ok) return null;
+
+    const json = (await resp.json()) as GeminiResponse;
+    const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (typeof text !== 'string' || !text.trim()) return null;
+    return text;
+  } catch {
+    return null;
+  }
+}
+
+/** Strip a leading/trailing markdown code fence (```lang ... ```) if present. */
+function stripCodeFences(text: string): string {
+  return text
+    .trim()
+    .replace(/^```(?:json|markdown|md)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+}
+
+// ---------------------------------------------------------------------------
+//  Document generation
+// ---------------------------------------------------------------------------
+
+export const DOCUMENT_TYPES = [
+  'sop',
+  'proposal',
+  'report',
+  'handover',
+  'process_guide',
+  'brief',
+  'email',
+] as const;
+export type DocumentType = (typeof DOCUMENT_TYPES)[number];
+
+export interface GenerateDocumentInput {
+  type: DocumentType;
+  title?: string;
+  context: string;
+}
+
+export interface GenerateDocumentResult {
+  title: string;
+  /** Markdown body. */
+  content: string;
+  source: 'gemini' | 'fallback';
+}
+
+const DOCUMENT_LABELS: Record<DocumentType, string> = {
+  sop: 'Standard Operating Procedure',
+  proposal: 'Client Proposal',
+  report: 'Report',
+  handover: 'Handover Document',
+  process_guide: 'Process Guide',
+  brief: 'Creative / Project Brief',
+  email: 'Email',
+};
+
+function defaultDocTitle(input: GenerateDocumentInput): string {
+  if (input.title && input.title.trim()) return input.title.trim();
+  return DOCUMENT_LABELS[input.type];
+}
+
+/** Section headings appropriate to each document type, used for the prompt + fallback. */
+const DOCUMENT_SECTIONS: Record<DocumentType, string[]> = {
+  sop: ['Purpose', 'Scope', 'Roles & Responsibilities', 'Procedure', 'Tools & Resources', 'Review & Revision'],
+  proposal: ['Overview', 'Objectives', 'Scope of Work', 'Deliverables', 'Timeline', 'Investment', 'Next Steps'],
+  report: ['Summary', 'Key Metrics', 'Highlights', 'Challenges', 'Recommendations', 'Next Steps'],
+  handover: ['Overview', 'Current Status', 'Key Contacts', 'Accounts & Access', 'Open Items', 'Notes'],
+  process_guide: ['Overview', 'Prerequisites', 'Step-by-Step', 'Best Practices', 'Troubleshooting'],
+  brief: ['Background', 'Objectives', 'Target Audience', 'Key Message', 'Deliverables', 'Timeline', 'Success Metrics'],
+  email: ['Subject', 'Body', 'Call to Action'],
+};
+
+function buildDocumentPrompt(input: GenerateDocumentInput): string {
+  const label = DOCUMENT_LABELS[input.type];
+  const sections = DOCUMENT_SECTIONS[input.type];
+  return [
+    `You are a senior marketing-agency operator. Write a clear, professional ${label} in GitHub-flavored Markdown.`,
+    input.title ? `Document title: ${input.title}.` : '',
+    `Context / brief from the user:\n${input.context}`,
+    '',
+    `Structure the document with a top-level "# " heading and these sections (use "## " for each, adapt as needed): ${sections.join(', ')}.`,
+    'Be specific and actionable. Use bullet lists and tables where helpful.',
+    'Respond with ONLY the Markdown document — no code fences, no preamble, no explanation.',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+/** Deterministic markdown template used when no AI is available. */
+function fallbackDocument(input: GenerateDocumentInput): GenerateDocumentResult {
+  const title = defaultDocTitle(input);
+  const label = DOCUMENT_LABELS[input.type];
+  const sections = DOCUMENT_SECTIONS[input.type];
+  const ctx = input.context.trim();
+
+  const lines: string[] = [`# ${title}`, '', `_${label}_`, ''];
+  for (const section of sections) {
+    lines.push(`## ${section}`, '');
+    if (section === 'Subject') {
+      lines.push(title, '');
+    } else if (
+      section === 'Overview' ||
+      section === 'Summary' ||
+      section === 'Background' ||
+      section === 'Purpose' ||
+      section === 'Body'
+    ) {
+      lines.push(ctx || '_Add details here._', '');
+    } else {
+      lines.push('- _Add details here._', '');
+    }
+  }
+  return { title, content: lines.join('\n').trim() + '\n', source: 'fallback' };
+}
+
+/**
+ * Generate a markdown document of the given type. Tries Gemini, falls back to a
+ * structured template. NEVER throws.
+ */
+export async function generateDocument(
+  input: GenerateDocumentInput,
+): Promise<GenerateDocumentResult> {
+  const text = await callGeminiText({
+    contents: [{ role: 'user', text: buildDocumentPrompt(input) }],
+  });
+  if (text && text.trim()) {
+    return {
+      title: defaultDocTitle(input),
+      content: stripCodeFences(text),
+      source: 'gemini',
+    };
+  }
+  return fallbackDocument(input);
+}
+
+// ---------------------------------------------------------------------------
+//  Chat
+// ---------------------------------------------------------------------------
+
+export interface ChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+export interface ChatInput {
+  /** Pre-built grounding context (agency / projects / clients summary). */
+  systemContext: string;
+  messages: ChatMessage[];
+}
+
+export interface ChatResult {
+  reply: string;
+  source: 'gemini' | 'fallback';
+}
+
+/**
+ * Single request/response chat (no streaming). Grounds the model with the
+ * provided system context, then replays the message history. Falls back to a
+ * helpful canned reply when no AI is available. NEVER throws.
+ */
+export async function generateChatReply(
+  input: ChatInput,
+): Promise<ChatResult> {
+  const history = input.messages.map((m) => ({
+    role: (m.role === 'assistant' ? 'model' : 'user') as 'user' | 'model',
+    text: m.content,
+  }));
+
+  const text = await callGeminiText({
+    system: [
+      'You are Sanctum AI, an assistant embedded in a marketing-agency management tool.',
+      'Answer concisely and helpfully using the agency context below. If the context lacks the answer, say so and suggest next steps.',
+      '',
+      input.systemContext,
+    ].join('\n'),
+    contents: history.length
+      ? history
+      : [{ role: 'user', text: 'Hello' }],
+  });
+
+  if (text && text.trim()) {
+    return { reply: text.trim(), source: 'gemini' };
+  }
+
+  // Fallback: acknowledge the last user message with a useful canned reply.
+  const lastUser = [...input.messages]
+    .reverse()
+    .find((m) => m.role === 'user');
+  const reply = lastUser
+    ? `AI is not configured on this server, so I can't generate a live answer right now. You asked: "${lastUser.content.slice(0, 280)}". Once a GEMINI_API_KEY is set I can answer using your agency, project, and client context.`
+    : 'AI is not configured on this server. Set a GEMINI_API_KEY to enable the assistant.';
+  return { reply, source: 'fallback' };
+}
+
+// ---------------------------------------------------------------------------
+//  Task breakdown
+// ---------------------------------------------------------------------------
+
+export interface BreakdownTaskSuggestion {
+  title: string;
+  status?: string;
+}
+export interface BreakdownMilestoneSuggestion {
+  title: string;
+  tasks: BreakdownTaskSuggestion[];
+}
+export interface TaskBreakdownResult {
+  milestones: BreakdownMilestoneSuggestion[];
+  source: 'gemini' | 'fallback';
+}
+
+export interface TaskBreakdownInput {
+  projectName: string;
+  projectDescription?: string | null;
+  prompt?: string;
+}
+
+const breakdownTaskSchema = z.object({
+  title: z.string(),
+  status: z.string().optional(),
+});
+const breakdownMilestoneSchema = z.object({
+  title: z.string(),
+  tasks: z.array(breakdownTaskSchema).optional(),
+});
+const breakdownSchema = z.object({
+  milestones: z.array(breakdownMilestoneSchema),
+});
+
+function buildBreakdownPrompt(input: TaskBreakdownInput): string {
+  return [
+    'You are a senior project manager at a marketing agency. Break the project below into a sensible set of milestones, each with a few concrete tasks.',
+    `Project name: ${input.projectName}.`,
+    input.projectDescription
+      ? `Project description: ${input.projectDescription}.`
+      : '',
+    input.prompt ? `Additional guidance: ${input.prompt}.` : '',
+    '',
+    'Allowed task status values: backlog, todo, in_progress, in_review, done. Default new tasks to "todo".',
+    'Respond with ONLY a raw JSON object — no markdown fences, no prose — of this exact shape:',
+    '{',
+    '  "milestones": [',
+    '    { "title": string, "tasks": [ { "title": string, "status": one of the allowed values } ] }',
+    '  ]',
+    '}',
+    'Produce 3-5 milestones with 2-5 tasks each.',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+/** A sensible generic agency project breakdown used when AI is unavailable. */
+function fallbackBreakdown(): TaskBreakdownResult {
+  return {
+    source: 'fallback',
+    milestones: [
+      {
+        title: 'Discovery',
+        tasks: [
+          { title: 'Kickoff call & requirements gathering', status: 'todo' },
+          { title: 'Audit current assets & accounts', status: 'todo' },
+          { title: 'Define goals & success metrics', status: 'todo' },
+        ],
+      },
+      {
+        title: 'Production',
+        tasks: [
+          { title: 'Draft strategy & content plan', status: 'todo' },
+          { title: 'Create deliverables', status: 'todo' },
+          { title: 'Internal QA pass', status: 'todo' },
+        ],
+      },
+      {
+        title: 'Review',
+        tasks: [
+          { title: 'Share with client for feedback', status: 'todo' },
+          { title: 'Incorporate revisions', status: 'todo' },
+        ],
+      },
+      {
+        title: 'Launch',
+        tasks: [
+          { title: 'Publish / hand off deliverables', status: 'todo' },
+          { title: 'Post-launch report', status: 'todo' },
+        ],
+      },
+    ],
+  };
+}
+
+/**
+ * Propose a milestone/task breakdown for a project. Tries Gemini (robust JSON
+ * parse), falls back to a default breakdown. NEVER throws. Does NOT persist —
+ * the route is responsible for creating rows.
+ */
+export async function generateTaskBreakdown(
+  input: TaskBreakdownInput,
+): Promise<TaskBreakdownResult> {
+  const text = await callGeminiText({
+    contents: [{ role: 'user', text: buildBreakdownPrompt(input) }],
+  });
+  if (text && text.trim()) {
+    const cleaned = stripCodeFences(text);
+    const first = cleaned.indexOf('{');
+    const last = cleaned.lastIndexOf('}');
+    if (first !== -1 && last > first) {
+      try {
+        const parsed = JSON.parse(cleaned.slice(first, last + 1));
+        const validated = breakdownSchema.safeParse(parsed);
+        if (validated.success && validated.data.milestones.length) {
+          const milestones = validated.data.milestones
+            .filter((m) => m.title.trim())
+            .map((m) => ({
+              title: m.title.trim(),
+              tasks: (m.tasks ?? [])
+                .filter((tk) => tk.title.trim())
+                .map((tk) => ({
+                  title: tk.title.trim(),
+                  status: tk.status,
+                })),
+            }));
+          if (milestones.length) {
+            return { milestones, source: 'gemini' };
+          }
+        }
+      } catch {
+        // fall through to fallback
+      }
+    }
+  }
+  return fallbackBreakdown();
+}

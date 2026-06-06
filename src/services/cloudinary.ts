@@ -71,7 +71,7 @@ export function signUpload(params: SignParams): SignedUpload {
 /** Best-effort delete of an asset (used on media/post removal). */
 export async function destroyAsset(
   publicId: string,
-  resourceType: 'image' | 'video',
+  resourceType: 'image' | 'raw' | 'video',
 ): Promise<void> {
   try {
     await cloudinary.uploader.destroy(publicId, {
@@ -80,6 +80,51 @@ export async function destroyAsset(
   } catch {
     // non-fatal — reconciliation can clean up later
   }
+}
+
+export interface DocumentSignParams {
+  agencyId: string;
+  folder: string;
+}
+
+export interface SignedDocumentUpload {
+  cloudName: string;
+  apiKey: string;
+  timestamp: number;
+  signature: string;
+  folder: string;
+}
+
+/**
+ * Build a Cloudinary signed-upload payload for the Documents hub. The folder is
+ * supplied by the caller (forced server-side to a tenant path) and signed
+ * together with the timestamp — EXACTLY the same scheme as signUpload() above.
+ * The browser POSTs the file + these params directly to Cloudinary's
+ * /auto/upload endpoint.
+ */
+export function signDocumentUpload(
+  params: DocumentSignParams,
+): SignedDocumentUpload {
+  const timestamp = Math.floor(Date.now() / 1000);
+
+  // Parameters that are signed must match exactly what the client sends.
+  const paramsToSign: Record<string, string | number> = {
+    folder: params.folder,
+    timestamp,
+  };
+
+  const signature = cloudinary.utils.api_sign_request(
+    paramsToSign,
+    env.CLOUDINARY_API_SECRET,
+  );
+
+  return {
+    cloudName: env.CLOUDINARY_CLOUD_NAME,
+    apiKey: env.CLOUDINARY_API_KEY,
+    timestamp,
+    signature,
+    folder: params.folder,
+  };
 }
 
 export { cloudinary };

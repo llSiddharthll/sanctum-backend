@@ -8,6 +8,55 @@
       "when": 1780423252691,
       "tag": "0000_wooden_daredevil",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1780692600467,
+      "tag": "0001_yummy_killer_shrike",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1780693706842,
+      "tag": "0002_melted_xorn",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1780766119147,
+      "tag": "0003_ambiguous_george_stacy",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1780769612476,
+      "tag": "0004_nifty_lucky_pierre",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1780771343233,
+      "tag": "0005_faulty_famine",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1780773273610,
+      "tag": "0006_fantastic_colonel_america",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1780774934501,
+      "tag": "0007_smart_gabe_jones",
+      "breakpoints": true
     }
   ]
 }

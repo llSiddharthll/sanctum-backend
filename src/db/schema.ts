@@ -2,6 +2,7 @@ import {
   sqliteTable,
   text,
   integer,
+  real,
   blob,
   uniqueIndex,
   index,
@@ -100,6 +101,13 @@ export const users = sqliteTable(
     status: text('status', { enum: ['active', 'disabled'] })
       .notNull()
       .default('active'),
+    // ---- HR / profile fields ----
+    designation: text('designation'),
+    department: text('department'),
+    phone: text('phone'),
+    hourlyRate: integer('hourly_rate'), // paise, nullable
+    weeklyCapacityHrs: integer('weekly_capacity_hrs').notNull().default(40),
+    skills: text('skills'), // comma-separated
     lastLoginAt: ts('last_login_at'),
     createdAt: ts('created_at').notNull().default(now),
     updatedAt: ts('updated_at').notNull().default(now),
@@ -164,6 +172,35 @@ export const clients = sqliteTable(
     status: text('status', { enum: ['active', 'archived'] })
       .notNull()
       .default('active'),
+    // ---- Agency-CRM fields ----
+    industry: text('industry'),
+    website: text('website'),
+    phoneCc: text('phone_cc'), // dial code e.g. '+91'
+    phone: text('phone'),
+    clientSource: text('client_source', {
+      enum: [
+        'referral',
+        'inbound',
+        'outbound',
+        'social',
+        'event',
+        'agency_network',
+        'other',
+      ],
+    }),
+    gstNumber: text('gst_number'),
+    paymentTermsDays: integer('payment_terms_days'),
+    billingAddress: text('billing_address'),
+    billingState: text('billing_state'),
+    billingCity: text('billing_city'),
+    billingPincode: text('billing_pincode'),
+    relationshipHealth: text('relationship_health', {
+      enum: ['excellent', 'good', 'at_risk', 'poor'],
+    })
+      .notNull()
+      .default('good'),
+    nextFollowUpAt: ts('next_follow_up_at'),
+    internalNotes: text('internal_notes'),
     portalVisibleStatuses: text('portal_visible_statuses')
       .notNull()
       .default('pending_approval,approved,scheduled,posted'),
@@ -536,6 +573,544 @@ export const auditLog = sqliteTable(
   ],
 );
 
+// ============================================================
+//  PROJECTS (client engagements / deliverables)
+// ============================================================
+export const projects = sqliteTable(
+  t('projects'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    clientId: text('client_id')
+      .notNull()
+      .references(() => clients.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    description: text('description'),
+    type: text('type', {
+      enum: ['fixed_price', 'retainer', 'hourly', 'milestone_based'],
+    })
+      .notNull()
+      .default('fixed_price'),
+    status: text('status', {
+      enum: ['planning', 'active', 'on_hold', 'completed', 'cancelled'],
+    })
+      .notNull()
+      .default('planning'),
+    health: text('health', {
+      enum: ['on_track', 'at_risk', 'off_track'],
+    })
+      .notNull()
+      .default('on_track'),
+    contractValue: integer('contract_value').default(0),
+    currency: text('currency').notNull().default('INR'),
+    startDate: ts('start_date'),
+    deadline: ts('deadline'),
+    createdBy: text('created_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [
+    index('ix_projects_agency').on(tbl.agencyId),
+    index('ix_projects_agency_client').on(tbl.agencyId, tbl.clientId),
+    index('ix_projects_agency_status').on(tbl.agencyId, tbl.status),
+  ],
+);
+
+// ============================================================
+//  PROJECT_TASKS (kanban items under a project)
+// ============================================================
+export const projectTasks = sqliteTable(
+  t('project_tasks'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    projectId: text('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    // Optional link to a milestone in the SAME project. Cleared (set null)
+    // if the milestone is deleted so a task is never orphaned to a stale id.
+    milestoneId: text('milestone_id').references(
+      () => projectMilestones.id,
+      { onDelete: 'set null' },
+    ),
+    title: text('title').notNull(),
+    description: text('description'),
+    status: text('status', {
+      enum: ['backlog', 'todo', 'in_progress', 'in_review', 'done'],
+    })
+      .notNull()
+      .default('todo'),
+    assigneeId: text('assignee_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    dueDate: ts('due_date'),
+    position: integer('position').notNull().default(0),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [
+    index('ix_tasks_agency_project').on(tbl.agencyId, tbl.projectId),
+    index('ix_tasks_agency_project_status').on(
+      tbl.agencyId,
+      tbl.projectId,
+      tbl.status,
+    ),
+    index('ix_tasks_agency_project_milestone').on(
+      tbl.agencyId,
+      tbl.projectId,
+      tbl.milestoneId,
+    ),
+  ],
+);
+
+// ============================================================
+//  PROJECT_MILESTONES (dated checkpoints under a project)
+// ============================================================
+export const projectMilestones = sqliteTable(
+  t('project_milestones'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    projectId: text('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    title: text('title').notNull(),
+    description: text('description'),
+    dueDate: ts('due_date'),
+    status: text('status', {
+      enum: ['pending', 'completed'],
+    })
+      .notNull()
+      .default('pending'),
+    completedAt: ts('completed_at'),
+    position: integer('position').notNull().default(0),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [
+    index('ix_milestones_agency_project').on(tbl.agencyId, tbl.projectId),
+  ],
+);
+
+// ============================================================
+//  PROJECT_MEMBERS (M:N users <-> projects)
+// ============================================================
+export const projectMembers = sqliteTable(
+  t('project_members'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    projectId: text('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    role: text('role'),
+    createdAt: ts('created_at').notNull().default(now),
+  },
+  (tbl) => [
+    uniqueIndex('ux_project_members_project_user').on(
+      tbl.projectId,
+      tbl.userId,
+    ),
+    index('ix_project_members_agency_project').on(
+      tbl.agencyId,
+      tbl.projectId,
+    ),
+  ],
+);
+
+// ============================================================
+//  TIME_LOGS (per-user worklog entries; minutes against project/task)
+// ============================================================
+export const timeLogs = sqliteTable(
+  t('time_logs'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    projectId: text('project_id').references(() => projects.id, {
+      onDelete: 'set null',
+    }),
+    taskId: text('task_id').references(() => projectTasks.id, {
+      onDelete: 'set null',
+    }),
+    minutes: integer('minutes').notNull(),
+    workDate: ts('work_date').notNull(),
+    note: text('note'),
+    createdAt: ts('created_at').notNull().default(now),
+  },
+  (tbl) => [
+    index('ix_time_logs_agency_user_date').on(
+      tbl.agencyId,
+      tbl.userId,
+      tbl.workDate,
+    ),
+  ],
+);
+
+// ============================================================
+//  INVOICES (financial documents; money stored as INTEGER PAISE)
+//  ₹1 = 100 paise. status: draft|sent|partially_paid|paid|cancelled.
+//  'overdue' is DERIVED in the serializer, never stored.
+// ============================================================
+export const invoices = sqliteTable(
+  t('invoices'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    // restrict: financial records must not vanish if a client is removed.
+    clientId: text('client_id')
+      .notNull()
+      .references(() => clients.id, { onDelete: 'restrict' }),
+    projectId: text('project_id').references(() => projects.id, {
+      onDelete: 'set null',
+    }),
+    invoiceNumber: text('invoice_number'),
+    status: text('status', {
+      enum: ['draft', 'sent', 'partially_paid', 'paid', 'cancelled'],
+    })
+      .notNull()
+      .default('draft'),
+    issueDate: ts('issue_date'),
+    dueDate: ts('due_date'),
+    isInterstate: integer('is_interstate', { mode: 'boolean' })
+      .notNull()
+      .default(false),
+    currency: text('currency').notNull().default('INR'),
+    // ---- All money fields are INTEGER PAISE ----
+    subtotal: integer('subtotal').notNull().default(0),
+    taxTotal: integer('tax_total').notNull().default(0),
+    cgst: integer('cgst').notNull().default(0),
+    sgst: integer('sgst').notNull().default(0),
+    igst: integer('igst').notNull().default(0),
+    total: integer('total').notNull().default(0),
+    notes: text('notes'),
+    terms: text('terms'),
+    bankDetails: text('bank_details'),
+    createdBy: text('created_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [
+    uniqueIndex('ux_invoices_agency_number').on(
+      tbl.agencyId,
+      tbl.invoiceNumber,
+    ),
+    index('ix_invoices_agency').on(tbl.agencyId),
+    index('ix_invoices_agency_status').on(tbl.agencyId, tbl.status),
+    index('ix_invoices_agency_client').on(tbl.agencyId, tbl.clientId),
+    index('ix_invoices_agency_project').on(tbl.agencyId, tbl.projectId),
+  ],
+);
+
+// ============================================================
+//  INVOICE_ITEMS (line items; rate & amount in INTEGER PAISE)
+// ============================================================
+export const invoiceItems = sqliteTable(
+  t('invoice_items'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    invoiceId: text('invoice_id')
+      .notNull()
+      .references(() => invoices.id, { onDelete: 'cascade' }),
+    description: text('description').notNull(),
+    quantity: real('quantity').notNull().default(1),
+    unit: text('unit').notNull().default('piece'),
+    rate: integer('rate').notNull().default(0), // paise
+    gstRate: real('gst_rate').notNull().default(18),
+    amount: integer('amount').notNull().default(0), // paise = round(quantity*rate)
+    position: integer('position').notNull().default(0),
+    createdAt: ts('created_at').notNull().default(now),
+  },
+  (tbl) => [
+    index('ix_invoice_items_agency_invoice').on(tbl.agencyId, tbl.invoiceId),
+    index('ix_invoice_items_invoice').on(tbl.invoiceId),
+  ],
+);
+
+// ============================================================
+//  INVOICE_PAYMENTS (receipts against an invoice; amount in PAISE)
+// ============================================================
+export const invoicePayments = sqliteTable(
+  t('invoice_payments'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    invoiceId: text('invoice_id')
+      .notNull()
+      .references(() => invoices.id, { onDelete: 'cascade' }),
+    amount: integer('amount').notNull(), // paise
+    paidAt: ts('paid_at'),
+    method: text('method', {
+      enum: ['bank_transfer', 'upi', 'cash', 'card', 'cheque', 'other'],
+    })
+      .notNull()
+      .default('bank_transfer'),
+    reference: text('reference'),
+    notes: text('notes'),
+    recordedBy: text('recorded_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: ts('created_at').notNull().default(now),
+  },
+  (tbl) => [
+    index('ix_invoice_payments_agency_invoice').on(
+      tbl.agencyId,
+      tbl.invoiceId,
+    ),
+    index('ix_invoice_payments_agency_paid').on(tbl.agencyId, tbl.paidAt),
+  ],
+);
+
+// ============================================================
+//  EXPENSES (agency outgoings; amount & gstAmount in PAISE)
+// ============================================================
+export const expenses = sqliteTable(
+  t('expenses'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    projectId: text('project_id').references(() => projects.id, {
+      onDelete: 'set null',
+    }),
+    clientId: text('client_id').references(() => clients.id, {
+      onDelete: 'set null',
+    }),
+    category: text('category', {
+      enum: [
+        'software',
+        'salaries',
+        'marketing',
+        'travel',
+        'office',
+        'equipment',
+        'contractor',
+        'taxes',
+        'utilities',
+        'other',
+      ],
+    })
+      .notNull()
+      .default('other'),
+    amount: integer('amount').notNull(), // paise
+    description: text('description'),
+    expenseDate: ts('expense_date'),
+    receiptUrl: text('receipt_url'),
+    gstDeductible: integer('gst_deductible', { mode: 'boolean' })
+      .notNull()
+      .default(false),
+    gstAmount: integer('gst_amount'), // paise, nullable
+    loggedBy: text('logged_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [
+    index('ix_expenses_agency').on(tbl.agencyId),
+    index('ix_expenses_agency_category').on(tbl.agencyId, tbl.category),
+    index('ix_expenses_agency_date').on(tbl.agencyId, tbl.expenseDate),
+    index('ix_expenses_agency_project').on(tbl.agencyId, tbl.projectId),
+    index('ix_expenses_agency_client').on(tbl.agencyId, tbl.clientId),
+  ],
+);
+
+// ============================================================
+//  MESSAGE_THREADS (real-time conversations within an agency)
+// ============================================================
+export const messageThreads = sqliteTable(
+  t('message_threads'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    subject: text('subject').notNull(),
+    clientId: text('client_id').references(() => clients.id, {
+      onDelete: 'set null',
+    }),
+    projectId: text('project_id').references(() => projects.id, {
+      onDelete: 'set null',
+    }),
+    status: text('status', {
+      enum: ['open', 'awaiting', 'closed'],
+    })
+      .notNull()
+      .default('open'),
+    createdBy: text('created_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    lastMessageAt: ts('last_message_at'),
+    lastMessagePreview: text('last_message_preview'),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [
+    index('ix_threads_agency_last_message').on(
+      tbl.agencyId,
+      tbl.lastMessageAt,
+    ),
+  ],
+);
+
+// ============================================================
+//  THREAD_PARTICIPANTS (M:N users <-> threads; read cursors)
+// ============================================================
+export const threadParticipants = sqliteTable(
+  t('thread_participants'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    threadId: text('thread_id')
+      .notNull()
+      .references(() => messageThreads.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    lastReadAt: ts('last_read_at'),
+    createdAt: ts('created_at').notNull().default(now),
+  },
+  (tbl) => [
+    uniqueIndex('ux_thread_participants_thread_user').on(
+      tbl.threadId,
+      tbl.userId,
+    ),
+  ],
+);
+
+// ============================================================
+//  MESSAGES (persisted chat; Socket.IO is delivery-only)
+// ============================================================
+export const messages = sqliteTable(
+  t('messages'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    threadId: text('thread_id')
+      .notNull()
+      .references(() => messageThreads.id, { onDelete: 'cascade' }),
+    senderId: text('sender_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    body: text('body').notNull(),
+    createdAt: ts('created_at').notNull().default(now),
+    editedAt: ts('edited_at'),
+  },
+  (tbl) => [index('ix_messages_thread_created').on(tbl.threadId, tbl.createdAt)],
+);
+
+// ============================================================
+//  DOCUMENTS (file hub — Cloudinary-backed assets + metadata)
+// ============================================================
+export const documents = sqliteTable(
+  t('documents'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    category: text('category', {
+      enum: [
+        'contract',
+        'nda',
+        'proposal',
+        'deliverable',
+        'invoice',
+        'report',
+        'design',
+        'ai_generated',
+        'misc',
+      ],
+    })
+      .notNull()
+      .default('misc'),
+    clientId: text('client_id').references(() => clients.id, {
+      onDelete: 'set null',
+    }),
+    projectId: text('project_id').references(() => projects.id, {
+      onDelete: 'set null',
+    }),
+    fileUrl: text('file_url').notNull(),
+    publicId: text('public_id'),
+    resourceType: text('resource_type', {
+      enum: ['image', 'raw', 'video'],
+    })
+      .notNull()
+      .default('image'),
+    format: text('format'),
+    mimeType: text('mime_type'),
+    sizeBytes: integer('size_bytes').notNull().default(0),
+    clientVisible: integer('client_visible', { mode: 'boolean' })
+      .notNull()
+      .default(false),
+    uploadedBy: text('uploaded_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [index('ix_documents_agency_created').on(tbl.agencyId, tbl.createdAt)],
+);
+
+// ============================================================
+//  SHEETS (lightweight spreadsheets; data is a JSON string)
+// ============================================================
+export const sheets = sqliteTable(
+  t('sheets'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    title: text('title').notNull().default('Untitled Sheet'),
+    clientId: text('client_id').references(() => clients.id, {
+      onDelete: 'set null',
+    }),
+    projectId: text('project_id').references(() => projects.id, {
+      onDelete: 'set null',
+    }),
+    data: text('data').notNull().default('{}'),
+    createdBy: text('created_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [index('ix_sheets_agency_updated').on(tbl.agencyId, tbl.updatedAt)],
+);
+
 // ---- Inferred row types (handy across the app) ----
 export type Agency = typeof agencies.$inferSelect;
 export type User = typeof users.$inferSelect;
@@ -545,3 +1120,17 @@ export type PostMedia = typeof postMedia.$inferSelect;
 export type PortalToken = typeof portalTokens.$inferSelect;
 export type AiGeneration = typeof aiGenerations.$inferSelect;
 export type Plan = typeof plans.$inferSelect;
+export type Project = typeof projects.$inferSelect;
+export type ProjectTask = typeof projectTasks.$inferSelect;
+export type ProjectMilestone = typeof projectMilestones.$inferSelect;
+export type ProjectMember = typeof projectMembers.$inferSelect;
+export type TimeLog = typeof timeLogs.$inferSelect;
+export type Invoice = typeof invoices.$inferSelect;
+export type InvoiceItem = typeof invoiceItems.$inferSelect;
+export type InvoicePayment = typeof invoicePayments.$inferSelect;
+export type Expense = typeof expenses.$inferSelect;
+export type MessageThread = typeof messageThreads.$inferSelect;
+export type ThreadParticipant = typeof threadParticipants.$inferSelect;
+export type Message = typeof messages.$inferSelect;
+export type Document = typeof documents.$inferSelect;
+export type Sheet = typeof sheets.$inferSelect;

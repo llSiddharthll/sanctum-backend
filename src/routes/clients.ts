@@ -1,13 +1,17 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, count, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   agencies,
   clients,
   portalTokens,
   plans,
+  projects,
   subscriptions,
+  invoices,
+  invoicePayments,
+  documents,
 } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
 import { newId, newOpaqueToken } from '../lib/ids.js';
@@ -34,6 +38,21 @@ function serializeClient(c: typeof clients.$inferSelect) {
     handles: c.handlesJson ? safeJson(c.handlesJson) : null,
     contactEmail: c.contactEmail,
     status: c.status,
+    isActive: c.status === 'active',
+    industry: c.industry,
+    website: c.website,
+    phoneCc: c.phoneCc,
+    phone: c.phone,
+    clientSource: c.clientSource,
+    gstNumber: c.gstNumber,
+    paymentTermsDays: c.paymentTermsDays,
+    billingAddress: c.billingAddress,
+    billingState: c.billingState,
+    billingCity: c.billingCity,
+    billingPincode: c.billingPincode,
+    relationshipHealth: c.relationshipHealth,
+    nextFollowUpAt: toIso(c.nextFollowUpAt),
+    internalNotes: c.internalNotes,
     portalVisibleStatuses: c.portalVisibleStatuses.split(','),
     createdAt: toIso(c.createdAt),
     updatedAt: toIso(c.updatedAt),
@@ -74,6 +93,22 @@ clientsRouter.get('/', async (req, res) => {
   ok(res, rows.map(serializeClient));
 });
 
+const clientSourceEnum = z.enum([
+  'referral',
+  'inbound',
+  'outbound',
+  'social',
+  'event',
+  'agency_network',
+  'other',
+]);
+const relationshipHealthEnum = z.enum([
+  'excellent',
+  'good',
+  'at_risk',
+  'poor',
+]);
+
 // POST /clients — create (owner/admin), enforces plan client limit.
 const createSchema = z.object({
   name: z.string().min(1).max(120),
@@ -81,6 +116,23 @@ const createSchema = z.object({
   brandColor: z.string().max(20).optional(),
   handles: z.record(z.string(), z.string()).optional(),
   contactEmail: z.string().email().optional(),
+  // ---- Agency-CRM fields ----
+  industry: z.string().trim().max(120).optional(),
+  website: z.string().trim().max(255).optional(),
+  phoneCc: z.string().trim().max(8).optional(),
+  phone: z.string().trim().max(32).optional(),
+  clientSource: clientSourceEnum.optional(),
+  gstNumber: z.string().trim().max(32).optional(),
+  paymentTermsDays: z.number().int().min(0).optional(),
+  billingAddress: z.string().trim().max(500).optional(),
+  billingState: z.string().trim().max(120).optional(),
+  billingCity: z.string().trim().max(120).optional(),
+  billingPincode: z.string().trim().max(16).optional(),
+  relationshipHealth: relationshipHealthEnum.optional(),
+  nextFollowUpAt: z.coerce.date().optional(),
+  internalNotes: z.string().trim().max(5000).optional(),
+  // `isActive` toggle ('Active client' checkbox) maps to status.
+  isActive: z.boolean().optional(),
 });
 
 clientsRouter.post('/', requireRole('owner', 'admin'), async (req, res) => {
@@ -98,6 +150,27 @@ clientsRouter.post('/', requireRole('owner', 'admin'), async (req, res) => {
     brandColor: body.brandColor ?? null,
     handlesJson: body.handles ? JSON.stringify(body.handles) : null,
     contactEmail: body.contactEmail ?? null,
+    industry: body.industry ?? null,
+    website: body.website ?? null,
+    phoneCc: body.phoneCc ?? null,
+    phone: body.phone ?? null,
+    clientSource: body.clientSource ?? null,
+    gstNumber: body.gstNumber ?? null,
+    paymentTermsDays: body.paymentTermsDays ?? null,
+    billingAddress: body.billingAddress ?? null,
+    billingState: body.billingState ?? null,
+    billingCity: body.billingCity ?? null,
+    billingPincode: body.billingPincode ?? null,
+    // relationshipHealth has a NOT NULL default; omit to let the DB apply it.
+    ...(body.relationshipHealth !== undefined
+      ? { relationshipHealth: body.relationshipHealth }
+      : {}),
+    nextFollowUpAt: body.nextFollowUpAt ?? null,
+    internalNotes: body.internalNotes ?? null,
+    // 'Active client' toggle: isActive=true -> 'active', false -> 'archived'.
+    ...(body.isActive !== undefined
+      ? { status: body.isActive ? 'active' : 'archived' }
+      : {}),
   });
 
   await audit({
@@ -148,7 +221,64 @@ async function enforceClientLimit(agencyId: string): Promise<void> {
 clientsRouter.get('/:clientId', async (req, res) => {
   const ctx = getAuth(req);
   const client = await requireClientAccess(ctx, param(req, 'clientId'));
-  ok(res, serializeClient(client));
+  const [pc] = await db
+    .select({ value: count() })
+    .from(projects)
+    .where(
+      and(
+        eq(projects.agencyId, ctx.agencyId),
+        eq(projects.clientId, client.id),
+      ),
+    );
+
+  // invoiceCount = all of this client's invoices for the agency.
+  const [ic] = await db
+    .select({ value: count() })
+    .from(invoices)
+    .where(
+      and(
+        eq(invoices.agencyId, ctx.agencyId),
+        eq(invoices.clientId, client.id),
+      ),
+    );
+
+  // outstanding (paise) = Σ amountDue (total - paid) of this client's issued,
+  // not-fully-paid invoices (status sent | partially_paid).
+  const paidPerInvoiceSq = sql<number>`(
+    select coalesce(sum(${invoicePayments.amount}), 0) from ${invoicePayments}
+    where ${invoicePayments.invoiceId} = ${invoices.id}
+  )`;
+  const [out] = await db
+    .select({
+      value: sql<number>`coalesce(sum(${invoices.total} - ${paidPerInvoiceSq}), 0)`,
+    })
+    .from(invoices)
+    .where(
+      and(
+        eq(invoices.agencyId, ctx.agencyId),
+        eq(invoices.clientId, client.id),
+        inArray(invoices.status, ['sent', 'partially_paid']),
+      ),
+    );
+
+  // documentCount = all of this client's documents for the agency.
+  const [dc] = await db
+    .select({ value: count() })
+    .from(documents)
+    .where(
+      and(
+        eq(documents.agencyId, ctx.agencyId),
+        eq(documents.clientId, client.id),
+      ),
+    );
+
+  ok(res, {
+    ...serializeClient(client),
+    projectCount: pc?.value ?? 0,
+    invoiceCount: ic?.value ?? 0,
+    documentCount: dc?.value ?? 0,
+    outstanding: Number(out?.value ?? 0), // paise
+  });
 });
 
 // PATCH /clients/:clientId
@@ -169,7 +299,29 @@ clientsRouter.patch('/:clientId', async (req, res) => {
   if (body.handles !== undefined)
     patch.handlesJson = JSON.stringify(body.handles);
   if (body.contactEmail !== undefined) patch.contactEmail = body.contactEmail;
-  if (body.status !== undefined) patch.status = body.status;
+  if (body.industry !== undefined) patch.industry = body.industry;
+  if (body.website !== undefined) patch.website = body.website;
+  if (body.phoneCc !== undefined) patch.phoneCc = body.phoneCc;
+  if (body.phone !== undefined) patch.phone = body.phone;
+  if (body.clientSource !== undefined) patch.clientSource = body.clientSource;
+  if (body.gstNumber !== undefined) patch.gstNumber = body.gstNumber;
+  if (body.paymentTermsDays !== undefined)
+    patch.paymentTermsDays = body.paymentTermsDays;
+  if (body.billingAddress !== undefined)
+    patch.billingAddress = body.billingAddress;
+  if (body.billingState !== undefined) patch.billingState = body.billingState;
+  if (body.billingCity !== undefined) patch.billingCity = body.billingCity;
+  if (body.billingPincode !== undefined)
+    patch.billingPincode = body.billingPincode;
+  if (body.relationshipHealth !== undefined)
+    patch.relationshipHealth = body.relationshipHealth;
+  if (body.nextFollowUpAt !== undefined)
+    patch.nextFollowUpAt = body.nextFollowUpAt;
+  if (body.internalNotes !== undefined) patch.internalNotes = body.internalNotes;
+  // 'Active client' toggle takes precedence; falls back to explicit status.
+  if (body.isActive !== undefined)
+    patch.status = body.isActive ? 'active' : 'archived';
+  else if (body.status !== undefined) patch.status = body.status;
   if (body.portalVisibleStatuses !== undefined)
     patch.portalVisibleStatuses = body.portalVisibleStatuses.join(',');
 

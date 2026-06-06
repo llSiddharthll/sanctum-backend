@@ -1,0 +1,2 @@
+ALTER TABLE `sanctum_project_tasks` ADD `milestone_id` text REFERENCES sanctum_project_milestones(id);--> statement-breakpoint
+CREATE INDEX `ix_tasks_agency_project_milestone` ON `sanctum_project_tasks` (`agency_id`,`project_id`,`milestone_id`);
