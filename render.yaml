@@ -10,7 +10,10 @@ services:
     plan: free
     branch: main
     autoDeploy: true
-    buildCommand: corepack enable && pnpm install --no-frozen-lockfile && pnpm run build
+    # npm install (not pnpm): pnpm 11 blocks argon2's native build script
+    # (ERR_PNPM_IGNORED_BUILDS) on Render. --include=dev is required because
+    # NODE_ENV=production would otherwise skip TypeScript/drizzle devDeps.
+    buildCommand: npm install --include=dev && npm run build
     startCommand: node dist/server.js
     healthCheckPath: /health
     envVars:
