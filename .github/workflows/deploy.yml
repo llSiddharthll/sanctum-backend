@@ -1,0 +1,29 @@
+name: Deploy backend to Render
+
+# Render auto-deploy via its own webhook doesn't fire for this repo (it was
+# connected by public URL, so GitHub never notifies Render of pushes). This
+# workflow triggers the deploy ourselves by calling a Render Deploy Hook.
+#
+# One-time setup: Render dashboard -> sanctum-backend -> Settings -> Deploy Hook
+# -> copy the URL, then add it as a GitHub repo secret named RENDER_DEPLOY_HOOK
+# (Repo Settings -> Secrets and variables -> Actions -> New repository secret).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render deploy
+        env:
+          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$HOOK" ]; then
+            echo "::warning::RENDER_DEPLOY_HOOK secret is not set — add it to enable auto-deploy. Skipping."
+            exit 0
+          fi
+          echo "Triggering Render deploy..."
+          curl -fsS -X POST "$HOOK" && echo "Deploy triggered."
