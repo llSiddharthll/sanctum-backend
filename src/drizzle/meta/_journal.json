@@ -64,6 +64,13 @@
       "when": 1781468701013,
       "tag": "0008_whole_venus",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1781472565279,
+      "tag": "0009_crazy_veda",
+      "breakpoints": true
     }
   ]
 }

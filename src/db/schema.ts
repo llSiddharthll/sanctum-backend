@@ -6,6 +6,8 @@ import {
   blob,
   uniqueIndex,
   index,
+  foreignKey,
+  primaryKey,
 } from 'drizzle-orm/sqlite-core';
 import { sql } from 'drizzle-orm';
 
@@ -649,7 +651,19 @@ export const projectTasks = sqliteTable(
     assigneeId: text('assignee_id').references(() => users.id, {
       onDelete: 'set null',
     }),
+    priority: text('priority', {
+      enum: ['none', 'low', 'medium', 'high', 'urgent'],
+    })
+      .notNull()
+      .default('none'),
+    estimateMinutes: integer('estimate_minutes'), // nullable
+    startDate: ts('start_date'), // nullable; pairs with dueDate
     dueDate: ts('due_date'),
+    // Stamped when status -> 'done', cleared otherwise.
+    completedAt: ts('completed_at'),
+    // Self-FK to a parent task (one level only — enforced in the API). The
+    // actual FK + cascade is declared in the table callback below.
+    parentTaskId: text('parent_task_id'),
     position: integer('position').notNull().default(0),
     createdAt: ts('created_at').notNull().default(now),
     updatedAt: ts('updated_at').notNull().default(now),
@@ -666,6 +680,22 @@ export const projectTasks = sqliteTable(
       tbl.projectId,
       tbl.milestoneId,
     ),
+    index('ix_tasks_agency_project_parent').on(
+      tbl.agencyId,
+      tbl.projectId,
+      tbl.parentTaskId,
+    ),
+    index('ix_tasks_agency_project_priority').on(
+      tbl.agencyId,
+      tbl.projectId,
+      tbl.priority,
+    ),
+    // Self-reference: deleting a parent cascades to its subtasks.
+    foreignKey({
+      columns: [tbl.parentTaskId],
+      foreignColumns: [tbl.id],
+      name: 'fk_tasks_parent',
+    }).onDelete('cascade'),
   ],
 );
 
@@ -728,6 +758,116 @@ export const projectMembers = sqliteTable(
       tbl.agencyId,
       tbl.projectId,
     ),
+  ],
+);
+
+// ============================================================
+//  PROJECT_TASK_LABELS (label definitions, project-scoped)
+// ============================================================
+export const projectTaskLabels = sqliteTable(
+  t('project_task_labels'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    projectId: text('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    // pine|brass|sky|rose|amber|violet|slate
+    color: text('color').notNull().default('pine'),
+    createdAt: ts('created_at').notNull().default(now),
+  },
+  (tbl) => [
+    uniqueIndex('ux_task_labels_project_name').on(tbl.projectId, tbl.name),
+    index('ix_task_labels_agency_project').on(tbl.agencyId, tbl.projectId),
+  ],
+);
+
+// ============================================================
+//  PROJECT_TASK_LABEL_LINKS (M:N task <-> label)
+// ============================================================
+export const projectTaskLabelLinks = sqliteTable(
+  t('project_task_label_links'),
+  {
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    taskId: text('task_id')
+      .notNull()
+      .references(() => projectTasks.id, { onDelete: 'cascade' }),
+    labelId: text('label_id')
+      .notNull()
+      .references(() => projectTaskLabels.id, { onDelete: 'cascade' }),
+  },
+  (tbl) => [
+    primaryKey({ columns: [tbl.taskId, tbl.labelId] }),
+    index('ix_task_label_links_label').on(tbl.labelId),
+  ],
+);
+
+// ============================================================
+//  PROJECT_TASK_DEPENDENCIES (blocks / blocked-by)
+//  Canonical direction: blockerTaskId blocks blockedTaskId.
+// ============================================================
+export const projectTaskDependencies = sqliteTable(
+  t('project_task_dependencies'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    projectId: text('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    blockerTaskId: text('blocker_task_id')
+      .notNull()
+      .references(() => projectTasks.id, { onDelete: 'cascade' }),
+    blockedTaskId: text('blocked_task_id')
+      .notNull()
+      .references(() => projectTasks.id, { onDelete: 'cascade' }),
+    createdBy: text('created_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: ts('created_at').notNull().default(now),
+  },
+  (tbl) => [
+    uniqueIndex('ux_task_deps_edge').on(
+      tbl.blockerTaskId,
+      tbl.blockedTaskId,
+    ),
+    index('ix_task_deps_blocked').on(tbl.blockedTaskId),
+    index('ix_task_deps_agency_project').on(tbl.agencyId, tbl.projectId),
+  ],
+);
+
+// ============================================================
+//  PROJECT_TASK_COMMENTS (task discussion + soft delete)
+// ============================================================
+export const projectTaskComments = sqliteTable(
+  t('project_task_comments'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    taskId: text('task_id')
+      .notNull()
+      .references(() => projectTasks.id, { onDelete: 'cascade' }),
+    authorId: text('author_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    body: text('body').notNull(),
+    // JSON array of userIds parsed from @mentions.
+    mentionsJson: text('mentions_json'),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+    // Soft delete (author-only).
+    deletedAt: ts('deleted_at'),
+  },
+  (tbl) => [
+    index('ix_task_comments_task_created').on(tbl.taskId, tbl.createdAt),
   ],
 );
 

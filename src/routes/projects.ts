@@ -1,6 +1,16 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, asc, desc, eq, inArray, like, sql } from 'drizzle-orm';
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  inArray,
+  isNull,
+  like,
+  or,
+  sql,
+} from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   auditLog,
@@ -9,12 +19,16 @@ import {
   projectTasks,
   projectMilestones,
   projectMembers,
+  projectTaskLabels,
+  projectTaskLabelLinks,
+  projectTaskDependencies,
+  projectTaskComments,
   timeLogs,
   users,
 } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
-import { notFound } from '../lib/errors.js';
+import { AppError, notFound, conflict, forbidden } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
 import { getAuth } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
@@ -47,6 +61,16 @@ const TASK_STATUSES = [
   'done',
 ] as const;
 const MILESTONE_STATUSES = ['pending', 'completed'] as const;
+const TASK_PRIORITIES = ['none', 'low', 'medium', 'high', 'urgent'] as const;
+const LABEL_COLORS = [
+  'pine',
+  'brass',
+  'sky',
+  'rose',
+  'amber',
+  'violet',
+  'slate',
+] as const;
 
 // ---- Correlated count subqueries (tenant-implied via project FK) ----
 const tasksTotalSq = sql<number>`(
@@ -152,11 +176,179 @@ function serializeTask(tk: typeof projectTasks.$inferSelect) {
     description: tk.description,
     status: tk.status,
     assigneeId: tk.assigneeId,
+    priority: tk.priority,
+    estimateMinutes: tk.estimateMinutes,
+    startDate: toIso(tk.startDate),
     dueDate: toIso(tk.dueDate),
+    completedAt: toIso(tk.completedAt),
+    parentTaskId: tk.parentTaskId,
     position: tk.position,
     createdAt: toIso(tk.createdAt),
     updatedAt: toIso(tk.updatedAt),
   };
+}
+
+/** A label as returned to the client. */
+function serializeLabel(l: typeof projectTaskLabels.$inferSelect) {
+  return {
+    id: l.id,
+    projectId: l.projectId,
+    name: l.name,
+    color: l.color,
+    createdAt: toIso(l.createdAt),
+  };
+}
+
+type SerializedLabel = ReturnType<typeof serializeLabel>;
+type SerializedTask = ReturnType<typeof serializeTask>;
+
+/** A task enriched with computed list-view fields. */
+type EnrichedTask = SerializedTask & {
+  labels: SerializedLabel[];
+  subtaskCount: number;
+  subtaskDoneCount: number;
+  blockedByCount: number;
+  commentCount: number;
+};
+
+/**
+ * Bulk-load enrichment (labels, subtask counts, blocked-by, comments) for a
+ * set of tasks and fold it onto the serialized rows. One query per facet keeps
+ * this O(facets) rather than O(rows).
+ */
+async function enrichTasks(
+  agencyId: string,
+  rows: (typeof projectTasks.$inferSelect)[],
+): Promise<EnrichedTask[]> {
+  const ids = rows.map((r) => r.id);
+  const base = rows.map(serializeTask);
+  if (ids.length === 0) {
+    return base.map((t) => ({
+      ...t,
+      labels: [],
+      subtaskCount: 0,
+      subtaskDoneCount: 0,
+      blockedByCount: 0,
+      commentCount: 0,
+    }));
+  }
+
+  // Labels (joined through the link table), grouped by task.
+  const labelRows = await db
+    .select({
+      taskId: projectTaskLabelLinks.taskId,
+      id: projectTaskLabels.id,
+      projectId: projectTaskLabels.projectId,
+      name: projectTaskLabels.name,
+      color: projectTaskLabels.color,
+      createdAt: projectTaskLabels.createdAt,
+    })
+    .from(projectTaskLabelLinks)
+    .innerJoin(
+      projectTaskLabels,
+      eq(projectTaskLabels.id, projectTaskLabelLinks.labelId),
+    )
+    .where(
+      and(
+        eq(projectTaskLabelLinks.agencyId, agencyId),
+        inArray(projectTaskLabelLinks.taskId, ids),
+      ),
+    )
+    .orderBy(asc(projectTaskLabels.name));
+
+  const labelsByTask = new Map<string, SerializedLabel[]>();
+  for (const lr of labelRows) {
+    const list = labelsByTask.get(lr.taskId) ?? [];
+    list.push({
+      id: lr.id,
+      projectId: lr.projectId,
+      name: lr.name,
+      color: lr.color,
+      createdAt: toIso(lr.createdAt),
+    });
+    labelsByTask.set(lr.taskId, list);
+  }
+
+  // Subtask totals + done counts, grouped by parent.
+  const subtaskRows = await db
+    .select({
+      parentTaskId: projectTasks.parentTaskId,
+      total: sql<number>`count(*)`,
+      done: sql<number>`sum(case when ${projectTasks.status} = 'done' then 1 else 0 end)`,
+    })
+    .from(projectTasks)
+    .where(
+      and(
+        eq(projectTasks.agencyId, agencyId),
+        inArray(projectTasks.parentTaskId, ids),
+      ),
+    )
+    .groupBy(projectTasks.parentTaskId);
+
+  const subtaskByParent = new Map<
+    string,
+    { total: number; done: number }
+  >();
+  for (const sr of subtaskRows) {
+    if (sr.parentTaskId)
+      subtaskByParent.set(sr.parentTaskId, {
+        total: Number(sr.total ?? 0),
+        done: Number(sr.done ?? 0),
+      });
+  }
+
+  // Blocked-by counts (this task is the blocked side of an edge).
+  const blockedRows = await db
+    .select({
+      blockedTaskId: projectTaskDependencies.blockedTaskId,
+      total: sql<number>`count(*)`,
+    })
+    .from(projectTaskDependencies)
+    .where(
+      and(
+        eq(projectTaskDependencies.agencyId, agencyId),
+        inArray(projectTaskDependencies.blockedTaskId, ids),
+      ),
+    )
+    .groupBy(projectTaskDependencies.blockedTaskId);
+
+  const blockedByTask = new Map<string, number>();
+  for (const br of blockedRows) {
+    blockedByTask.set(br.blockedTaskId, Number(br.total ?? 0));
+  }
+
+  // Comment counts (non-deleted only).
+  const commentRows = await db
+    .select({
+      taskId: projectTaskComments.taskId,
+      total: sql<number>`count(*)`,
+    })
+    .from(projectTaskComments)
+    .where(
+      and(
+        eq(projectTaskComments.agencyId, agencyId),
+        inArray(projectTaskComments.taskId, ids),
+        isNull(projectTaskComments.deletedAt),
+      ),
+    )
+    .groupBy(projectTaskComments.taskId);
+
+  const commentsByTask = new Map<string, number>();
+  for (const cr of commentRows) {
+    commentsByTask.set(cr.taskId, Number(cr.total ?? 0));
+  }
+
+  return base.map((t) => {
+    const sub = subtaskByParent.get(t.id);
+    return {
+      ...t,
+      labels: labelsByTask.get(t.id) ?? [],
+      subtaskCount: sub?.total ?? 0,
+      subtaskDoneCount: sub?.done ?? 0,
+      blockedByCount: blockedByTask.get(t.id) ?? 0,
+      commentCount: commentsByTask.get(t.id) ?? 0,
+    };
+  });
 }
 
 function serializeMilestone(m: typeof projectMilestones.$inferSelect) {
@@ -408,27 +600,350 @@ projectsRouter.delete('/:id', async (req, res) => {
 });
 
 // ============================================================
-//  TASKS
+//  LABELS (project-scoped task labels)  §3.1
 // ============================================================
 
-// GET /projects/:id/tasks
-projectsRouter.get('/:id/tasks', async (req, res) => {
+/** Fetch a label scoped to the project + agency, or throw 404. */
+async function getScopedLabel(
+  ctx: ReturnType<typeof getAuth>,
+  projectId: string,
+  labelId: string,
+) {
+  const [row] = await db
+    .select()
+    .from(projectTaskLabels)
+    .where(
+      and(
+        eq(projectTaskLabels.id, labelId),
+        eq(projectTaskLabels.agencyId, ctx.agencyId),
+        eq(projectTaskLabels.projectId, projectId),
+      ),
+    )
+    .limit(1);
+  if (!row) throw notFound('Label not found.');
+  return row;
+}
+
+// GET /projects/:id/labels
+projectsRouter.get('/:id/labels', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
   await getScopedProject(ctx, projectId);
 
   const rows = await db
     .select()
-    .from(projectTasks)
+    .from(projectTaskLabels)
     .where(
       and(
-        eq(projectTasks.agencyId, ctx.agencyId),
-        eq(projectTasks.projectId, projectId),
+        eq(projectTaskLabels.agencyId, ctx.agencyId),
+        eq(projectTaskLabels.projectId, projectId),
       ),
     )
-    .orderBy(asc(projectTasks.position), asc(projectTasks.createdAt));
+    .orderBy(asc(projectTaskLabels.name));
 
-  ok(res, rows.map(serializeTask));
+  ok(res, rows.map(serializeLabel));
+});
+
+// POST /projects/:id/labels
+const createLabelSchema = z.object({
+  name: z.string().trim().min(1).max(60),
+  color: z.enum(LABEL_COLORS).optional(),
+});
+
+projectsRouter.post('/:id/labels', async (req, res) => {
+  const ctx = getAuth(req);
+  const projectId = param(req, 'id');
+  await getScopedProject(ctx, projectId);
+  const body = createLabelSchema.parse(req.body);
+
+  // Enforce per-project unique name (case-sensitive, matches the unique index).
+  const [dup] = await db
+    .select({ id: projectTaskLabels.id })
+    .from(projectTaskLabels)
+    .where(
+      and(
+        eq(projectTaskLabels.projectId, projectId),
+        eq(projectTaskLabels.name, body.name),
+      ),
+    )
+    .limit(1);
+  if (dup) throw conflict('A label with that name already exists.');
+
+  const id = newId('plb');
+  await db.insert(projectTaskLabels).values({
+    id,
+    agencyId: ctx.agencyId,
+    projectId,
+    name: body.name,
+    ...(body.color !== undefined ? { color: body.color } : {}),
+  });
+
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'label.create',
+    entityType: 'label',
+    entityId: id,
+    metadata: { projectId, name: body.name, color: body.color ?? 'pine' },
+    ip: req.ip,
+  });
+
+  const [row] = await db
+    .select()
+    .from(projectTaskLabels)
+    .where(eq(projectTaskLabels.id, id));
+  created(res, serializeLabel(row!));
+});
+
+// PATCH /projects/:id/labels/:labelId
+const updateLabelSchema = z.object({
+  name: z.string().trim().min(1).max(60).optional(),
+  color: z.enum(LABEL_COLORS).optional(),
+});
+
+projectsRouter.patch('/:id/labels/:labelId', async (req, res) => {
+  const ctx = getAuth(req);
+  const projectId = param(req, 'id');
+  await getScopedProject(ctx, projectId);
+  const label = await getScopedLabel(ctx, projectId, param(req, 'labelId'));
+  const body = updateLabelSchema.parse(req.body);
+
+  if (body.name !== undefined && body.name !== label.name) {
+    const [dup] = await db
+      .select({ id: projectTaskLabels.id })
+      .from(projectTaskLabels)
+      .where(
+        and(
+          eq(projectTaskLabels.projectId, projectId),
+          eq(projectTaskLabels.name, body.name),
+        ),
+      )
+      .limit(1);
+    if (dup) throw conflict('A label with that name already exists.');
+  }
+
+  const patch: Partial<typeof projectTaskLabels.$inferInsert> = {};
+  if (body.name !== undefined) patch.name = body.name;
+  if (body.color !== undefined) patch.color = body.color;
+
+  if (Object.keys(patch).length > 0) {
+    await db
+      .update(projectTaskLabels)
+      .set(patch)
+      .where(
+        and(
+          eq(projectTaskLabels.id, label.id),
+          eq(projectTaskLabels.agencyId, ctx.agencyId),
+        ),
+      );
+  }
+
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'label.update',
+    entityType: 'label',
+    entityId: label.id,
+    metadata: { projectId, ...patch },
+    ip: req.ip,
+  });
+
+  const [row] = await db
+    .select()
+    .from(projectTaskLabels)
+    .where(eq(projectTaskLabels.id, label.id));
+  ok(res, serializeLabel(row!));
+});
+
+// DELETE /projects/:id/labels/:labelId (cascades links)
+projectsRouter.delete('/:id/labels/:labelId', async (req, res) => {
+  const ctx = getAuth(req);
+  const projectId = param(req, 'id');
+  await getScopedProject(ctx, projectId);
+  const label = await getScopedLabel(ctx, projectId, param(req, 'labelId'));
+
+  await db
+    .delete(projectTaskLabels)
+    .where(
+      and(
+        eq(projectTaskLabels.id, label.id),
+        eq(projectTaskLabels.agencyId, ctx.agencyId),
+      ),
+    );
+
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'label.delete',
+    entityType: 'label',
+    entityId: label.id,
+    metadata: { projectId, name: label.name },
+    ip: req.ip,
+  });
+  ok(res, { deleted: true });
+});
+
+// ============================================================
+//  TASKS
+// ============================================================
+
+// GET /projects/:id/tasks — flexible, composable list  §3.6
+const DUE_FILTERS = ['overdue', 'today', 'week', 'none'] as const;
+const TASK_SORTS = [
+  'manual',
+  'priority',
+  'due',
+  'created',
+  'updated',
+  'title',
+] as const;
+
+/** Coerce a query param into a string[] whether it arrives as a or a[]. */
+function toArray(v: unknown): string[] {
+  if (v === undefined) return [];
+  if (Array.isArray(v)) return v.map(String).filter((s) => s.length > 0);
+  return [String(v)].filter((s) => s.length > 0);
+}
+
+const listTasksQuery = z.object({
+  group: z
+    .enum(['status', 'assignee', 'priority', 'label', 'milestone', 'none'])
+    .optional(),
+  due: z.enum(DUE_FILTERS).optional(),
+  q: z.string().trim().max(200).optional(),
+  sort: z.enum(TASK_SORTS).optional(),
+  dir: z.enum(['asc', 'desc']).optional(),
+  includeSubtasks: z
+    .enum(['true', 'false'])
+    .optional()
+    .transform((v) => v !== 'false'),
+});
+
+projectsRouter.get('/:id/tasks', async (req, res) => {
+  const ctx = getAuth(req);
+  const projectId = param(req, 'id');
+  await getScopedProject(ctx, projectId);
+
+  const q = listTasksQuery.parse(req.query);
+  const statusFilter = toArray(req.query['status[]'] ?? req.query.status).filter(
+    (s): s is (typeof TASK_STATUSES)[number] =>
+      (TASK_STATUSES as readonly string[]).includes(s),
+  );
+  const assigneeFilter = toArray(
+    req.query['assignee[]'] ?? req.query.assignee,
+  );
+  const priorityFilter = toArray(
+    req.query['priority[]'] ?? req.query.priority,
+  ).filter((p): p is (typeof TASK_PRIORITIES)[number] =>
+    (TASK_PRIORITIES as readonly string[]).includes(p),
+  );
+  const labelFilter = toArray(req.query['label[]'] ?? req.query.label);
+  const milestoneFilter = toArray(
+    req.query['milestone[]'] ?? req.query.milestone,
+  );
+
+  const filters = [
+    eq(projectTasks.agencyId, ctx.agencyId),
+    eq(projectTasks.projectId, projectId),
+  ];
+
+  if (!q.includeSubtasks) filters.push(isNull(projectTasks.parentTaskId));
+  if (statusFilter.length > 0)
+    filters.push(inArray(projectTasks.status, statusFilter));
+  if (priorityFilter.length > 0)
+    filters.push(inArray(projectTasks.priority, priorityFilter));
+  if (milestoneFilter.length > 0)
+    filters.push(inArray(projectTasks.milestoneId, milestoneFilter));
+
+  if (assigneeFilter.length > 0) {
+    const ids = assigneeFilter.filter((a) => a !== 'unassigned');
+    const wantsUnassigned = assigneeFilter.includes('unassigned');
+    const parts = [];
+    if (ids.length > 0) parts.push(inArray(projectTasks.assigneeId, ids));
+    if (wantsUnassigned) parts.push(isNull(projectTasks.assigneeId));
+    if (parts.length > 0) filters.push(or(...parts)!);
+  }
+
+  if (q.q && q.q.length > 0) {
+    filters.push(like(projectTasks.title, `%${q.q}%`));
+  }
+
+  // Due-date buckets (computed against the server's "now").
+  if (q.due) {
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+    const startOfTomorrow = new Date(startOfToday);
+    startOfTomorrow.setDate(startOfTomorrow.getDate() + 1);
+    const endOfWeek = new Date(startOfToday);
+    endOfWeek.setDate(endOfWeek.getDate() + 7);
+    if (q.due === 'none') {
+      filters.push(isNull(projectTasks.dueDate));
+    } else if (q.due === 'overdue') {
+      filters.push(
+        sql`${projectTasks.dueDate} is not null and ${projectTasks.dueDate} < ${startOfToday}`,
+      );
+    } else if (q.due === 'today') {
+      filters.push(
+        sql`${projectTasks.dueDate} >= ${startOfToday} and ${projectTasks.dueDate} < ${startOfTomorrow}`,
+      );
+    } else if (q.due === 'week') {
+      filters.push(
+        sql`${projectTasks.dueDate} >= ${startOfToday} and ${projectTasks.dueDate} < ${endOfWeek}`,
+      );
+    }
+  }
+
+  // Restrict to tasks carrying any of the requested labels.
+  if (labelFilter.length > 0) {
+    const linked = db
+      .select({ taskId: projectTaskLabelLinks.taskId })
+      .from(projectTaskLabelLinks)
+      .where(
+        and(
+          eq(projectTaskLabelLinks.agencyId, ctx.agencyId),
+          inArray(projectTaskLabelLinks.labelId, labelFilter),
+        ),
+      );
+    filters.push(inArray(projectTasks.id, linked));
+  }
+
+  // Sorting. `manual` (default) = position asc; priority uses an explicit rank
+  // because the enum is text. Secondary key is position for stability.
+  const dir = q.dir === 'desc' ? desc : asc;
+  const sort = q.sort ?? 'manual';
+  let orderBy;
+  if (sort === 'priority') {
+    const rank = sql`case ${projectTasks.priority}
+      when 'urgent' then 0 when 'high' then 1 when 'medium' then 2
+      when 'low' then 3 else 4 end`;
+    orderBy = [dir(rank), asc(projectTasks.position)];
+  } else if (sort === 'due') {
+    orderBy = [
+      sql`${projectTasks.dueDate} is null`,
+      dir(projectTasks.dueDate),
+      asc(projectTasks.position),
+    ];
+  } else if (sort === 'created') {
+    orderBy = [dir(projectTasks.createdAt)];
+  } else if (sort === 'updated') {
+    orderBy = [dir(projectTasks.updatedAt)];
+  } else if (sort === 'title') {
+    orderBy = [dir(projectTasks.title)];
+  } else {
+    orderBy = [asc(projectTasks.position), asc(projectTasks.createdAt)];
+  }
+
+  const rows = await db
+    .select()
+    .from(projectTasks)
+    .where(and(...filters))
+    .orderBy(...orderBy);
+
+  const enriched = await enrichTasks(ctx.agencyId, rows);
+  ok(res, enriched);
 });
 
 /**
@@ -454,6 +969,31 @@ async function requireProjectMilestone(
   if (!row) throw notFound('Milestone not found.');
 }
 
+/**
+ * Verify a candidate parent task is a valid one-level parent in this project:
+ * exists, same project/agency, and is itself a top-level task. Returns the
+ * parent row (its milestoneId is inherited by new subtasks). Throws 422 on a
+ * nesting violation, 404 if not found.
+ */
+async function requireValidParentTask(
+  ctx: ReturnType<typeof getAuth>,
+  projectId: string,
+  parentTaskId: string,
+  selfId?: string,
+) {
+  if (selfId && parentTaskId === selfId) {
+    throw new AppError('VALIDATION_ERROR', 'A task cannot be its own parent.');
+  }
+  const parent = await getScopedTask(ctx, projectId, parentTaskId);
+  if (parent.parentTaskId !== null) {
+    throw new AppError(
+      'VALIDATION_ERROR',
+      'Subtasks can only be nested one level deep.',
+    );
+  }
+  return parent;
+}
+
 // POST /projects/:id/tasks
 const createTaskSchema = z.object({
   title: z.string().min(1).max(200),
@@ -461,7 +1001,11 @@ const createTaskSchema = z.object({
   status: z.enum(TASK_STATUSES).optional(),
   milestoneId: z.string().min(1).nullable().optional(),
   assigneeId: z.string().min(1).optional(),
+  priority: z.enum(TASK_PRIORITIES).optional(),
+  estimateMinutes: z.number().int().min(0).nullable().optional(),
+  startDate: z.coerce.date().nullable().optional(),
   dueDate: z.coerce.date().optional(),
+  parentTaskId: z.string().min(1).nullable().optional(),
   position: z.number().int().min(0).optional(),
 });
 
@@ -474,11 +1018,23 @@ projectsRouter.post('/:id/tasks', async (req, res) => {
   if (body.assigneeId !== undefined) {
     await requireAgencyUser(ctx, body.assigneeId);
   }
-  if (body.milestoneId) {
-    await requireProjectMilestone(ctx, projectId, body.milestoneId);
+
+  // Subtasks inherit their parent's milestone when one isn't given.
+  let parent: typeof projectTasks.$inferSelect | undefined;
+  if (body.parentTaskId) {
+    parent = await requireValidParentTask(ctx, projectId, body.parentTaskId);
+  }
+
+  let milestoneId = body.milestoneId ?? null;
+  if (milestoneId) {
+    await requireProjectMilestone(ctx, projectId, milestoneId);
+  } else if (body.milestoneId === undefined && parent) {
+    milestoneId = parent.milestoneId;
   }
 
   const id = newId('ptk');
+  // status -> 'done' at creation stamps completedAt.
+  const completedAt = body.status === 'done' ? new Date() : null;
   await db.insert(projectTasks).values({
     id,
     agencyId: ctx.agencyId,
@@ -486,9 +1042,14 @@ projectsRouter.post('/:id/tasks', async (req, res) => {
     title: body.title,
     description: body.description ?? null,
     ...(body.status !== undefined ? { status: body.status } : {}),
-    milestoneId: body.milestoneId ?? null,
+    milestoneId,
     assigneeId: body.assigneeId ?? null,
+    ...(body.priority !== undefined ? { priority: body.priority } : {}),
+    estimateMinutes: body.estimateMinutes ?? null,
+    startDate: body.startDate ?? null,
     dueDate: body.dueDate ?? null,
+    completedAt,
+    parentTaskId: body.parentTaskId ?? null,
     ...(body.position !== undefined ? { position: body.position } : {}),
   });
 
@@ -496,7 +1057,7 @@ projectsRouter.post('/:id/tasks', async (req, res) => {
     agencyId: ctx.agencyId,
     actorType: ctx.role,
     actorId: ctx.userId,
-    action: 'task.create',
+    action: body.parentTaskId ? 'task.subtask_add' : 'task.create',
     entityType: 'task',
     entityId: id,
     metadata: {
@@ -504,7 +1065,8 @@ projectsRouter.post('/:id/tasks', async (req, res) => {
       taskTitle: body.title,
       status: body.status ?? 'todo',
       ...(body.assigneeId ? { assigneeId: body.assigneeId } : {}),
-      ...(body.milestoneId ? { milestoneId: body.milestoneId } : {}),
+      ...(milestoneId ? { milestoneId } : {}),
+      ...(body.parentTaskId ? { parentTaskId: body.parentTaskId } : {}),
     },
     ip: req.ip,
   });
@@ -611,14 +1173,18 @@ async function getScopedTask(
   return row;
 }
 
-// PATCH /projects/:id/tasks/:taskId
+// PATCH /projects/:id/tasks/:taskId  §3.3
 const updateTaskSchema = z.object({
   title: z.string().min(1).max(200).optional(),
   description: z.string().max(5000).nullable().optional(),
   status: z.enum(TASK_STATUSES).optional(),
   milestoneId: z.string().min(1).nullable().optional(),
   assigneeId: z.string().min(1).nullable().optional(),
+  priority: z.enum(TASK_PRIORITIES).optional(),
+  estimateMinutes: z.number().int().min(0).nullable().optional(),
+  startDate: z.coerce.date().nullable().optional(),
   dueDate: z.coerce.date().nullable().optional(),
+  parentTaskId: z.string().min(1).nullable().optional(),
   position: z.number().int().min(0).optional(),
 });
 
@@ -636,6 +1202,28 @@ projectsRouter.patch('/:id/tasks/:taskId', async (req, res) => {
     await requireProjectMilestone(ctx, projectId, body.milestoneId);
   }
 
+  // Re-parenting: the new parent must be a top-level task in this project, and
+  // this task must not already have children (else it would create a 3rd level).
+  if (body.parentTaskId) {
+    await requireValidParentTask(ctx, projectId, body.parentTaskId, task.id);
+    const [child] = await db
+      .select({ id: projectTasks.id })
+      .from(projectTasks)
+      .where(
+        and(
+          eq(projectTasks.agencyId, ctx.agencyId),
+          eq(projectTasks.parentTaskId, task.id),
+        ),
+      )
+      .limit(1);
+    if (child) {
+      throw new AppError(
+        'VALIDATION_ERROR',
+        'A task with subtasks cannot become a subtask itself.',
+      );
+    }
+  }
+
   const patch: Partial<typeof projectTasks.$inferInsert> = {
     updatedAt: new Date(),
   };
@@ -644,8 +1232,19 @@ projectsRouter.patch('/:id/tasks/:taskId', async (req, res) => {
   if (body.status !== undefined) patch.status = body.status;
   if (body.milestoneId !== undefined) patch.milestoneId = body.milestoneId;
   if (body.assigneeId !== undefined) patch.assigneeId = body.assigneeId;
+  if (body.priority !== undefined) patch.priority = body.priority;
+  if (body.estimateMinutes !== undefined)
+    patch.estimateMinutes = body.estimateMinutes;
+  if (body.startDate !== undefined) patch.startDate = body.startDate;
   if (body.dueDate !== undefined) patch.dueDate = body.dueDate;
+  if (body.parentTaskId !== undefined) patch.parentTaskId = body.parentTaskId;
   if (body.position !== undefined) patch.position = body.position;
+
+  // completedAt is derived from status: entering 'done' stamps it; leaving
+  // 'done' clears it. Only touch it when status actually changes.
+  if (body.status !== undefined && body.status !== task.status) {
+    patch.completedAt = body.status === 'done' ? new Date() : null;
+  }
 
   await db
     .update(projectTasks)
@@ -665,6 +1264,11 @@ projectsRouter.patch('/:id/tasks/:taskId', async (req, res) => {
     body.assigneeId !== undefined && body.assigneeId !== task.assigneeId;
   const milestoneChanged =
     body.milestoneId !== undefined && body.milestoneId !== task.milestoneId;
+  const priorityChanged =
+    body.priority !== undefined && body.priority !== task.priority;
+  const parentChanged =
+    body.parentTaskId !== undefined &&
+    body.parentTaskId !== task.parentTaskId;
 
   await audit({
     agencyId: ctx.agencyId,
@@ -681,6 +1285,10 @@ projectsRouter.patch('/:id/tasks/:taskId', async (req, res) => {
         : {}),
       ...(assigneeChanged ? { assigneeId: body.assigneeId } : {}),
       ...(milestoneChanged ? { milestoneId: body.milestoneId } : {}),
+      ...(priorityChanged
+        ? { fromPriority: task.priority, toPriority: body.priority }
+        : {}),
+      ...(parentChanged ? { parentTaskId: body.parentTaskId } : {}),
     },
     ip: req.ip,
   });
@@ -690,6 +1298,28 @@ projectsRouter.patch('/:id/tasks/:taskId', async (req, res) => {
     .from(projectTasks)
     .where(eq(projectTasks.id, task.id));
   ok(res, serializeTask(row!));
+});
+
+// GET /projects/:id/tasks/:taskId/subtasks  §3.4
+projectsRouter.get('/:id/tasks/:taskId/subtasks', async (req, res) => {
+  const ctx = getAuth(req);
+  const projectId = param(req, 'id');
+  await getScopedProject(ctx, projectId);
+  const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
+
+  const rows = await db
+    .select()
+    .from(projectTasks)
+    .where(
+      and(
+        eq(projectTasks.agencyId, ctx.agencyId),
+        eq(projectTasks.projectId, projectId),
+        eq(projectTasks.parentTaskId, task.id),
+      ),
+    )
+    .orderBy(asc(projectTasks.position), asc(projectTasks.createdAt));
+
+  ok(res, await enrichTasks(ctx.agencyId, rows));
 });
 
 // DELETE /projects/:id/tasks/:taskId
@@ -719,6 +1349,707 @@ projectsRouter.delete('/:id/tasks/:taskId', async (req, res) => {
     ip: req.ip,
   });
   ok(res, { deleted: true });
+});
+
+// ============================================================
+//  TASK LABEL LINKS  §3.2
+// ============================================================
+
+// PUT /projects/:id/tasks/:taskId/labels — replace the full label set.
+const putTaskLabelsSchema = z.object({
+  labelIds: z.array(z.string().min(1)).max(50),
+});
+
+projectsRouter.put('/:id/tasks/:taskId/labels', async (req, res) => {
+  const ctx = getAuth(req);
+  const projectId = param(req, 'id');
+  await getScopedProject(ctx, projectId);
+  const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
+  const body = putTaskLabelsSchema.parse(req.body);
+
+  // De-dupe and validate every requested label belongs to this project.
+  const wanted = [...new Set(body.labelIds)];
+  if (wanted.length > 0) {
+    const valid = await db
+      .select({ id: projectTaskLabels.id })
+      .from(projectTaskLabels)
+      .where(
+        and(
+          eq(projectTaskLabels.agencyId, ctx.agencyId),
+          eq(projectTaskLabels.projectId, projectId),
+          inArray(projectTaskLabels.id, wanted),
+        ),
+      );
+    if (valid.length !== wanted.length) {
+      throw new AppError(
+        'VALIDATION_ERROR',
+        'One or more labels do not belong to this project.',
+      );
+    }
+  }
+
+  // Replace the full set: delete-then-insert in a transaction.
+  await db.transaction(async (tx) => {
+    await tx
+      .delete(projectTaskLabelLinks)
+      .where(
+        and(
+          eq(projectTaskLabelLinks.agencyId, ctx.agencyId),
+          eq(projectTaskLabelLinks.taskId, task.id),
+        ),
+      );
+    if (wanted.length > 0) {
+      await tx.insert(projectTaskLabelLinks).values(
+        wanted.map((labelId) => ({
+          agencyId: ctx.agencyId,
+          taskId: task.id,
+          labelId,
+        })),
+      );
+    }
+  });
+
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'task.label_change',
+    entityType: 'task',
+    entityId: task.id,
+    metadata: { projectId, labelIds: wanted },
+    ip: req.ip,
+  });
+
+  // Return the resolved labels for the task.
+  const labels =
+    wanted.length === 0
+      ? []
+      : (
+          await db
+            .select()
+            .from(projectTaskLabels)
+            .where(
+              and(
+                eq(projectTaskLabels.agencyId, ctx.agencyId),
+                inArray(projectTaskLabels.id, wanted),
+              ),
+            )
+            .orderBy(asc(projectTaskLabels.name))
+        ).map(serializeLabel);
+
+  ok(res, labels);
+});
+
+// ============================================================
+//  TASK DEPENDENCIES (blocks / blocked-by)  §3.5
+// ============================================================
+
+/**
+ * Detect whether adding edge (blocker -> blocked) would create a cycle, by a
+ * bounded BFS over the project's existing dependency graph: starting from
+ * `blocked`, follow blocker->blocked edges; if we can reach `blocker`, the new
+ * edge would close a loop. Bounded by total edge count.
+ */
+async function dependencyWouldCycle(
+  agencyId: string,
+  projectId: string,
+  blockerTaskId: string,
+  blockedTaskId: string,
+): Promise<boolean> {
+  // A direct 2-cycle (the reverse edge already exists) is the trivial case.
+  const edges = await db
+    .select({
+      blocker: projectTaskDependencies.blockerTaskId,
+      blocked: projectTaskDependencies.blockedTaskId,
+    })
+    .from(projectTaskDependencies)
+    .where(
+      and(
+        eq(projectTaskDependencies.agencyId, agencyId),
+        eq(projectTaskDependencies.projectId, projectId),
+      ),
+    );
+
+  const adj = new Map<string, string[]>();
+  for (const e of edges) {
+    const list = adj.get(e.blocker) ?? [];
+    list.push(e.blocked);
+    adj.set(e.blocker, list);
+  }
+
+  // BFS from blockedTaskId following downstream edges; reaching blockerTaskId
+  // means blocker already (transitively) depends on blocked -> cycle.
+  const visited = new Set<string>();
+  const queue = [blockedTaskId];
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    if (current === blockerTaskId) return true;
+    if (visited.has(current)) continue;
+    visited.add(current);
+    for (const next of adj.get(current) ?? []) {
+      if (!visited.has(next)) queue.push(next);
+    }
+  }
+  return false;
+}
+
+// GET /projects/:id/tasks/:taskId/dependencies -> { blockedBy, blocks }
+projectsRouter.get('/:id/tasks/:taskId/dependencies', async (req, res) => {
+  const ctx = getAuth(req);
+  const projectId = param(req, 'id');
+  await getScopedProject(ctx, projectId);
+  const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
+
+  const deps = await loadTaskDependencies(ctx.agencyId, task.id);
+  ok(res, deps);
+});
+
+/** Resolve a task's blocked-by + blocks lists into serialized tasks + dep ids. */
+async function loadTaskDependencies(agencyId: string, taskId: string) {
+  // Edges where this task is the blocked side -> its blockers.
+  const blockedByEdges = await db
+    .select({
+      depId: projectTaskDependencies.id,
+      task: projectTasks,
+    })
+    .from(projectTaskDependencies)
+    .innerJoin(
+      projectTasks,
+      eq(projectTasks.id, projectTaskDependencies.blockerTaskId),
+    )
+    .where(
+      and(
+        eq(projectTaskDependencies.agencyId, agencyId),
+        eq(projectTaskDependencies.blockedTaskId, taskId),
+      ),
+    )
+    .orderBy(asc(projectTaskDependencies.createdAt));
+
+  // Edges where this task is the blocker -> the tasks it blocks.
+  const blocksEdges = await db
+    .select({
+      depId: projectTaskDependencies.id,
+      task: projectTasks,
+    })
+    .from(projectTaskDependencies)
+    .innerJoin(
+      projectTasks,
+      eq(projectTasks.id, projectTaskDependencies.blockedTaskId),
+    )
+    .where(
+      and(
+        eq(projectTaskDependencies.agencyId, agencyId),
+        eq(projectTaskDependencies.blockerTaskId, taskId),
+      ),
+    )
+    .orderBy(asc(projectTaskDependencies.createdAt));
+
+  return {
+    blockedBy: blockedByEdges.map((e) => ({
+      depId: e.depId,
+      task: serializeTask(e.task),
+    })),
+    blocks: blocksEdges.map((e) => ({
+      depId: e.depId,
+      task: serializeTask(e.task),
+    })),
+  };
+}
+
+// POST /projects/:id/tasks/:taskId/dependencies { type, otherTaskId }
+const createDependencySchema = z.object({
+  type: z.enum(['blocks', 'blocked_by']),
+  otherTaskId: z.string().min(1),
+});
+
+projectsRouter.post('/:id/tasks/:taskId/dependencies', async (req, res) => {
+  const ctx = getAuth(req);
+  const projectId = param(req, 'id');
+  await getScopedProject(ctx, projectId);
+  const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
+  const body = createDependencySchema.parse(req.body);
+
+  if (body.otherTaskId === task.id) {
+    throw new AppError(
+      'VALIDATION_ERROR',
+      'A task cannot depend on itself.',
+    );
+  }
+  // The other task must also live in this project.
+  const other = await getScopedTask(ctx, projectId, body.otherTaskId);
+
+  // Normalize to canonical (blocker -> blocked).
+  const blockerTaskId = body.type === 'blocks' ? task.id : other.id;
+  const blockedTaskId = body.type === 'blocks' ? other.id : task.id;
+
+  // Reject duplicate (also guarded by the unique index).
+  const [dup] = await db
+    .select({ id: projectTaskDependencies.id })
+    .from(projectTaskDependencies)
+    .where(
+      and(
+        eq(projectTaskDependencies.blockerTaskId, blockerTaskId),
+        eq(projectTaskDependencies.blockedTaskId, blockedTaskId),
+      ),
+    )
+    .limit(1);
+  if (dup) throw conflict('That dependency already exists.');
+
+  // Reject any edge that would introduce a cycle (covers 2-cycles too).
+  if (
+    await dependencyWouldCycle(
+      ctx.agencyId,
+      projectId,
+      blockerTaskId,
+      blockedTaskId,
+    )
+  ) {
+    throw new AppError(
+      'VALIDATION_ERROR',
+      'That dependency would create a cycle.',
+    );
+  }
+
+  const id = newId('pdp');
+  await db.insert(projectTaskDependencies).values({
+    id,
+    agencyId: ctx.agencyId,
+    projectId,
+    blockerTaskId,
+    blockedTaskId,
+    createdBy: ctx.userId,
+  });
+
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'task.dependency_add',
+    entityType: 'task',
+    entityId: task.id,
+    metadata: { projectId, blockerTaskId, blockedTaskId },
+    ip: req.ip,
+  });
+
+  created(res, await loadTaskDependencies(ctx.agencyId, task.id));
+});
+
+// DELETE /projects/:id/tasks/:taskId/dependencies/:depId
+projectsRouter.delete(
+  '/:id/tasks/:taskId/dependencies/:depId',
+  async (req, res) => {
+    const ctx = getAuth(req);
+    const projectId = param(req, 'id');
+    await getScopedProject(ctx, projectId);
+    const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
+    const depId = param(req, 'depId');
+
+    const [dep] = await db
+      .select()
+      .from(projectTaskDependencies)
+      .where(
+        and(
+          eq(projectTaskDependencies.id, depId),
+          eq(projectTaskDependencies.agencyId, ctx.agencyId),
+          eq(projectTaskDependencies.projectId, projectId),
+        ),
+      )
+      .limit(1);
+    if (!dep) throw notFound('Dependency not found.');
+    // The dep must touch this task (either side of the edge).
+    if (dep.blockerTaskId !== task.id && dep.blockedTaskId !== task.id) {
+      throw notFound('Dependency not found.');
+    }
+
+    await db
+      .delete(projectTaskDependencies)
+      .where(
+        and(
+          eq(projectTaskDependencies.id, depId),
+          eq(projectTaskDependencies.agencyId, ctx.agencyId),
+        ),
+      );
+
+    await audit({
+      agencyId: ctx.agencyId,
+      actorType: ctx.role,
+      actorId: ctx.userId,
+      action: 'task.dependency_remove',
+      entityType: 'task',
+      entityId: task.id,
+      metadata: {
+        projectId,
+        blockerTaskId: dep.blockerTaskId,
+        blockedTaskId: dep.blockedTaskId,
+      },
+      ip: req.ip,
+    });
+
+    ok(res, await loadTaskDependencies(ctx.agencyId, task.id));
+  },
+);
+
+// ============================================================
+//  TASK COMMENTS  §3.8
+// ============================================================
+
+/** Serialize a comment row joined with its author's name. */
+function serializeComment(c: {
+  id: string;
+  taskId: string;
+  authorId: string;
+  body: string;
+  mentionsJson: string | null;
+  createdAt: Date | null;
+  updatedAt: Date | null;
+  deletedAt: Date | null;
+  authorName: string | null;
+}) {
+  return {
+    id: c.id,
+    taskId: c.taskId,
+    authorId: c.authorId,
+    authorName: c.authorName,
+    body: c.body,
+    mentions: c.mentionsJson
+      ? (JSON.parse(c.mentionsJson) as string[])
+      : [],
+    createdAt: toIso(c.createdAt),
+    updatedAt: toIso(c.updatedAt),
+    deletedAt: toIso(c.deletedAt),
+  };
+}
+
+const commentSelection = {
+  id: projectTaskComments.id,
+  taskId: projectTaskComments.taskId,
+  authorId: projectTaskComments.authorId,
+  body: projectTaskComments.body,
+  mentionsJson: projectTaskComments.mentionsJson,
+  createdAt: projectTaskComments.createdAt,
+  updatedAt: projectTaskComments.updatedAt,
+  deletedAt: projectTaskComments.deletedAt,
+  authorName: users.fullName,
+};
+
+/**
+ * Parse explicit `mentions` (array of userIds) plus any `@token`s in the body,
+ * resolved against agency users, and intersect with the project's members.
+ * Returns the validated, de-duped set of mentioned userIds.
+ */
+async function resolveMentions(
+  agencyId: string,
+  body: string,
+  explicit: string[] | undefined,
+): Promise<string[]> {
+  const ids = new Set<string>(explicit ?? []);
+
+  // Lightweight @-token parse: @ followed by name-ish chars (handles @jane or
+  // @"Jane Doe"-style single tokens). Matched against user full names/emails.
+  const tokens = [...body.matchAll(/@([\w.\-]+)/g)].map((m) => m[1]!);
+  if (tokens.length > 0) {
+    const candidates = await db
+      .select({ id: users.id, email: users.email, fullName: users.fullName })
+      .from(users)
+      .where(eq(users.agencyId, agencyId));
+    for (const tok of tokens) {
+      const low = tok.toLowerCase();
+      const hit = candidates.find(
+        (u) =>
+          u.email.toLowerCase().startsWith(low) ||
+          (u.fullName ?? '').toLowerCase().replace(/\s+/g, '').startsWith(low),
+      );
+      if (hit) ids.add(hit.id);
+    }
+  }
+
+  if (ids.size === 0) return [];
+
+  // Keep only ids that are real agency users.
+  const valid = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(and(eq(users.agencyId, agencyId), inArray(users.id, [...ids])));
+  return valid.map((u) => u.id);
+}
+
+// GET /projects/:id/tasks/:taskId/comments (non-deleted, oldest-first)
+projectsRouter.get('/:id/tasks/:taskId/comments', async (req, res) => {
+  const ctx = getAuth(req);
+  const projectId = param(req, 'id');
+  await getScopedProject(ctx, projectId);
+  const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
+
+  const rows = await db
+    .select(commentSelection)
+    .from(projectTaskComments)
+    .leftJoin(users, eq(users.id, projectTaskComments.authorId))
+    .where(
+      and(
+        eq(projectTaskComments.agencyId, ctx.agencyId),
+        eq(projectTaskComments.taskId, task.id),
+        isNull(projectTaskComments.deletedAt),
+      ),
+    )
+    .orderBy(asc(projectTaskComments.createdAt));
+
+  ok(res, rows.map(serializeComment));
+});
+
+// POST /projects/:id/tasks/:taskId/comments { body, mentions? }
+const createCommentSchema = z.object({
+  body: z.string().trim().min(1).max(5000),
+  mentions: z.array(z.string().min(1)).optional(),
+});
+
+projectsRouter.post('/:id/tasks/:taskId/comments', async (req, res) => {
+  const ctx = getAuth(req);
+  const projectId = param(req, 'id');
+  await getScopedProject(ctx, projectId);
+  const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
+  const body = createCommentSchema.parse(req.body);
+
+  const mentions = await resolveMentions(
+    ctx.agencyId,
+    body.body,
+    body.mentions,
+  );
+
+  const id = newId('pcm');
+  await db.insert(projectTaskComments).values({
+    id,
+    agencyId: ctx.agencyId,
+    taskId: task.id,
+    authorId: ctx.userId,
+    body: body.body,
+    mentionsJson: mentions.length > 0 ? JSON.stringify(mentions) : null,
+  });
+
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'task.comment_add',
+    entityType: 'task',
+    entityId: task.id,
+    metadata: {
+      projectId,
+      commentId: id,
+      ...(mentions.length > 0 ? { mentions } : {}),
+    },
+    ip: req.ip,
+  });
+
+  const [row] = await db
+    .select(commentSelection)
+    .from(projectTaskComments)
+    .leftJoin(users, eq(users.id, projectTaskComments.authorId))
+    .where(eq(projectTaskComments.id, id));
+  created(res, serializeComment(row!));
+});
+
+/** Fetch a comment scoped to its task + agency (incl. soft-deleted), or 404. */
+async function getScopedComment(
+  ctx: ReturnType<typeof getAuth>,
+  taskId: string,
+  commentId: string,
+) {
+  const [row] = await db
+    .select()
+    .from(projectTaskComments)
+    .where(
+      and(
+        eq(projectTaskComments.id, commentId),
+        eq(projectTaskComments.agencyId, ctx.agencyId),
+        eq(projectTaskComments.taskId, taskId),
+      ),
+    )
+    .limit(1);
+  if (!row || row.deletedAt) throw notFound('Comment not found.');
+  return row;
+}
+
+// PATCH /projects/:id/tasks/:taskId/comments/:commentId (author-only)
+const updateCommentSchema = z.object({
+  body: z.string().trim().min(1).max(5000),
+  mentions: z.array(z.string().min(1)).optional(),
+});
+
+projectsRouter.patch(
+  '/:id/tasks/:taskId/comments/:commentId',
+  async (req, res) => {
+    const ctx = getAuth(req);
+    const projectId = param(req, 'id');
+    await getScopedProject(ctx, projectId);
+    const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
+    const comment = await getScopedComment(
+      ctx,
+      task.id,
+      param(req, 'commentId'),
+    );
+    if (comment.authorId !== ctx.userId) {
+      throw forbidden('You can only edit your own comments.');
+    }
+    const body = updateCommentSchema.parse(req.body);
+
+    const mentions = await resolveMentions(
+      ctx.agencyId,
+      body.body,
+      body.mentions,
+    );
+
+    await db
+      .update(projectTaskComments)
+      .set({
+        body: body.body,
+        mentionsJson: mentions.length > 0 ? JSON.stringify(mentions) : null,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(projectTaskComments.id, comment.id),
+          eq(projectTaskComments.agencyId, ctx.agencyId),
+        ),
+      );
+
+    const [row] = await db
+      .select(commentSelection)
+      .from(projectTaskComments)
+      .leftJoin(users, eq(users.id, projectTaskComments.authorId))
+      .where(eq(projectTaskComments.id, comment.id));
+    ok(res, serializeComment(row!));
+  },
+);
+
+// DELETE /projects/:id/tasks/:taskId/comments/:commentId (author-only soft delete)
+projectsRouter.delete(
+  '/:id/tasks/:taskId/comments/:commentId',
+  async (req, res) => {
+    const ctx = getAuth(req);
+    const projectId = param(req, 'id');
+    await getScopedProject(ctx, projectId);
+    const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
+    const comment = await getScopedComment(
+      ctx,
+      task.id,
+      param(req, 'commentId'),
+    );
+    if (comment.authorId !== ctx.userId) {
+      throw forbidden('You can only delete your own comments.');
+    }
+
+    await db
+      .update(projectTaskComments)
+      .set({ deletedAt: new Date() })
+      .where(
+        and(
+          eq(projectTaskComments.id, comment.id),
+          eq(projectTaskComments.agencyId, ctx.agencyId),
+        ),
+      );
+
+    ok(res, { deleted: true });
+  },
+);
+
+// ============================================================
+//  SINGLE TASK DETAIL  §3.7
+// ============================================================
+
+// GET /projects/:id/tasks/:taskId — full detail bundle.
+projectsRouter.get('/:id/tasks/:taskId', async (req, res) => {
+  const ctx = getAuth(req);
+  const projectId = param(req, 'id');
+  await getScopedProject(ctx, projectId);
+  const taskRow = await getScopedTask(ctx, projectId, param(req, 'taskId'));
+
+  const [enrichedTask] = await enrichTasks(ctx.agencyId, [taskRow]);
+
+  // Subtasks (children by position).
+  const subtaskRows = await db
+    .select()
+    .from(projectTasks)
+    .where(
+      and(
+        eq(projectTasks.agencyId, ctx.agencyId),
+        eq(projectTasks.projectId, projectId),
+        eq(projectTasks.parentTaskId, taskRow.id),
+      ),
+    )
+    .orderBy(asc(projectTasks.position), asc(projectTasks.createdAt));
+  const subtasks = await enrichTasks(ctx.agencyId, subtaskRows);
+
+  const dependencies = await loadTaskDependencies(ctx.agencyId, taskRow.id);
+
+  // Comments (non-deleted, oldest-first) with author names.
+  const commentRows = await db
+    .select(commentSelection)
+    .from(projectTaskComments)
+    .leftJoin(users, eq(users.id, projectTaskComments.authorId))
+    .where(
+      and(
+        eq(projectTaskComments.agencyId, ctx.agencyId),
+        eq(projectTaskComments.taskId, taskRow.id),
+        isNull(projectTaskComments.deletedAt),
+      ),
+    )
+    .orderBy(asc(projectTaskComments.createdAt));
+  const comments = commentRows.map(serializeComment);
+
+  // Activity = audit entries for this task entity, with actor names.
+  const activityRows = await db
+    .select({
+      id: auditLog.id,
+      actorType: auditLog.actorType,
+      actorId: auditLog.actorId,
+      action: auditLog.action,
+      metadataJson: auditLog.metadataJson,
+      createdAt: auditLog.createdAt,
+      actorName: users.fullName,
+    })
+    .from(auditLog)
+    .leftJoin(users, eq(users.id, auditLog.actorId))
+    .where(
+      and(
+        eq(auditLog.agencyId, ctx.agencyId),
+        eq(auditLog.entityType, 'task'),
+        eq(auditLog.entityId, taskRow.id),
+      ),
+    )
+    .orderBy(asc(auditLog.createdAt));
+  const activity = activityRows.map((a) => ({
+    id: a.id,
+    actorType: a.actorType,
+    actorId: a.actorId,
+    actorName: a.actorName,
+    action: a.action,
+    metadata: a.metadataJson ? JSON.parse(a.metadataJson) : null,
+    createdAt: toIso(a.createdAt),
+  }));
+
+  // Merged chronological feed: activity + comments, each tagged by kind.
+  const feed = [
+    ...activity.map((a) => ({
+      kind: 'activity' as const,
+      at: a.createdAt,
+      activity: a,
+    })),
+    ...comments.map((c) => ({
+      kind: 'comment' as const,
+      at: c.createdAt,
+      comment: c,
+    })),
+  ].sort((a, b) => (a.at ?? '').localeCompare(b.at ?? ''));
+
+  ok(res, {
+    task: enrichedTask,
+    subtasks,
+    labels: enrichedTask?.labels ?? [],
+    dependencies,
+    comments,
+    activity,
+    feed,
+  });
 });
 
 // ============================================================
