@@ -1,13 +1,15 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, asc, eq, inArray, like, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, like, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
+  auditLog,
   clients,
   projects,
   projectTasks,
   projectMilestones,
   projectMembers,
+  timeLogs,
   users,
 } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
@@ -16,6 +18,7 @@ import { notFound } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
 import { getAuth } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
+import { listProjectTimers } from './timers.js';
 
 // mergeParams keeps any parent params available (none today, but consistent
 // with the other nested routers).
@@ -302,6 +305,7 @@ projectsRouter.post('/', async (req, res) => {
     action: 'project.create',
     entityType: 'project',
     entityId: id,
+    metadata: { projectId: id, name: body.name },
     ip: req.ip,
   });
 
@@ -360,6 +364,20 @@ projectsRouter.patch('/:id', async (req, res) => {
       and(eq(projects.id, projectId), eq(projects.agencyId, ctx.agencyId)),
     );
 
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'project.update',
+    entityType: 'project',
+    entityId: projectId,
+    metadata: {
+      projectId,
+      ...(body.status !== undefined ? { status: body.status } : {}),
+    },
+    ip: req.ip,
+  });
+
   const row = await getScopedProject(ctx, projectId);
   ok(res, serializeProject(row));
 });
@@ -383,6 +401,7 @@ projectsRouter.delete('/:id', async (req, res) => {
     action: 'project.delete',
     entityType: 'project',
     entityId: projectId,
+    metadata: { projectId },
     ip: req.ip,
   });
   ok(res, { deleted: true });
@@ -473,6 +492,23 @@ projectsRouter.post('/:id/tasks', async (req, res) => {
     ...(body.position !== undefined ? { position: body.position } : {}),
   });
 
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'task.create',
+    entityType: 'task',
+    entityId: id,
+    metadata: {
+      projectId,
+      taskTitle: body.title,
+      status: body.status ?? 'todo',
+      ...(body.assigneeId ? { assigneeId: body.assigneeId } : {}),
+      ...(body.milestoneId ? { milestoneId: body.milestoneId } : {}),
+    },
+    ip: req.ip,
+  });
+
   const [row] = await db
     .select()
     .from(projectTasks)
@@ -523,6 +559,21 @@ projectsRouter.post('/:id/tasks/bulk', async (req, res) => {
       position: position++,
     });
   }
+
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'task.bulk_create',
+    entityType: 'task',
+    entityId: projectId,
+    metadata: {
+      projectId,
+      count: ids.length,
+      ...(body.milestoneId ? { milestoneId: body.milestoneId } : {}),
+    },
+    ip: req.ip,
+  });
 
   const rows = await db
     .select()
@@ -606,6 +657,34 @@ projectsRouter.patch('/:id/tasks/:taskId', async (req, res) => {
       ),
     );
 
+  // Audit: a status change is its own action for the activity feed; otherwise
+  // it's a generic task.update. Always carry the changed-field deltas.
+  const statusChanged =
+    body.status !== undefined && body.status !== task.status;
+  const assigneeChanged =
+    body.assigneeId !== undefined && body.assigneeId !== task.assigneeId;
+  const milestoneChanged =
+    body.milestoneId !== undefined && body.milestoneId !== task.milestoneId;
+
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: statusChanged ? 'task.status_change' : 'task.update',
+    entityType: 'task',
+    entityId: task.id,
+    metadata: {
+      projectId,
+      taskTitle: patch.title ?? task.title,
+      ...(statusChanged
+        ? { fromStatus: task.status, toStatus: body.status }
+        : {}),
+      ...(assigneeChanged ? { assigneeId: body.assigneeId } : {}),
+      ...(milestoneChanged ? { milestoneId: body.milestoneId } : {}),
+    },
+    ip: req.ip,
+  });
+
   const [row] = await db
     .select()
     .from(projectTasks)
@@ -628,6 +707,17 @@ projectsRouter.delete('/:id/tasks/:taskId', async (req, res) => {
         eq(projectTasks.agencyId, ctx.agencyId),
       ),
     );
+
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'task.delete',
+    entityType: 'task',
+    entityId: task.id,
+    metadata: { projectId, taskTitle: task.title },
+    ip: req.ip,
+  });
   ok(res, { deleted: true });
 });
 
@@ -685,6 +775,21 @@ projectsRouter.post('/:id/milestones', async (req, res) => {
     // Setting a milestone as completed at creation stamps completedAt.
     ...(body.status === 'completed' ? { completedAt: new Date() } : {}),
     ...(body.position !== undefined ? { position: body.position } : {}),
+  });
+
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'milestone.create',
+    entityType: 'milestone',
+    entityId: id,
+    metadata: {
+      projectId,
+      milestoneTitle: body.title,
+      status: body.status ?? 'pending',
+    },
+    ip: req.ip,
   });
 
   const [row] = await db
@@ -763,6 +868,26 @@ projectsRouter.patch('/:id/milestones/:milestoneId', async (req, res) => {
       ),
     );
 
+  const mStatusChanged =
+    body.status !== undefined && body.status !== milestone.status;
+
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'milestone.update',
+    entityType: 'milestone',
+    entityId: milestone.id,
+    metadata: {
+      projectId,
+      milestoneTitle: patch.title ?? milestone.title,
+      ...(mStatusChanged
+        ? { fromStatus: milestone.status, toStatus: body.status }
+        : {}),
+    },
+    ip: req.ip,
+  });
+
   const [row] = await db
     .select()
     .from(projectMilestones)
@@ -789,6 +914,17 @@ projectsRouter.delete('/:id/milestones/:milestoneId', async (req, res) => {
         eq(projectMilestones.agencyId, ctx.agencyId),
       ),
     );
+
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'milestone.delete',
+    entityType: 'milestone',
+    entityId: milestone.id,
+    metadata: { projectId, milestoneTitle: milestone.title },
+    ip: req.ip,
+  });
   ok(res, { deleted: true });
 });
 
@@ -879,6 +1015,22 @@ projectsRouter.post('/:id/members', async (req, res) => {
     )
     .limit(1);
 
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'member.add',
+    entityType: 'project_member',
+    entityId: row!.id,
+    metadata: {
+      projectId,
+      userId: body.userId,
+      userName: row!.userName,
+      role: body.role ?? null,
+    },
+    ip: req.ip,
+  });
+
   created(res, {
     id: row!.id,
     userId: row!.userId,
@@ -904,8 +1056,341 @@ projectsRouter.delete('/:id/members/:memberId', async (req, res) => {
         eq(projectMembers.projectId, projectId),
       ),
     )
-    .returning({ id: projectMembers.id });
+    .returning({ id: projectMembers.id, userId: projectMembers.userId });
   if (!result.length) throw notFound('Member not found.');
 
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'member.remove',
+    entityType: 'project_member',
+    entityId: result[0]!.id,
+    metadata: { projectId, userId: result[0]!.userId },
+    ip: req.ip,
+  });
+
   ok(res, { deleted: true });
+});
+
+// ============================================================
+//  TIME TRACKING (project-scoped reads; mutations live in timers.ts)
+// ============================================================
+
+// GET /projects/:id/timers — ALL running timers for the project
+projectsRouter.get('/:id/timers', async (req, res) => {
+  const ctx = getAuth(req);
+  const projectId = param(req, 'id');
+  await getScopedProject(ctx, projectId);
+  ok(res, await listProjectTimers(ctx, projectId));
+});
+
+// GET /projects/:id/time-summary
+projectsRouter.get('/:id/time-summary', async (req, res) => {
+  const ctx = getAuth(req);
+  const projectId = param(req, 'id');
+  await getScopedProject(ctx, projectId);
+
+  const [{ totalMinutes, logCount } = { totalMinutes: 0, logCount: 0 }] =
+    await db
+      .select({
+        totalMinutes: sql<number>`coalesce(sum(${timeLogs.minutes}), 0)`,
+        logCount: sql<number>`count(*)`,
+      })
+      .from(timeLogs)
+      .where(
+        and(
+          eq(timeLogs.agencyId, ctx.agencyId),
+          eq(timeLogs.projectId, projectId),
+        ),
+      );
+
+  const byMemberRows = await db
+    .select({
+      userId: timeLogs.userId,
+      userName: users.fullName,
+      minutes: sql<number>`coalesce(sum(${timeLogs.minutes}), 0)`,
+    })
+    .from(timeLogs)
+    .leftJoin(users, eq(users.id, timeLogs.userId))
+    .where(
+      and(
+        eq(timeLogs.agencyId, ctx.agencyId),
+        eq(timeLogs.projectId, projectId),
+      ),
+    )
+    .groupBy(timeLogs.userId, users.fullName)
+    .orderBy(desc(sql`sum(${timeLogs.minutes})`));
+
+  const byTaskRows = await db
+    .select({
+      taskId: timeLogs.taskId,
+      taskTitle: projectTasks.title,
+      minutes: sql<number>`coalesce(sum(${timeLogs.minutes}), 0)`,
+    })
+    .from(timeLogs)
+    .leftJoin(projectTasks, eq(projectTasks.id, timeLogs.taskId))
+    .where(
+      and(
+        eq(timeLogs.agencyId, ctx.agencyId),
+        eq(timeLogs.projectId, projectId),
+      ),
+    )
+    .groupBy(timeLogs.taskId, projectTasks.title)
+    .orderBy(desc(sql`sum(${timeLogs.minutes})`))
+    .limit(15);
+
+  const activeTimers = await listProjectTimers(ctx, projectId);
+
+  ok(res, {
+    totalMinutes: Number(totalMinutes ?? 0),
+    byMember: byMemberRows.map((m) => ({
+      userId: m.userId,
+      userName: m.userName,
+      minutes: Number(m.minutes ?? 0),
+    })),
+    byTask: byTaskRows.map((tk) => ({
+      taskId: tk.taskId,
+      taskTitle: tk.taskId ? tk.taskTitle : 'No task',
+      minutes: Number(tk.minutes ?? 0),
+    })),
+    activeTimers,
+    logCount: Number(logCount ?? 0),
+  });
+});
+
+// GET /projects/:id/time-logs?limit
+const projectLogsQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+});
+
+projectsRouter.get('/:id/time-logs', async (req, res) => {
+  const ctx = getAuth(req);
+  const projectId = param(req, 'id');
+  await getScopedProject(ctx, projectId);
+  const q = projectLogsQuery.parse(req.query);
+
+  const rows = await db
+    .select({
+      id: timeLogs.id,
+      minutes: timeLogs.minutes,
+      workDate: timeLogs.workDate,
+      note: timeLogs.note,
+      userId: timeLogs.userId,
+      userName: users.fullName,
+      taskId: timeLogs.taskId,
+      taskTitle: projectTasks.title,
+    })
+    .from(timeLogs)
+    .leftJoin(users, eq(users.id, timeLogs.userId))
+    .leftJoin(projectTasks, eq(projectTasks.id, timeLogs.taskId))
+    .where(
+      and(
+        eq(timeLogs.agencyId, ctx.agencyId),
+        eq(timeLogs.projectId, projectId),
+      ),
+    )
+    .orderBy(desc(timeLogs.workDate))
+    .limit(q.limit ?? 50);
+
+  ok(
+    res,
+    rows.map((l) => ({
+      id: l.id,
+      minutes: l.minutes,
+      workDate: toIso(l.workDate),
+      note: l.note,
+      userId: l.userId,
+      userName: l.userName,
+      taskId: l.taskId,
+      taskTitle: l.taskTitle,
+    })),
+  );
+});
+
+// ============================================================
+//  ACTIVITY FEED
+// ============================================================
+
+type ActivityRow = {
+  id: string;
+  action: string;
+  actorId: string | null;
+  actorName: string | null;
+  entityType: string | null;
+  entityId: string | null;
+  metadataJson: string | null;
+  createdAt: Date | null;
+};
+
+function serializeActivity(r: ActivityRow) {
+  let metadata: Record<string, unknown> | null = null;
+  if (r.metadataJson) {
+    try {
+      metadata = JSON.parse(r.metadataJson);
+    } catch {
+      metadata = null;
+    }
+  }
+  return {
+    id: r.id,
+    action: r.action,
+    actorId: r.actorId,
+    actorName: r.actorName,
+    entityType: r.entityType,
+    entityId: r.entityId,
+    metadata,
+    createdAt: toIso(r.createdAt),
+  };
+}
+
+/**
+ * Read the audit feed for a project: rows whose metadata json has the matching
+ * projectId. Uses json_extract with a LIKE fallback for robustness.
+ */
+async function fetchProjectActivity(
+  ctx: ReturnType<typeof getAuth>,
+  projectId: string,
+  limit: number,
+): Promise<ReturnType<typeof serializeActivity>[]> {
+  const rows = await db
+    .select({
+      id: auditLog.id,
+      action: auditLog.action,
+      actorId: auditLog.actorId,
+      actorName: users.fullName,
+      entityType: auditLog.entityType,
+      entityId: auditLog.entityId,
+      metadataJson: auditLog.metadataJson,
+      createdAt: auditLog.createdAt,
+    })
+    .from(auditLog)
+    .leftJoin(users, eq(users.id, auditLog.actorId))
+    .where(
+      and(
+        eq(auditLog.agencyId, ctx.agencyId),
+        sql`(
+          json_extract(${auditLog.metadataJson}, '$.projectId') = ${projectId}
+          or ${auditLog.metadataJson} like ${'%"projectId":"' + projectId + '"%'}
+        )`,
+      ),
+    )
+    .orderBy(desc(auditLog.createdAt))
+    .limit(limit);
+
+  return (rows as ActivityRow[]).map(serializeActivity);
+}
+
+// GET /projects/:id/activity?limit=50
+const activityQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+});
+
+projectsRouter.get('/:id/activity', async (req, res) => {
+  const ctx = getAuth(req);
+  const projectId = param(req, 'id');
+  await getScopedProject(ctx, projectId);
+  const q = activityQuery.parse(req.query);
+  ok(res, await fetchProjectActivity(ctx, projectId, q.limit ?? 50));
+});
+
+// ============================================================
+//  OVERVIEW (boss dashboard tab)
+// ============================================================
+
+projectsRouter.get('/:id/overview', async (req, res) => {
+  const ctx = getAuth(req);
+  const projectId = param(req, 'id');
+  await getScopedProject(ctx, projectId);
+
+  // Tasks grouped by status.
+  const taskStatusRows = await db
+    .select({
+      status: projectTasks.status,
+      count: sql<number>`count(*)`,
+    })
+    .from(projectTasks)
+    .where(
+      and(
+        eq(projectTasks.agencyId, ctx.agencyId),
+        eq(projectTasks.projectId, projectId),
+      ),
+    )
+    .groupBy(projectTasks.status);
+
+  const tasksByStatus = {
+    backlog: 0,
+    todo: 0,
+    in_progress: 0,
+    in_review: 0,
+    done: 0,
+  };
+  for (const r of taskStatusRows) {
+    if (r.status in tasksByStatus) {
+      tasksByStatus[r.status as keyof typeof tasksByStatus] = Number(
+        r.count ?? 0,
+      );
+    }
+  }
+  const taskTotal =
+    tasksByStatus.backlog +
+    tasksByStatus.todo +
+    tasksByStatus.in_progress +
+    tasksByStatus.in_review +
+    tasksByStatus.done;
+  const taskDone = tasksByStatus.done;
+
+  // Milestones.
+  const [{ milestoneTotal, milestoneDone } = { milestoneTotal: 0, milestoneDone: 0 }] =
+    await db
+      .select({
+        milestoneTotal: sql<number>`count(*)`,
+        milestoneDone: sql<number>`coalesce(sum(case when ${projectMilestones.status} = 'completed' then 1 else 0 end), 0)`,
+      })
+      .from(projectMilestones)
+      .where(
+        and(
+          eq(projectMilestones.agencyId, ctx.agencyId),
+          eq(projectMilestones.projectId, projectId),
+        ),
+      );
+
+  // Members.
+  const [{ memberCount } = { memberCount: 0 }] = await db
+    .select({ memberCount: sql<number>`count(*)` })
+    .from(projectMembers)
+    .where(
+      and(
+        eq(projectMembers.agencyId, ctx.agencyId),
+        eq(projectMembers.projectId, projectId),
+      ),
+    );
+
+  // Logged time.
+  const [{ totalTimeMinutes } = { totalTimeMinutes: 0 }] = await db
+    .select({
+      totalTimeMinutes: sql<number>`coalesce(sum(${timeLogs.minutes}), 0)`,
+    })
+    .from(timeLogs)
+    .where(
+      and(
+        eq(timeLogs.agencyId, ctx.agencyId),
+        eq(timeLogs.projectId, projectId),
+      ),
+    );
+
+  const activeTimers = await listProjectTimers(ctx, projectId);
+  const recentActivity = await fetchProjectActivity(ctx, projectId, 6);
+
+  ok(res, {
+    tasksByStatus,
+    taskTotal,
+    taskDone,
+    milestoneTotal: Number(milestoneTotal ?? 0),
+    milestoneDone: Number(milestoneDone ?? 0),
+    memberCount: Number(memberCount ?? 0),
+    totalTimeMinutes: Number(totalTimeMinutes ?? 0),
+    activeTimerCount: activeTimers.length,
+    recentActivity,
+  });
 });

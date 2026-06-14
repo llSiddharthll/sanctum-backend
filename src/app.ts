@@ -15,6 +15,7 @@ import { agenciesRouter } from './routes/agencies.js';
 import { usersRouter } from './routes/users.js';
 import { clientsRouter } from './routes/clients.js';
 import { projectsRouter } from './routes/projects.js';
+import { timersRouter } from './routes/timers.js';
 import { invoicesRouter } from './routes/invoices.js';
 import { expensesRouter } from './routes/expenses.js';
 import { financeRouter } from './routes/finance.js';
@@ -52,6 +53,7 @@ export function createApp() {
   api.use('/team', usersRouter);
   api.use('/clients', clientsRouter);
   api.use('/projects', projectsRouter);
+  api.use('/timers', timersRouter);
   api.use('/invoices', invoicesRouter);
   api.use('/expenses', expensesRouter);
   api.use('/finance', financeRouter);

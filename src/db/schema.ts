@@ -765,6 +765,36 @@ export const timeLogs = sqliteTable(
 );
 
 // ============================================================
+//  TIMERS (a row exists ONLY while a timer is RUNNING; deleted on stop)
+//  Exactly ONE running timer per user is enforced in application code.
+// ============================================================
+export const timers = sqliteTable(
+  t('timers'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    projectId: text('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    taskId: text('task_id').references(() => projectTasks.id, {
+      onDelete: 'set null',
+    }),
+    startedAt: ts('started_at').notNull(),
+    note: text('note'),
+    createdAt: ts('created_at').notNull().default(now),
+  },
+  (tbl) => [
+    index('ix_timers_agency_user').on(tbl.agencyId, tbl.userId),
+    index('ix_timers_agency_project').on(tbl.agencyId, tbl.projectId),
+  ],
+);
+
+// ============================================================
 //  INVOICES (financial documents; money stored as INTEGER PAISE)
 //  ₹1 = 100 paise. status: draft|sent|partially_paid|paid|cancelled.
 //  'overdue' is DERIVED in the serializer, never stored.
@@ -1125,6 +1155,7 @@ export type ProjectTask = typeof projectTasks.$inferSelect;
 export type ProjectMilestone = typeof projectMilestones.$inferSelect;
 export type ProjectMember = typeof projectMembers.$inferSelect;
 export type TimeLog = typeof timeLogs.$inferSelect;
+export type Timer = typeof timers.$inferSelect;
 export type Invoice = typeof invoices.$inferSelect;
 export type InvoiceItem = typeof invoiceItems.$inferSelect;
 export type InvoicePayment = typeof invoicePayments.$inferSelect;
