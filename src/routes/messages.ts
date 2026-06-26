@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { ok, created, param } from '../lib/http.js';
 import { requireAuth } from '../middleware/auth.js';
+import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth } from '../middleware/tenant.js';
 import {
   createMessage,
@@ -19,6 +20,7 @@ const THREAD_STATUSES = ['open', 'awaiting', 'closed'] as const;
 
 export const messagesRouter = Router();
 messagesRouter.use(requireAuth);
+messagesRouter.use(requireModuleRW('messages'));
 
 // ============================================================
 //  THREADS

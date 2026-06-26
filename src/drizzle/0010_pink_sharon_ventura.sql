@@ -1,0 +1,1 @@
+ALTER TABLE `sanctum_users` ADD `permissions_json` text;

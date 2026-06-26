@@ -7,11 +7,13 @@ import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { notFound } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
+import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
 
 export const expensesRouter = Router();
 expensesRouter.use(requireAuth);
+expensesRouter.use(requireModuleRW('finance'));
 
 const EXPENSE_CATEGORIES = [
   'software',

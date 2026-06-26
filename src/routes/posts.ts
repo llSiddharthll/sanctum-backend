@@ -7,12 +7,16 @@ import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { invalidState, notFound } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
+import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth, requireClientAccess } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
 
 // mergeParams so :clientId from the parent mount is available here.
 export const postsRouter = Router({ mergeParams: true });
 postsRouter.use(requireAuth);
+// Content posts are part of the Clients module (mounted outside clientsRouter,
+// so the module gate must be re-applied here): GET=view, writes=manage.
+postsRouter.use(requireModuleRW('clients'));
 
 type PostStatus =
   | 'draft'

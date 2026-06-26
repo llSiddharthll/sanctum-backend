@@ -24,6 +24,7 @@ import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { notFound, conflict, invalidState } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
+import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
 import {
@@ -35,6 +36,7 @@ import {
 
 export const invoicesRouter = Router();
 invoicesRouter.use(requireAuth);
+invoicesRouter.use(requireModuleRW('finance'));
 
 const INVOICE_STATUSES = [
   'draft',

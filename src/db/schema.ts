@@ -52,6 +52,10 @@ export const agencies = sqliteTable(t('agencies'), {
   status: text('status', { enum: ['active', 'suspended', 'deleted'] })
     .notNull()
     .default('active'),
+  // Per-agency role permission defaults: a JSON object
+  // { admin: { moduleKey: level }, member: { moduleKey: level } }.
+  // NULL means "use built-in defaults" (full access). See lib/permissions.ts.
+  rolePermissionsJson: text('role_permissions_json'),
   createdAt: ts('created_at').notNull().default(now),
   updatedAt: ts('updated_at').notNull().default(now),
 });
@@ -100,6 +104,12 @@ export const users = sqliteTable(
     role: text('role', { enum: ['owner', 'admin', 'member'] })
       .notNull()
       .default('member'),
+    // Module-level RBAC overrides: a JSON object of { moduleKey: accessLevel }.
+    // NULL means "use role defaults" (full access). See lib/permissions.ts.
+    permissionsJson: text('permissions_json'),
+    // Optional custom role (named permission preset). When set, the user's
+    // `role` column holds the custom role's base tier. See custom_roles.
+    customRoleId: text('custom_role_id'),
     status: text('status', { enum: ['active', 'disabled'] })
       .notNull()
       .default('active'),
@@ -206,12 +216,18 @@ export const clients = sqliteTable(
     portalVisibleStatuses: text('portal_visible_statuses')
       .notNull()
       .default('pending_approval,approved,scheduled,posted'),
+    // Account manager / relationship owner (distinct from task assignment).
+    ownerId: text('owner_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
     createdAt: ts('created_at').notNull().default(now),
     updatedAt: ts('updated_at').notNull().default(now),
   },
   (tbl) => [
     index('ix_clients_agency').on(tbl.agencyId),
     index('ix_clients_agency_status').on(tbl.agencyId, tbl.status),
+    index('ix_clients_agency_owner').on(tbl.agencyId, tbl.ownerId),
+    index('ix_clients_agency_followup').on(tbl.agencyId, tbl.nextFollowUpAt),
   ],
 );
 
@@ -1281,6 +1297,440 @@ export const sheets = sqliteTable(
   (tbl) => [index('ix_sheets_agency_updated').on(tbl.agencyId, tbl.updatedAt)],
 );
 
+// ============================================================
+//  ATTENDANCE_POLICY (per-agency work schedule + fencing; singleton)
+//  workdaysCsv: comma list of weekday numbers 0=Sun..6=Sat.
+//  Times are MINUTES from local midnight (in `timezone`).
+// ============================================================
+export const attendancePolicy = sqliteTable(t('attendance_policy'), {
+  agencyId: text('agency_id')
+    .primaryKey()
+    .references(() => agencies.id, { onDelete: 'cascade' }),
+  timezone: text('timezone').notNull().default('Asia/Kolkata'),
+  workdaysCsv: text('workdays_csv').notNull().default('1,2,3,4,5'),
+  // Which Saturday occurrences (1..5) are OFF when Saturday is a working day.
+  // e.g. "2,4" = 2nd & 4th Saturdays off (the common "even Saturdays" rule).
+  saturdayOffWeeksCsv: text('saturday_off_weeks_csv'),
+  shiftStartMin: integer('shift_start_min').notNull().default(540), // 09:00
+  shiftEndMin: integer('shift_end_min').notNull().default(1080), // 18:00
+  fullDayMinutes: integer('full_day_minutes').notNull().default(480), // 8h
+  halfDayMinutes: integer('half_day_minutes').notNull().default(240), // 4h
+  lateGraceMinutes: integer('late_grace_minutes').notNull().default(15),
+  countOvertime: integer('count_overtime', { mode: 'boolean' })
+    .notNull()
+    .default(true),
+  // Optional fencing — restrict where a punch can originate.
+  enforceIp: integer('enforce_ip', { mode: 'boolean' }).notNull().default(false),
+  allowedIpsCsv: text('allowed_ips_csv'),
+  enforceGeo: integer('enforce_geo', { mode: 'boolean' })
+    .notNull()
+    .default(false),
+  geoLat: real('geo_lat'),
+  geoLng: real('geo_lng'),
+  geoRadiusM: integer('geo_radius_m'),
+  updatedAt: ts('updated_at').notNull().default(now),
+});
+
+// ============================================================
+//  ATTENDANCE_RECORDS (one row per user per day; `day` = 'YYYY-MM-DD')
+// ============================================================
+export const attendanceRecords = sqliteTable(
+  t('attendance_records'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    day: text('day').notNull(), // local calendar day in the agency timezone
+    checkInAt: ts('check_in_at'),
+    checkOutAt: ts('check_out_at'),
+    workedMinutes: integer('worked_minutes').notNull().default(0),
+    overtimeMinutes: integer('overtime_minutes').notNull().default(0),
+    status: text('status', {
+      enum: [
+        'present',
+        'late',
+        'half_day',
+        'absent',
+        'on_leave',
+        'holiday',
+        'weekly_off',
+      ],
+    })
+      .notNull()
+      .default('present'),
+    isLate: integer('is_late', { mode: 'boolean' }).notNull().default(false),
+    source: text('source', {
+      enum: ['self', 'admin', 'regularized', 'system'],
+    })
+      .notNull()
+      .default('self'),
+    note: text('note'),
+    checkInIp: text('check_in_ip'),
+    checkInLat: real('check_in_lat'),
+    checkInLng: real('check_in_lng'),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [
+    uniqueIndex('ux_attendance_user_day').on(tbl.userId, tbl.day),
+    index('ix_attendance_agency_day').on(tbl.agencyId, tbl.day),
+    index('ix_attendance_agency_user_day').on(
+      tbl.agencyId,
+      tbl.userId,
+      tbl.day,
+    ),
+  ],
+);
+
+// ============================================================
+//  HOLIDAYS (agency-wide; `day` = 'YYYY-MM-DD'). Applied to all members.
+// ============================================================
+export const holidays = sqliteTable(
+  t('holidays'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    day: text('day').notNull(),
+    name: text('name').notNull(),
+    recurring: integer('recurring', { mode: 'boolean' })
+      .notNull()
+      .default(false),
+    createdBy: text('created_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: ts('created_at').notNull().default(now),
+  },
+  (tbl) => [
+    uniqueIndex('ux_holidays_agency_day').on(tbl.agencyId, tbl.day),
+    index('ix_holidays_agency').on(tbl.agencyId),
+  ],
+);
+
+// ============================================================
+//  LEAVE_TYPES (per-agency catalog: casual/sick/earned/unpaid…)
+// ============================================================
+export const leaveTypes = sqliteTable(
+  t('leave_types'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    colorToken: text('color_token').notNull().default('pine'),
+    paid: integer('paid', { mode: 'boolean' }).notNull().default(true),
+    annualQuota: integer('annual_quota').notNull().default(0), // days/year, 0=unlimited
+    active: integer('active', { mode: 'boolean' }).notNull().default(true),
+    sortOrder: integer('sort_order').notNull().default(0),
+    createdAt: ts('created_at').notNull().default(now),
+  },
+  (tbl) => [
+    uniqueIndex('ux_leave_types_agency_name').on(tbl.agencyId, tbl.name),
+    index('ix_leave_types_agency').on(tbl.agencyId),
+  ],
+);
+
+// ============================================================
+//  LEAVE_REQUESTS (apply -> approve/reject workflow)
+// ============================================================
+export const leaveRequests = sqliteTable(
+  t('leave_requests'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    leaveTypeId: text('leave_type_id')
+      .notNull()
+      .references(() => leaveTypes.id, { onDelete: 'restrict' }),
+    startDay: text('start_day').notNull(), // YYYY-MM-DD
+    endDay: text('end_day').notNull(),
+    halfDayStart: integer('half_day_start', { mode: 'boolean' })
+      .notNull()
+      .default(false),
+    halfDayEnd: integer('half_day_end', { mode: 'boolean' })
+      .notNull()
+      .default(false),
+    days: real('days').notNull().default(0), // computed working-day count
+    reason: text('reason'),
+    status: text('status', {
+      enum: ['pending', 'approved', 'rejected', 'cancelled'],
+    })
+      .notNull()
+      .default('pending'),
+    decidedBy: text('decided_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    decidedAt: ts('decided_at'),
+    decisionNote: text('decision_note'),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [
+    index('ix_leave_req_agency_status').on(tbl.agencyId, tbl.status),
+    index('ix_leave_req_agency_user').on(tbl.agencyId, tbl.userId),
+  ],
+);
+
+// ============================================================
+//  ATTENDANCE_REGULARIZATIONS (fix a day: late/short/half/missed punch)
+// ============================================================
+export const attendanceRegularizations = sqliteTable(
+  t('attendance_regularizations'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    day: text('day').notNull(),
+    type: text('type', {
+      enum: [
+        'missed_punch',
+        'late',
+        'short_hours',
+        'half_day',
+        'wrong_status',
+      ],
+    }).notNull(),
+    requestedCheckInAt: ts('requested_check_in_at'),
+    requestedCheckOutAt: ts('requested_check_out_at'),
+    requestedStatus: text('requested_status', {
+      enum: ['present', 'half_day', 'on_leave'],
+    }),
+    reason: text('reason').notNull(),
+    status: text('status', {
+      enum: ['pending', 'approved', 'rejected', 'cancelled'],
+    })
+      .notNull()
+      .default('pending'),
+    decidedBy: text('decided_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    decidedAt: ts('decided_at'),
+    decisionNote: text('decision_note'),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [
+    index('ix_regular_agency_status').on(tbl.agencyId, tbl.status),
+    index('ix_regular_agency_user').on(tbl.agencyId, tbl.userId),
+  ],
+);
+
+// ============================================================
+//  NOTIFICATIONS (in-app alerts; realtime over Socket.IO)
+// ============================================================
+export const notifications = sqliteTable(
+  t('notifications'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    type: text('type').notNull(), // e.g. 'leave.requested', 'leave.approved'
+    title: text('title').notNull(),
+    body: text('body'),
+    entityType: text('entity_type'),
+    entityId: text('entity_id'),
+    link: text('link'),
+    readAt: ts('read_at'),
+    createdAt: ts('created_at').notNull().default(now),
+  },
+  (tbl) => [
+    index('ix_notifications_user_created').on(tbl.userId, tbl.createdAt),
+    index('ix_notifications_user_unread').on(tbl.userId, tbl.readAt),
+  ],
+);
+
+// ============================================================
+//  CLIENT_CONTACTS (multiple people per client)
+// ============================================================
+export const clientContacts = sqliteTable(
+  t('client_contacts'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    clientId: text('client_id')
+      .notNull()
+      .references(() => clients.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    role: text('role'), // job title / relationship (e.g. 'Founder', 'Finance')
+    email: text('email'),
+    phone: text('phone'),
+    isPrimary: integer('is_primary', { mode: 'boolean' })
+      .notNull()
+      .default(false),
+    isBilling: integer('is_billing', { mode: 'boolean' })
+      .notNull()
+      .default(false),
+    notes: text('notes'),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [index('ix_client_contacts_agency_client').on(tbl.agencyId, tbl.clientId)],
+);
+
+// ============================================================
+//  CLIENT_NOTES (activity timeline: notes / calls / meetings / emails)
+// ============================================================
+export const clientNotes = sqliteTable(
+  t('client_notes'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    clientId: text('client_id')
+      .notNull()
+      .references(() => clients.id, { onDelete: 'cascade' }),
+    authorId: text('author_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    type: text('type', {
+      enum: ['note', 'call', 'meeting', 'email', 'task'],
+    })
+      .notNull()
+      .default('note'),
+    body: text('body').notNull(),
+    pinned: integer('pinned', { mode: 'boolean' }).notNull().default(false),
+    // For 'task' entries: a due date + completion stamp (drives follow-ups).
+    dueAt: ts('due_at'),
+    completedAt: ts('completed_at'),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [
+    index('ix_client_notes_agency_client_created').on(
+      tbl.agencyId,
+      tbl.clientId,
+      tbl.createdAt,
+    ),
+  ],
+);
+
+// ============================================================
+//  DEALS (sales pipeline / opportunities per client)
+//  valuePaise: INTEGER PAISE (₹1 = 100 paise).
+// ============================================================
+export const deals = sqliteTable(
+  t('deals'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    clientId: text('client_id')
+      .notNull()
+      .references(() => clients.id, { onDelete: 'cascade' }),
+    title: text('title').notNull(),
+    stage: text('stage', {
+      enum: ['lead', 'qualified', 'proposal', 'negotiation', 'won', 'lost'],
+    })
+      .notNull()
+      .default('lead'),
+    valuePaise: integer('value_paise').notNull().default(0),
+    currency: text('currency').notNull().default('INR'),
+    probability: integer('probability').notNull().default(0), // 0..100
+    expectedCloseAt: ts('expected_close_at'),
+    ownerId: text('owner_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    lostReason: text('lost_reason'),
+    notes: text('notes'),
+    createdBy: text('created_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    closedAt: ts('closed_at'),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [
+    index('ix_deals_agency_stage').on(tbl.agencyId, tbl.stage),
+    index('ix_deals_agency_client').on(tbl.agencyId, tbl.clientId),
+  ],
+);
+
+// ============================================================
+//  CLIENT_TAGS + CLIENT_TAG_LINKS (M:N segmentation)
+// ============================================================
+export const clientTags = sqliteTable(
+  t('client_tags'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    colorToken: text('color_token').notNull().default('pine'),
+    createdAt: ts('created_at').notNull().default(now),
+  },
+  (tbl) => [uniqueIndex('ux_client_tags_agency_name').on(tbl.agencyId, tbl.name)],
+);
+
+export const clientTagLinks = sqliteTable(
+  t('client_tag_links'),
+  {
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    clientId: text('client_id')
+      .notNull()
+      .references(() => clients.id, { onDelete: 'cascade' }),
+    tagId: text('tag_id')
+      .notNull()
+      .references(() => clientTags.id, { onDelete: 'cascade' }),
+  },
+  (tbl) => [
+    primaryKey({ columns: [tbl.clientId, tbl.tagId] }),
+    index('ix_client_tag_links_tag').on(tbl.tagId),
+    index('ix_client_tag_links_agency_client').on(tbl.agencyId, tbl.clientId),
+  ],
+);
+
+// ============================================================
+//  CUSTOM_ROLES (named permission presets per agency)
+//  baseRole = the privilege tier the role inherits (admin|member).
+//  permissionsJson = module->level overrides layered above the base tier.
+// ============================================================
+export const customRoles = sqliteTable(
+  t('custom_roles'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    colorToken: text('color_token').notNull().default('pine'),
+    baseRole: text('base_role', { enum: ['admin', 'member'] })
+      .notNull()
+      .default('member'),
+    permissionsJson: text('permissions_json'),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [
+    uniqueIndex('ux_custom_roles_agency_name').on(tbl.agencyId, tbl.name),
+    index('ix_custom_roles_agency').on(tbl.agencyId),
+  ],
+);
+
 // ---- Inferred row types (handy across the app) ----
 export type Agency = typeof agencies.$inferSelect;
 export type User = typeof users.$inferSelect;
@@ -1305,3 +1755,16 @@ export type ThreadParticipant = typeof threadParticipants.$inferSelect;
 export type Message = typeof messages.$inferSelect;
 export type Document = typeof documents.$inferSelect;
 export type Sheet = typeof sheets.$inferSelect;
+export type AttendancePolicy = typeof attendancePolicy.$inferSelect;
+export type AttendanceRecord = typeof attendanceRecords.$inferSelect;
+export type Holiday = typeof holidays.$inferSelect;
+export type LeaveType = typeof leaveTypes.$inferSelect;
+export type LeaveRequest = typeof leaveRequests.$inferSelect;
+export type AttendanceRegularization =
+  typeof attendanceRegularizations.$inferSelect;
+export type Notification = typeof notifications.$inferSelect;
+export type ClientContact = typeof clientContacts.$inferSelect;
+export type ClientNote = typeof clientNotes.$inferSelect;
+export type Deal = typeof deals.$inferSelect;
+export type ClientTag = typeof clientTags.$inferSelect;
+export type CustomRole = typeof customRoles.$inferSelect;

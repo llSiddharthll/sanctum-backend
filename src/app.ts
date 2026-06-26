@@ -29,6 +29,9 @@ import { portalRouter } from './routes/portal.js';
 import { messagesRouter } from './routes/messages.js';
 import { documentsRouter } from './routes/documents.js';
 import { sheetsRouter } from './routes/sheets.js';
+import { attendanceRouter } from './routes/attendance.js';
+import { notificationsRouter } from './routes/notifications.js';
+import { crmRouter } from './routes/crm.js';
 
 export function createApp() {
   const app = express();
@@ -72,6 +75,9 @@ export function createApp() {
   api.use('/messages', messagesRouter);
   api.use('/documents', documentsRouter);
   api.use('/sheets', sheetsRouter);
+  api.use('/attendance', attendanceRouter);
+  api.use('/notifications', notificationsRouter);
+  api.use('/crm', crmRouter);
 
   // Public client portal (token-auth, no cookies).
   api.use('/portal', portalRouter);

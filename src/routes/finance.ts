@@ -10,10 +10,12 @@ import {
 } from '../db/schema.js';
 import { ok } from '../lib/http.js';
 import { requireAuth } from '../middleware/auth.js';
+import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth } from '../middleware/tenant.js';
 
 export const financeRouter = Router();
 financeRouter.use(requireAuth);
+financeRouter.use(requireModuleRW('finance'));
 
 type AuthCtx = ReturnType<typeof getAuth>;
 

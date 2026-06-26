@@ -7,12 +7,15 @@ import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { notFound } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
+import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth, requireClientAccess } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
 
 // Mounted under /clients/:clientId/posts/:postId — mergeParams pulls both ids.
 export const approvalsRouter = Router({ mergeParams: true });
 approvalsRouter.use(requireAuth);
+// Part of the Clients module (mounted outside clientsRouter): re-apply the gate.
+approvalsRouter.use(requireModuleRW('clients'));
 
 async function scopedPost(
   ctx: ReturnType<typeof getAuth>,

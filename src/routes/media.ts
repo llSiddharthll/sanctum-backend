@@ -7,11 +7,14 @@ import { ok, created } from '../lib/http.js';
 import { newId, currentPeriod } from '../lib/ids.js';
 import { notFound } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
+import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth, requireClientAccess } from '../middleware/tenant.js';
 import { signUpload, destroyAsset } from '../services/cloudinary.js';
 
 export const mediaRouter = Router();
 mediaRouter.use(requireAuth);
+// Post media is part of the Clients module: GET=view, writes=manage.
+mediaRouter.use(requireModuleRW('clients'));
 
 // POST /media/sign — Cloudinary signed upload signature.
 const signSchema = z.object({

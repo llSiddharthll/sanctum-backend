@@ -7,16 +7,28 @@ import {
   aiGenerations,
   auditLog,
   clients,
+  customRoles,
   plans,
   subscriptions,
   usageCounters,
   users,
 } from '../db/schema.js';
-import { ok, toIso } from '../lib/http.js';
-import { notFound } from '../lib/errors.js';
-import { currentPeriod } from '../lib/ids.js';
+import { ok, created, toIso, param } from '../lib/http.js';
+import { conflict, notFound } from '../lib/errors.js';
+import { currentPeriod, newId } from '../lib/ids.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
+import { requireModule } from '../middleware/permissions.js';
 import { getAuth } from '../middleware/tenant.js';
+import {
+  moduleCatalog,
+  resolveRolePermissions,
+  resolvePermissions,
+  serializeRoleDefaults,
+  serializeOverrides,
+  parseRoleDefaults,
+  sanitizeRoleDefaults,
+} from '../lib/permissions.js';
+import { audit } from '../services/audit.js';
 import { rateLimitConfig } from '../middleware/rate-limit.js';
 import { env } from '../env.js';
 
@@ -49,7 +61,11 @@ const patchSchema = z.object({
   brandColor: z.string().max(20).nullable().optional(),
 });
 
-agenciesRouter.patch('/', requireRole('owner', 'admin'), async (req, res) => {
+agenciesRouter.patch(
+  '/',
+  requireRole('owner', 'admin'),
+  requireModule('settings', 'manage'),
+  async (req, res) => {
   const ctx = getAuth(req);
   const body = patchSchema.parse(req.body);
   const patch: Partial<typeof agencies.$inferInsert> = { updatedAt: new Date() };
@@ -188,5 +204,211 @@ agenciesRouter.get(
         createdAt: toIso(a.createdAt),
       })),
     );
+  },
+);
+
+// ============================================================
+//  ROLES & PERMISSIONS (admin-managed role defaults)
+//  The module catalog is code-defined (single source of truth), so new
+//  modules appear here automatically. Per-role defaults are stored per agency
+//  and layered under each user's personal overrides.
+// ============================================================
+
+// GET /agency/roles — module catalog + the effective per-role permission matrix.
+agenciesRouter.get(
+  '/roles',
+  requireRole('owner', 'admin'),
+  requireModule('settings', 'view'),
+  async (req, res) => {
+    const ctx = getAuth(req);
+    const [agency] = await db
+      .select({ rolePermissionsJson: agencies.rolePermissionsJson })
+      .from(agencies)
+      .where(eq(agencies.id, ctx.agencyId))
+      .limit(1);
+    if (!agency) throw notFound('Agency not found.');
+    ok(res, {
+      modules: moduleCatalog(),
+      // owner is always full access (and not editable); admin + member are
+      // resolved from stored defaults, falling back to full access.
+      roles: resolveRolePermissions(agency.rolePermissionsJson),
+    });
+  },
+);
+
+// PUT /agency/roles — replace the admin/member role defaults.
+const rolesSchema = z.object({
+  admin: z.record(z.string(), z.string()).optional(),
+  member: z.record(z.string(), z.string()).optional(),
+});
+
+agenciesRouter.put(
+  '/roles',
+  requireRole('owner', 'admin'),
+  requireModule('settings', 'manage'),
+  async (req, res) => {
+    const ctx = getAuth(req);
+    const body = rolesSchema.parse(req.body);
+
+    // Merge incoming role maps onto the existing stored defaults.
+    const [agency] = await db
+      .select({ rolePermissionsJson: agencies.rolePermissionsJson })
+      .from(agencies)
+      .where(eq(agencies.id, ctx.agencyId))
+      .limit(1);
+    if (!agency) throw notFound('Agency not found.');
+
+    const existing = parseRoleDefaults(agency.rolePermissionsJson);
+    const incoming = sanitizeRoleDefaults(body);
+    const merged = {
+      admin: { ...existing.admin, ...incoming.admin },
+      member: { ...existing.member, ...incoming.member },
+    };
+
+    await db
+      .update(agencies)
+      .set({
+        rolePermissionsJson: serializeRoleDefaults(merged),
+        updatedAt: new Date(),
+      })
+      .where(eq(agencies.id, ctx.agencyId));
+
+    await audit({
+      agencyId: ctx.agencyId,
+      actorType: ctx.role,
+      actorId: ctx.userId,
+      action: 'roles.update',
+      entityType: 'agency',
+      entityId: ctx.agencyId,
+      ip: req.ip,
+    });
+
+    ok(res, {
+      modules: moduleCatalog(),
+      roles: resolveRolePermissions(serializeRoleDefaults(merged)),
+    });
+  },
+);
+
+// ============================================================
+//  CUSTOM ROLES (named permission presets, owner/admin-managed)
+// ============================================================
+function serializeCustomRole(cr: typeof customRoles.$inferSelect) {
+  return {
+    id: cr.id,
+    name: cr.name,
+    colorToken: cr.colorToken,
+    baseRole: cr.baseRole,
+    // Effective module map (custom overrides over the base tier defaults).
+    permissions: resolvePermissions(cr.baseRole, null, null, cr.permissionsJson),
+  };
+}
+
+agenciesRouter.get(
+  '/custom-roles',
+  requireRole('owner', 'admin'),
+  requireModule('settings', 'view'),
+  async (req, res) => {
+    const ctx = getAuth(req);
+    const rows = await db
+      .select()
+      .from(customRoles)
+      .where(eq(customRoles.agencyId, ctx.agencyId))
+      .orderBy(customRoles.name);
+    ok(res, rows.map(serializeCustomRole));
+  },
+);
+
+const customRoleSchema = z.object({
+  name: z.string().trim().min(1).max(40),
+  colorToken: z.string().trim().max(20).optional(),
+  baseRole: z.enum(['admin', 'member']),
+  permissions: z.record(z.string(), z.string()).optional(),
+});
+
+agenciesRouter.post(
+  '/custom-roles',
+  requireRole('owner', 'admin'),
+  requireModule('settings', 'manage'),
+  async (req, res) => {
+    const ctx = getAuth(req);
+    const body = customRoleSchema.parse(req.body);
+    const [dupe] = await db
+      .select({ id: customRoles.id })
+      .from(customRoles)
+      .where(and(eq(customRoles.agencyId, ctx.agencyId), eq(customRoles.name, body.name)))
+      .limit(1);
+    if (dupe) throw conflict('A role with that name already exists.');
+    const id = newId('crl');
+    await db.insert(customRoles).values({
+      id,
+      agencyId: ctx.agencyId,
+      name: body.name,
+      colorToken: body.colorToken ?? 'pine',
+      baseRole: body.baseRole,
+      permissionsJson: serializeOverrides(body.permissions ?? {}),
+    });
+    await audit({
+      agencyId: ctx.agencyId,
+      actorType: ctx.role,
+      actorId: ctx.userId,
+      action: 'role.create',
+      entityType: 'custom_role',
+      entityId: id,
+      metadata: { name: body.name, baseRole: body.baseRole },
+      ip: req.ip,
+    });
+    const [row] = await db.select().from(customRoles).where(eq(customRoles.id, id));
+    created(res, serializeCustomRole(row!));
+  },
+);
+
+agenciesRouter.patch(
+  '/custom-roles/:id',
+  requireRole('owner', 'admin'),
+  requireModule('settings', 'manage'),
+  async (req, res) => {
+    const ctx = getAuth(req);
+    const id = param(req, 'id');
+    const body = customRoleSchema.partial().parse(req.body);
+    const patch: Partial<typeof customRoles.$inferInsert> = { updatedAt: new Date() };
+    if (body.name !== undefined) patch.name = body.name;
+    if (body.colorToken !== undefined) patch.colorToken = body.colorToken;
+    if (body.baseRole !== undefined) patch.baseRole = body.baseRole;
+    if (body.permissions !== undefined)
+      patch.permissionsJson = serializeOverrides(body.permissions);
+    await db
+      .update(customRoles)
+      .set(patch)
+      .where(and(eq(customRoles.id, id), eq(customRoles.agencyId, ctx.agencyId)));
+    // Changing the base tier re-tiers every user holding this role.
+    if (body.baseRole !== undefined) {
+      await db
+        .update(users)
+        .set({ role: body.baseRole, updatedAt: new Date() })
+        .where(and(eq(users.agencyId, ctx.agencyId), eq(users.customRoleId, id)));
+    }
+    const [row] = await db.select().from(customRoles).where(eq(customRoles.id, id));
+    if (!row) throw notFound('Role not found.');
+    ok(res, serializeCustomRole(row));
+  },
+);
+
+agenciesRouter.delete(
+  '/custom-roles/:id',
+  requireRole('owner', 'admin'),
+  requireModule('settings', 'manage'),
+  async (req, res) => {
+    const ctx = getAuth(req);
+    const id = param(req, 'id');
+    // Detach holders — they revert to their base tier with no preset.
+    await db
+      .update(users)
+      .set({ customRoleId: null, updatedAt: new Date() })
+      .where(and(eq(users.agencyId, ctx.agencyId), eq(users.customRoleId, id)));
+    await db
+      .delete(customRoles)
+      .where(and(eq(customRoles.id, id), eq(customRoles.agencyId, ctx.agencyId)));
+    ok(res, { deleted: true });
   },
 );

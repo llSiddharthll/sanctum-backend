@@ -4,6 +4,7 @@ import { and, eq, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   agencies,
+  customRoles,
   plans,
   subscriptions,
   users,
@@ -26,6 +27,7 @@ import { requireAuth, REFRESH_COOKIE } from '../middleware/auth.js';
 import { authLimiter } from '../middleware/rate-limit.js';
 import { getAuth } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
+import { resolvePermissions } from '../lib/permissions.js';
 
 export const authRouter = Router();
 
@@ -259,12 +261,32 @@ authRouter.get('/me', requireAuth, async (req, res) => {
     plan = p ?? null;
   }
 
+  // Resolve the user's custom role (if any) for its name + permission preset.
+  let customRole = null;
+  if (user.customRoleId) {
+    const [cr] = await db
+      .select()
+      .from(customRoles)
+      .where(
+        and(
+          eq(customRoles.id, user.customRoleId),
+          eq(customRoles.agencyId, ctx.agencyId),
+        ),
+      )
+      .limit(1);
+    customRole = cr ?? null;
+  }
+  const builtinLabel =
+    user.role === 'owner' ? 'Owner' : user.role === 'admin' ? 'Admin' : 'Member';
+
   ok(res, {
     user: {
       id: user.id,
       email: user.email,
       fullName: user.fullName,
       role: user.role,
+      customRoleId: user.customRoleId,
+      roleName: customRole?.name ?? builtinLabel,
     },
     agency: agency
       ? { id: agency.id, name: agency.name, slug: agency.slug }
@@ -277,5 +299,13 @@ authRouter.get('/me', requireAuth, async (req, res) => {
           maxAiGenerations: plan.maxAiGenerations,
         }
       : null,
+    // Effective module permissions for sidebar/route gating on the client
+    // (user override > custom role > agency role default > built-in default).
+    permissions: resolvePermissions(
+      user.role,
+      user.permissionsJson,
+      agency?.rolePermissionsJson ?? null,
+      customRole?.permissionsJson ?? null,
+    ),
   });
 });

@@ -30,6 +30,7 @@
     "express-rate-limit": "8.2.1",
     "helmet": "8.1.0",
     "jose": "6.2.3",
+    "nodemailer": "^9.0.1",
     "socket.io": "^4.8.3",
     "zod": "4.4.3"
   },
@@ -38,6 +39,7 @@
     "@types/cors": "2.8.19",
     "@types/express": "5.0.3",
     "@types/node": "24.10.1",
+    "@types/nodemailer": "^8.0.1",
     "drizzle-kit": "0.31.10",
     "tsx": "4.20.6",
     "typescript": "5.9.3"

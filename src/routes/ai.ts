@@ -13,6 +13,7 @@ import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { quotaExceeded } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
+import { requireModuleRW } from '../middleware/permissions.js';
 import { aiLimiter } from '../middleware/rate-limit.js';
 import { getAuth, requireClientAccess } from '../middleware/tenant.js';
 import { generateMonth } from '../services/ai.js';
@@ -20,6 +21,7 @@ import { audit } from '../services/audit.js';
 
 export const aiRouter = Router({ mergeParams: true });
 aiRouter.use(requireAuth);
+aiRouter.use(requireModuleRW('ai'));
 
 const POST_TYPES = ['reel', 'story', 'carousel', 'post'] as const;
 

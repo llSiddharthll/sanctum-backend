@@ -1,0 +1,1 @@
+ALTER TABLE `sanctum_attendance_policy` ADD `saturday_off_weeks_csv` text;

@@ -5,6 +5,9 @@ import { db } from '../db/client.js';
 import {
   agencies,
   clients,
+  clientContacts,
+  clientTagLinks,
+  clientTags,
   portalTokens,
   plans,
   projects,
@@ -12,11 +15,13 @@ import {
   invoices,
   invoicePayments,
   documents,
+  users,
 } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
 import { newId, newOpaqueToken } from '../lib/ids.js';
 import { conflict, notFound, quotaExceeded } from '../lib/errors.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
+import { requireModuleRW } from '../middleware/permissions.js';
 import {
   assignedClientIds,
   getAuth,
@@ -28,6 +33,7 @@ import { sendPortalWelcome } from '../services/email.js';
 
 export const clientsRouter = Router();
 clientsRouter.use(requireAuth);
+clientsRouter.use(requireModuleRW('clients'));
 
 function serializeClient(c: typeof clients.$inferSelect) {
   return {
@@ -53,6 +59,7 @@ function serializeClient(c: typeof clients.$inferSelect) {
     relationshipHealth: c.relationshipHealth,
     nextFollowUpAt: toIso(c.nextFollowUpAt),
     internalNotes: c.internalNotes,
+    ownerId: c.ownerId,
     portalVisibleStatuses: c.portalVisibleStatuses.split(','),
     createdAt: toIso(c.createdAt),
     updatedAt: toIso(c.updatedAt),
@@ -110,27 +117,32 @@ const relationshipHealthEnum = z.enum([
 ]);
 
 // POST /clients — create (owner/admin), enforces plan client limit.
+// Optional CRM fields accept `null` so the edit form can CLEAR a field (the
+// PATCH handler writes null when the key is present). `name` and the
+// defaulted enums/status stay non-nullable.
 const createSchema = z.object({
   name: z.string().min(1).max(120),
-  logoUrl: z.string().url().optional(),
-  brandColor: z.string().max(20).optional(),
+  logoUrl: z.string().url().nullable().optional(),
+  brandColor: z.string().max(20).nullable().optional(),
   handles: z.record(z.string(), z.string()).optional(),
-  contactEmail: z.string().email().optional(),
+  contactEmail: z.string().email().nullable().optional(),
   // ---- Agency-CRM fields ----
-  industry: z.string().trim().max(120).optional(),
-  website: z.string().trim().max(255).optional(),
-  phoneCc: z.string().trim().max(8).optional(),
-  phone: z.string().trim().max(32).optional(),
-  clientSource: clientSourceEnum.optional(),
-  gstNumber: z.string().trim().max(32).optional(),
-  paymentTermsDays: z.number().int().min(0).optional(),
-  billingAddress: z.string().trim().max(500).optional(),
-  billingState: z.string().trim().max(120).optional(),
-  billingCity: z.string().trim().max(120).optional(),
-  billingPincode: z.string().trim().max(16).optional(),
+  industry: z.string().trim().max(120).nullable().optional(),
+  website: z.string().trim().max(255).nullable().optional(),
+  phoneCc: z.string().trim().max(8).nullable().optional(),
+  phone: z.string().trim().max(32).nullable().optional(),
+  clientSource: clientSourceEnum.nullable().optional(),
+  gstNumber: z.string().trim().max(32).nullable().optional(),
+  paymentTermsDays: z.number().int().min(0).nullable().optional(),
+  billingAddress: z.string().trim().max(500).nullable().optional(),
+  billingState: z.string().trim().max(120).nullable().optional(),
+  billingCity: z.string().trim().max(120).nullable().optional(),
+  billingPincode: z.string().trim().max(16).nullable().optional(),
   relationshipHealth: relationshipHealthEnum.optional(),
-  nextFollowUpAt: z.coerce.date().optional(),
-  internalNotes: z.string().trim().max(5000).optional(),
+  nextFollowUpAt: z.coerce.date().nullable().optional(),
+  internalNotes: z.string().trim().max(5000).nullable().optional(),
+  // Account manager / relationship owner.
+  ownerId: z.string().nullable().optional(),
   // `isActive` toggle ('Active client' checkbox) maps to status.
   isActive: z.boolean().optional(),
 });
@@ -167,6 +179,7 @@ clientsRouter.post('/', requireRole('owner', 'admin'), async (req, res) => {
       : {}),
     nextFollowUpAt: body.nextFollowUpAt ?? null,
     internalNotes: body.internalNotes ?? null,
+    ownerId: body.ownerId ?? null,
     // 'Active client' toggle: isActive=true -> 'active', false -> 'archived'.
     ...(body.isActive !== undefined
       ? { status: body.isActive ? 'active' : 'archived' }
@@ -272,8 +285,35 @@ clientsRouter.get('/:clientId', async (req, res) => {
       ),
     );
 
+  // Account owner name + segmentation tags (folded into the detail).
+  let ownerName: string | null = null;
+  if (client.ownerId) {
+    const [o] = await db
+      .select({ name: users.fullName, email: users.email })
+      .from(users)
+      .where(eq(users.id, client.ownerId))
+      .limit(1);
+    ownerName = o?.name ?? o?.email ?? null;
+  }
+  const tags = await db
+    .select({
+      id: clientTags.id,
+      name: clientTags.name,
+      colorToken: clientTags.colorToken,
+    })
+    .from(clientTagLinks)
+    .innerJoin(clientTags, eq(clientTags.id, clientTagLinks.tagId))
+    .where(
+      and(
+        eq(clientTagLinks.agencyId, ctx.agencyId),
+        eq(clientTagLinks.clientId, client.id),
+      ),
+    );
+
   ok(res, {
     ...serializeClient(client),
+    ownerName,
+    tags,
     projectCount: pc?.value ?? 0,
     invoiceCount: ic?.value ?? 0,
     documentCount: dc?.value ?? 0,
@@ -287,7 +327,10 @@ const updateSchema = createSchema.partial().extend({
   portalVisibleStatuses: z.array(z.string()).optional(),
 });
 
-clientsRouter.patch('/:clientId', async (req, res) => {
+clientsRouter.patch(
+  '/:clientId',
+  requireRole('owner', 'admin'),
+  async (req, res) => {
   const ctx = getAuth(req);
   const client = await requireClientAccess(ctx, param(req, 'clientId'));
   const body = updateSchema.parse(req.body);
@@ -318,6 +361,7 @@ clientsRouter.patch('/:clientId', async (req, res) => {
   if (body.nextFollowUpAt !== undefined)
     patch.nextFollowUpAt = body.nextFollowUpAt;
   if (body.internalNotes !== undefined) patch.internalNotes = body.internalNotes;
+  if (body.ownerId !== undefined) patch.ownerId = body.ownerId;
   // 'Active client' toggle takes precedence; falls back to explicit status.
   if (body.isActive !== undefined)
     patch.status = body.isActive ? 'active' : 'archived';
@@ -370,7 +414,10 @@ const tokenSchema = z.object({
   expiresInDays: z.number().int().positive().max(365).optional(),
 });
 
-clientsRouter.post('/:clientId/portal-tokens', async (req, res) => {
+clientsRouter.post(
+  '/:clientId/portal-tokens',
+  requireRole('owner', 'admin'),
+  async (req, res) => {
   const ctx = getAuth(req);
   const client = await requireClientAccess(ctx, param(req, 'clientId'));
   const body = tokenSchema.parse(req.body ?? {});
@@ -438,6 +485,7 @@ clientsRouter.get('/:clientId/portal-tokens', async (req, res) => {
 // POST /clients/:clientId/portal-tokens/:tokenId/revoke
 clientsRouter.post(
   '/:clientId/portal-tokens/:tokenId/revoke',
+  requireRole('owner', 'admin'),
   async (req, res) => {
     const ctx = getAuth(req);
     const client = await requireClientAccess(ctx, param(req, 'clientId'));
@@ -468,10 +516,27 @@ clientsRouter.post(
 );
 
 // POST /clients/:clientId/send-welcome — emails an active portal link.
-clientsRouter.post('/:clientId/send-welcome', async (req, res) => {
+clientsRouter.post(
+  '/:clientId/send-welcome',
+  requireRole('owner', 'admin'),
+  async (req, res) => {
   const ctx = getAuth(req);
   const client = await requireClientAccess(ctx, param(req, 'clientId'));
-  if (!client.contactEmail) {
+  // Prefer the primary contact's email, then the billing contact, then the
+  // legacy client.contactEmail field.
+  const [contact] = await db
+    .select({ email: clientContacts.email })
+    .from(clientContacts)
+    .where(
+      and(
+        eq(clientContacts.agencyId, ctx.agencyId),
+        eq(clientContacts.clientId, client.id),
+        eq(clientContacts.isPrimary, true),
+      ),
+    )
+    .limit(1);
+  const recipient = contact?.email ?? client.contactEmail;
+  if (!recipient) {
     throw conflict('Client has no contact email.');
   }
 
@@ -493,9 +558,9 @@ clientsRouter.post('/:clientId/send-welcome', async (req, res) => {
     .where(eq(agencies.id, ctx.agencyId))
     .limit(1);
 
-  const portalUrl = `${process.env.FRONTEND_ORIGIN ?? ''}/p/${raw}`;
+  const portalUrl = `${process.env.FRONTEND_ORIGIN ?? ''}/portal/${raw}`;
   await sendPortalWelcome({
-    to: client.contactEmail,
+    to: recipient,
     clientName: client.name,
     agencyName: agency?.name ?? 'Your agency',
     portalUrl,

@@ -25,7 +25,17 @@ services:
         value: gemini
       - key: GEMINI_MODEL
         value: gemini-flash-latest
+      - key: EMAIL_FROM_NAME
+        value: Sanctum
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "465"
       # ---- secrets / per-environment (set in dashboard or via API) ----
+      - key: EMAIL_USER
+        sync: false
+      - key: EMAIL_PASS
+        sync: false
       - key: TURSO_DATABASE_URL
         sync: false
       - key: TURSO_AUTH_TOKEN

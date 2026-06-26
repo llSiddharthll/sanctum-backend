@@ -30,6 +30,7 @@ import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { AppError, notFound, conflict, forbidden } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
+import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
 import { listProjectTimers } from './timers.js';
@@ -38,6 +39,7 @@ import { listProjectTimers } from './timers.js';
 // with the other nested routers).
 export const projectsRouter = Router({ mergeParams: true });
 projectsRouter.use(requireAuth);
+projectsRouter.use(requireModuleRW('projects'));
 
 const PROJECT_TYPES = [
   'fixed_price',

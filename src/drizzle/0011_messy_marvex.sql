@@ -1,0 +1,1 @@
+ALTER TABLE `sanctum_agencies` ADD `role_permissions_json` text;

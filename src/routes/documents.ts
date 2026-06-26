@@ -7,11 +7,13 @@ import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { notFound } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
+import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth } from '../middleware/tenant.js';
 import { signDocumentUpload, destroyAsset } from '../services/cloudinary.js';
 
 export const documentsRouter = Router();
 documentsRouter.use(requireAuth);
+documentsRouter.use(requireModuleRW('documents'));
 
 const DOCUMENT_CATEGORIES = [
   'contract',

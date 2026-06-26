@@ -3,7 +3,9 @@ import { z } from 'zod';
 import { and, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
+  agencies,
   clientAssignments,
+  customRoles,
   invites,
   projectMembers,
   projectTasks,
@@ -18,11 +20,20 @@ import { hashPassword } from '../lib/password.js';
 import { env } from '../env.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { getAuth, isPrivileged, requireClientAccess } from '../middleware/tenant.js';
+import { requireModuleRW } from '../middleware/permissions.js';
 import { audit } from '../services/audit.js';
+import {
+  resolvePermissions,
+  serializeOverrides,
+  sanitizeOverrides,
+  parseOverrides,
+} from '../lib/permissions.js';
 import crypto from 'node:crypto';
 
 export const usersRouter = Router();
 usersRouter.use(requireAuth);
+// Module gate: GET needs `view`, writes need `manage` on the Team module.
+usersRouter.use(requireModuleRW('team'));
 
 const FRONTEND_ORIGIN = env.FRONTEND_ORIGIN || 'http://localhost:3000';
 
@@ -78,6 +89,8 @@ const memberBaseSelection = {
   hourlyRate: users.hourlyRate,
   weeklyCapacityHrs: users.weeklyCapacityHrs,
   skills: users.skills,
+  permissionsJson: users.permissionsJson,
+  customRoleId: users.customRoleId,
   createdAt: users.createdAt,
 };
 
@@ -94,16 +107,29 @@ type MemberBaseRow = {
   hourlyRate: number | null;
   weeklyCapacityHrs: number;
   skills: string | null;
+  permissionsJson: string | null;
+  customRoleId: string | null;
   createdAt: Date | null;
 };
 
+function builtinRoleLabel(role: 'owner' | 'admin' | 'member'): string {
+  return role === 'owner' ? 'Owner' : role === 'admin' ? 'Admin' : 'Member';
+}
+
 /** Common profile fields shared by list rows and the detail view. */
-function profileFields(u: MemberBaseRow) {
+function profileFields(
+  u: MemberBaseRow,
+  roleDefaults?: string | null,
+  customRolePermsJson?: string | null,
+  customRoleName?: string | null,
+) {
   return {
     id: u.id,
     email: u.email,
     fullName: u.fullName,
     role: u.role,
+    customRoleId: u.customRoleId,
+    roleName: customRoleName ?? builtinRoleLabel(u.role),
     status: u.status,
     lastLoginAt: toIso(u.lastLoginAt),
     designation: u.designation,
@@ -112,8 +138,25 @@ function profileFields(u: MemberBaseRow) {
     hourlyRate: u.hourlyRate,
     weeklyCapacityHrs: u.weeklyCapacityHrs ?? 0,
     skills: parseSkills(u.skills),
+    // Effective: user override > custom role > agency role default > built-in.
+    permissions: resolvePermissions(
+      u.role,
+      u.permissionsJson,
+      roleDefaults ?? null,
+      customRolePermsJson ?? null,
+    ),
     joinedAt: toIso(u.createdAt),
   };
+}
+
+/** Fetch the agency's stored role-permission defaults JSON (or null). */
+async function getAgencyRoleDefaults(agencyId: string): Promise<string | null> {
+  const [row] = await db
+    .select({ rolePermissionsJson: agencies.rolePermissionsJson })
+    .from(agencies)
+    .where(eq(agencies.id, agencyId))
+    .limit(1);
+  return row?.rolePermissionsJson ?? null;
 }
 
 // ============================================================
@@ -149,10 +192,17 @@ usersRouter.get('/', async (req, res) => {
   }
 
   const baseRows = await db
-    .select(memberBaseSelection)
+    .select({
+      ...memberBaseSelection,
+      customRolePermsJson: customRoles.permissionsJson,
+      customRoleName: customRoles.name,
+    })
     .from(users)
+    .leftJoin(customRoles, eq(customRoles.id, users.customRoleId))
     .where(and(...filters))
     .orderBy(desc(users.createdAt));
+
+  const roleDefaults = await getAgencyRoleDefaults(ctx.agencyId);
 
   // Per-user aggregates via plain grouped queries. (The earlier correlated
   // subqueries didn't bind the outer user row, so every count came back 0.)
@@ -221,7 +271,12 @@ usersRouter.get('/', async (req, res) => {
     baseRows.map((u) => {
       const loggedMinutesThisWeek = weekMinutes.get(u.id) ?? 0;
       return {
-        ...profileFields(u as MemberBaseRow),
+        ...profileFields(
+          u as MemberBaseRow,
+          roleDefaults,
+          u.customRolePermsJson,
+          u.customRoleName,
+        ),
         activeTaskCount: taskCount.get(u.id) ?? 0,
         projectCount: projectIds.get(u.id)?.size ?? 0,
         loggedMinutesThisWeek,
@@ -247,6 +302,8 @@ const inviteSchema = z.object({
   hourlyRate: z.number().int().min(0).optional(),
   weeklyCapacityHrs: z.number().int().min(0).max(168).optional(),
   skills: z.union([z.string(), z.array(z.string())]).optional(),
+  // Optional module permission overrides ({ moduleKey: 'none'|'view'|'manage' }).
+  permissions: z.record(z.string(), z.string()).optional(),
 });
 
 usersRouter.post('/invite', requireRole('owner', 'admin'), async (req, res) => {
@@ -271,6 +328,10 @@ usersRouter.post('/invite', requireRole('owner', 'admin'), async (req, res) => {
   // Random password — the member sets a real one later via accept-invite.
   const randomPassword = crypto.randomBytes(24).toString('base64url');
 
+  const permissionsJson = body.permissions
+    ? serializeOverrides(body.permissions)
+    : null;
+
   await db.insert(users).values({
     id: userId,
     agencyId: ctx.agencyId,
@@ -287,6 +348,7 @@ usersRouter.post('/invite', requireRole('owner', 'admin'), async (req, res) => {
       ? { weeklyCapacityHrs: body.weeklyCapacityHrs }
       : {}),
     skills: skillsToCsv(body.skills) ?? null,
+    permissionsJson,
   });
 
   // Pending invite row (token) — best-effort accept flow.
@@ -314,22 +376,28 @@ usersRouter.post('/invite', requireRole('owner', 'admin'), async (req, res) => {
     ip: req.ip,
   });
 
+  const roleDefaults = await getAgencyRoleDefaults(ctx.agencyId);
   const member = {
-    ...profileFields({
-      id: userId,
-      email,
-      fullName: body.fullName,
-      role: body.role,
-      status: 'active',
-      lastLoginAt: null,
-      designation: body.designation ?? null,
-      department: body.department ?? null,
-      phone: body.phone ?? null,
-      hourlyRate: body.hourlyRate ?? null,
-      weeklyCapacityHrs: body.weeklyCapacityHrs ?? 40,
-      skills: skillsToCsv(body.skills) ?? null,
-      createdAt: new Date(),
-    }),
+    ...profileFields(
+      {
+        id: userId,
+        email,
+        fullName: body.fullName,
+        role: body.role,
+        status: 'active',
+        lastLoginAt: null,
+        designation: body.designation ?? null,
+        department: body.department ?? null,
+        phone: body.phone ?? null,
+        hourlyRate: body.hourlyRate ?? null,
+        weeklyCapacityHrs: body.weeklyCapacityHrs ?? 40,
+        skills: skillsToCsv(body.skills) ?? null,
+        permissionsJson,
+        customRoleId: null,
+        createdAt: new Date(),
+      },
+      roleDefaults,
+    ),
     activeTaskCount: 0,
     projectCount: 0,
     loggedMinutesThisWeek: 0,
@@ -348,11 +416,18 @@ usersRouter.get('/:userId', async (req, res) => {
   const userId = param(req, 'userId');
 
   const [u] = await db
-    .select(memberBaseSelection)
+    .select({
+      ...memberBaseSelection,
+      customRolePermsJson: customRoles.permissionsJson,
+      customRoleName: customRoles.name,
+    })
     .from(users)
+    .leftJoin(customRoles, eq(customRoles.id, users.customRoleId))
     .where(and(eq(users.id, userId), eq(users.agencyId, ctx.agencyId)))
     .limit(1);
   if (!u) throw notFound('Member not found.');
+
+  const roleDefaults = await getAgencyRoleDefaults(ctx.agencyId);
 
   // Projects: explicit memberships joined to project details, unioned with
   // projects the user has tasks in (distinct by project id).
@@ -463,7 +538,12 @@ usersRouter.get('/:userId', async (req, res) => {
   const totalLoggedMinutes = Number(total ?? 0);
 
   ok(res, {
-    ...profileFields(u as MemberBaseRow),
+    ...profileFields(
+      u as MemberBaseRow,
+      roleDefaults,
+      u.customRolePermsJson,
+      u.customRoleName,
+    ),
     projects: projectList,
     activeTasks: activeTasks.map((tk) => ({
       id: tk.id,
@@ -519,6 +599,9 @@ async function loggedMinutesThisWeekForUser(
 // ============================================================
 const patchSchema = z.object({
   role: z.enum(['admin', 'member']).optional(),
+  // Assign a custom role (sets the user's tier to the role's baseRole); null
+  // clears it back to the built-in role.
+  customRoleId: z.string().nullable().optional(),
   status: z.enum(['active', 'disabled']).optional(),
   fullName: z.string().trim().min(1).max(120).optional(),
   designation: z.string().trim().max(120).nullable().optional(),
@@ -527,6 +610,8 @@ const patchSchema = z.object({
   hourlyRate: z.number().int().min(0).nullable().optional(),
   weeklyCapacityHrs: z.number().int().min(0).max(168).optional(),
   skills: z.union([z.string(), z.array(z.string())]).optional(),
+  // Full or partial module permission map ({ moduleKey: 'none'|'view'|'manage' }).
+  permissions: z.record(z.string(), z.string()).optional(),
 });
 
 usersRouter.patch(
@@ -546,16 +631,45 @@ usersRouter.patch(
       )
       .limit(1);
     if (!target) throw notFound('User not found.');
-    // The owner's role/status can never be changed.
+    // The owner's role/status/permissions can never be changed (always full).
     if (
       target.role === 'owner' &&
-      (body.role !== undefined || body.status !== undefined)
+      (body.role !== undefined ||
+        body.customRoleId !== undefined ||
+        body.status !== undefined ||
+        body.permissions !== undefined)
     ) {
       throw conflict('Cannot modify the owner.');
     }
 
     const patch: Partial<typeof users.$inferInsert> = { updatedAt: new Date() };
-    if (body.role !== undefined) patch.role = body.role;
+    // Role assignment: a custom role sets the tier from its baseRole; a built-in
+    // role clears any custom role.
+    if (body.customRoleId !== undefined) {
+      if (body.customRoleId) {
+        const [cr] = await db
+          .select()
+          .from(customRoles)
+          .where(
+            and(
+              eq(customRoles.id, body.customRoleId),
+              eq(customRoles.agencyId, ctx.agencyId),
+            ),
+          )
+          .limit(1);
+        if (!cr) throw notFound('Custom role not found.');
+        patch.customRoleId = cr.id;
+        patch.role = cr.baseRole;
+        // The role's preset now drives — clear any personal overrides.
+        patch.permissionsJson = null;
+      } else {
+        patch.customRoleId = null;
+        if (body.role !== undefined) patch.role = body.role;
+      }
+    } else if (body.role !== undefined) {
+      patch.role = body.role;
+      patch.customRoleId = null;
+    }
     if (body.status !== undefined) patch.status = body.status;
     if (body.fullName !== undefined) patch.fullName = body.fullName;
     if (body.designation !== undefined) patch.designation = body.designation;
@@ -565,6 +679,15 @@ usersRouter.patch(
     if (body.weeklyCapacityHrs !== undefined)
       patch.weeklyCapacityHrs = body.weeklyCapacityHrs;
     if (body.skills !== undefined) patch.skills = skillsToCsv(body.skills) ?? null;
+    // Merge incoming permission overrides onto any existing ones, then persist.
+    // serializeOverrides drops invalid keys/levels and returns null when empty.
+    if (body.permissions !== undefined) {
+      const merged = {
+        ...parseOverrides(target.permissionsJson),
+        ...sanitizeOverrides(body.permissions),
+      };
+      patch.permissionsJson = serializeOverrides(merged);
+    }
 
     await db.update(users).set(patch).where(eq(users.id, target.id));
     await audit({

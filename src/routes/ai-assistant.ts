@@ -13,6 +13,7 @@ import { ok, created } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { notFound } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
+import { requireModuleRW } from '../middleware/permissions.js';
 import { aiLimiter } from '../middleware/rate-limit.js';
 import { getAuth } from '../middleware/tenant.js';
 import {
@@ -33,6 +34,7 @@ import { audit } from '../services/audit.js';
  */
 export const aiAssistantRouter = Router({ mergeParams: true });
 aiAssistantRouter.use(requireAuth);
+aiAssistantRouter.use(requireModuleRW('ai'));
 
 const TASK_STATUSES = [
   'backlog',

@@ -70,6 +70,13 @@ export function broadcastThreadCreated(
   }
 }
 
+/** A new in-app notification for a single user — delivered to their user room. */
+export function broadcastNotification(userId: string, payload: unknown): void {
+  const io = ioRef;
+  if (!io) return;
+  io.to(userRoom(userId)).emit('notification:new', payload);
+}
+
 /** Someone advanced their read cursor — tell the thread room (live receipts). */
 export function broadcastThreadRead(
   threadId: string,

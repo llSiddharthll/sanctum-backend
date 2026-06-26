@@ -50,6 +50,15 @@ const envSchema = z.object({
   CLOUDINARY_API_KEY: z.string().min(1),
   CLOUDINARY_API_SECRET: z.string().min(1),
 
+  // Email (SMTP). Optional: when absent, the email service logs instead of
+  // sending (so dev works without creds). For Gmail use an App Password.
+  EMAIL_USER: z.string().optional(),
+  EMAIL_PASS: z.string().optional(),
+  EMAIL_FROM_NAME: z.string().default('Sanctum'),
+  // SMTP host/port default to Gmail; override for another provider.
+  SMTP_HOST: z.string().default('smtp.gmail.com'),
+  SMTP_PORT: z.coerce.number().int().positive().default(465),
+
   // Gemini (Google Generative Language) — primary AI provider.
   // Optional: when absent, AI generation falls back to a deterministic
   // local template generator instead of failing.
@@ -88,3 +97,6 @@ export const isProd = env.NODE_ENV === 'production';
  * succeeds via the deterministic local fallback (it never returns 501).
  */
 export const aiEnabled = Boolean(env.GEMINI_API_KEY);
+
+/** True when SMTP creds are configured (otherwise emails are logged, not sent). */
+export const emailEnabled = Boolean(env.EMAIL_USER && env.EMAIL_PASS);
