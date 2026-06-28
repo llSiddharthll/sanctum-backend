@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, asc, eq, gte, inArray, lt } from 'drizzle-orm';
+import { and, asc, count, eq, gte, inArray, lt, ne } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { contentPosts, postMedia } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
@@ -10,6 +10,8 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth, requireClientAccess } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
+import { notifyClientReviewReady } from '../services/client-notify.js';
+import { broadcastPortalRefresh } from '../realtime/io.js';
 
 // mergeParams so :clientId from the parent mount is available here.
 export const postsRouter = Router({ mergeParams: true });
@@ -117,7 +119,48 @@ postsRouter.get('/', async (req, res) => {
     .where(and(...filters))
     .orderBy(asc(contentPosts.scheduledAt));
 
-  ok(res, rows.map(serializePost), 200, { meta: { month: q.month ?? null } });
+  // Attach a single hero thumbnail (first media by position) per post so the
+  // calendar/list can render previews without a per-post detail fetch. Cheap:
+  // one extra query scoped to just the listed posts.
+  const heroByPost = new Map<string, { secureUrl: string; resourceType: 'image' | 'video' }>();
+  if (rows.length) {
+    const mediaRows = await db
+      .select({
+        postId: postMedia.postId,
+        secureUrl: postMedia.secureUrl,
+        resourceType: postMedia.resourceType,
+        position: postMedia.position,
+      })
+      .from(postMedia)
+      .where(
+        and(
+          eq(postMedia.agencyId, ctx.agencyId),
+          inArray(
+            postMedia.postId,
+            rows.map((r) => r.id),
+          ),
+        ),
+      )
+      .orderBy(asc(postMedia.position));
+    for (const m of mediaRows) {
+      // Rows come ordered by position asc, so the first seen per post is the hero.
+      if (!heroByPost.has(m.postId)) {
+        heroByPost.set(m.postId, {
+          secureUrl: m.secureUrl,
+          resourceType: m.resourceType,
+        });
+      }
+    }
+  }
+
+  const serialized = rows.map((p) => {
+    const hero = heroByPost.get(p.id);
+    return hero
+      ? { ...serializePost(p), media: [{ secureUrl: hero.secureUrl, resourceType: hero.resourceType, position: 0 }] }
+      : serializePost(p);
+  });
+
+  ok(res, serialized, 200, { meta: { month: q.month ?? null } });
 });
 
 // POST /clients/:clientId/posts
@@ -259,6 +302,8 @@ postsRouter.patch('/:postId', async (req, res) => {
     .select()
     .from(contentPosts)
     .where(eq(contentPosts.id, post.id));
+  // Live-update the client portal (caption/schedule/platforms/type changed).
+  broadcastPortalRefresh(clientId);
   ok(res, serializePost(row!));
 });
 
@@ -287,6 +332,7 @@ postsRouter.delete('/:postId', async (req, res) => {
     entityId: post.id,
     ip: req.ip,
   });
+  broadcastPortalRefresh(clientId);
   ok(res, { deleted: true });
 });
 
@@ -335,6 +381,39 @@ postsRouter.post('/:postId/transition', async (req, res) => {
     entityId: post.id,
     ip: req.ip,
   });
+
+  // Email the client when content becomes reviewable. Revisions of a post they
+  // sent back ("changes addressed") always notify; a fresh send only notifies
+  // when it's the FIRST pending post — so sending a batch emails them once.
+  if (body.to === 'pending_approval') {
+    const wasChanges = post.status === 'changes_requested';
+    let shouldEmail = wasChanges;
+    if (!wasChanges) {
+      const [{ n }] = await db
+        .select({ n: count() })
+        .from(contentPosts)
+        .where(
+          and(
+            eq(contentPosts.agencyId, ctx.agencyId),
+            eq(contentPosts.clientId, clientId),
+            eq(contentPosts.status, 'pending_approval'),
+            ne(contentPosts.id, post.id),
+          ),
+        );
+      shouldEmail = Number(n) === 0;
+    }
+    if (shouldEmail) {
+      void notifyClientReviewReady({
+        agencyId: ctx.agencyId,
+        clientId,
+        createdBy: ctx.userId,
+        kind: wasChanges ? 'changes' : 'new',
+      }).catch(() => {});
+    }
+  }
+
+  // Live-refresh any open client portal (status change is client-visible).
+  broadcastPortalRefresh(clientId);
 
   const [row] = await db
     .select()

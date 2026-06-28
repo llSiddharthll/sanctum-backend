@@ -118,3 +118,50 @@ export async function sendPortalWelcome(input: {
     }),
   });
 }
+
+export async function sendTeamInvite(input: {
+  to: string;
+  agencyName: string;
+  inviterName?: string | null;
+  acceptUrl: string;
+}): Promise<{ ok: boolean }> {
+  const lead = input.inviterName
+    ? `${input.inviterName} invited you`
+    : 'You have been invited';
+  const text = `${lead} to join ${input.agencyName} on Sanctum.\n\nSet your password and sign in:\n${input.acceptUrl}\n\nThis link expires in 7 days.`;
+  return sendEmail({
+    to: input.to,
+    subject: `You're invited to ${input.agencyName} on Sanctum`,
+    text,
+    html: basicHtml({
+      heading: `Join ${input.agencyName} on Sanctum`,
+      body: `${lead} to join ${input.agencyName}. Set your password and you'll be signed in. This link expires in 7 days.`,
+      buttonLabel: 'Accept invite & set password',
+      buttonUrl: input.acceptUrl,
+    }),
+  });
+}
+
+export async function sendPasswordReset(input: {
+  to: string;
+  resetUrl: string;
+  name?: string | null;
+  byAdmin?: boolean;
+}): Promise<{ ok: boolean }> {
+  const who = input.name ? `Hi ${input.name},` : 'Hi,';
+  const reason = input.byAdmin
+    ? 'An administrator started a password reset for your Sanctum account.'
+    : 'We received a request to reset your Sanctum password.';
+  const text = `${who}\n\n${reason}\n\nReset your password:\n${input.resetUrl}\n\nThis link expires in 1 hour. If you didn't request this, you can safely ignore this email.`;
+  return sendEmail({
+    to: input.to,
+    subject: 'Reset your Sanctum password',
+    text,
+    html: basicHtml({
+      heading: 'Reset your password',
+      body: `${reason} Choose a new password below — this link expires in 1 hour. If you didn't request this, you can safely ignore this email.`,
+      buttonLabel: 'Reset password',
+      buttonUrl: input.resetUrl,
+    }),
+  });
+}

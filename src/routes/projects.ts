@@ -23,7 +23,9 @@ import {
   projectTaskLabelLinks,
   projectTaskDependencies,
   projectTaskComments,
+  taskAssignees,
   timeLogs,
+  timers,
   users,
 } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
@@ -204,14 +206,89 @@ function serializeLabel(l: typeof projectTaskLabels.$inferSelect) {
 type SerializedLabel = ReturnType<typeof serializeLabel>;
 type SerializedTask = ReturnType<typeof serializeTask>;
 
+/** A single assignee as returned to the client. */
+type Assignee = { userId: string; name: string };
+
 /** A task enriched with computed list-view fields. */
 type EnrichedTask = SerializedTask & {
+  assignees: Assignee[];
   labels: SerializedLabel[];
   subtaskCount: number;
   subtaskDoneCount: number;
   blockedByCount: number;
   commentCount: number;
 };
+
+/**
+ * Bulk-load the assignees for a set of tasks and fold them onto each row as an
+ * `assignees: { userId, name }[]` array (empty when none). One query joining
+ * task_assignees -> users keeps this O(1) regardless of task count.
+ */
+async function attachAssignees<T extends { id: string }>(
+  agencyId: string,
+  tasks: T[],
+): Promise<(T & { assignees: Assignee[] })[]> {
+  const ids = tasks.map((t) => t.id);
+  if (ids.length === 0) {
+    return tasks.map((t) => ({ ...t, assignees: [] as Assignee[] }));
+  }
+
+  const rows = await db
+    .select({
+      taskId: taskAssignees.taskId,
+      userId: taskAssignees.userId,
+      name: users.fullName,
+    })
+    .from(taskAssignees)
+    .innerJoin(users, eq(users.id, taskAssignees.userId))
+    .where(
+      and(
+        eq(taskAssignees.agencyId, agencyId),
+        inArray(taskAssignees.taskId, ids),
+      ),
+    )
+    .orderBy(asc(taskAssignees.createdAt));
+
+  const byTask = new Map<string, Assignee[]>();
+  for (const r of rows) {
+    const list = byTask.get(r.taskId) ?? [];
+    list.push({ userId: r.userId, name: r.name ?? 'Member' });
+    byTask.set(r.taskId, list);
+  }
+
+  return tasks.map((t) => ({ ...t, assignees: byTask.get(t.id) ?? [] }));
+}
+
+/**
+ * Replace the assignee set for a task with `userIds` (deduped) inside the
+ * caller's agency: clears existing rows then inserts the new ones. Used by the
+ * create + update handlers to keep the join table in sync with the primary
+ * `assigneeId` mirror.
+ */
+async function syncTaskAssignees(
+  agencyId: string,
+  taskId: string,
+  userIds: string[],
+): Promise<void> {
+  await db
+    .delete(taskAssignees)
+    .where(
+      and(
+        eq(taskAssignees.agencyId, agencyId),
+        eq(taskAssignees.taskId, taskId),
+      ),
+    );
+  const unique = [...new Set(userIds)];
+  if (unique.length === 0) return;
+  await db.insert(taskAssignees).values(
+    unique.map((userId) => ({
+      id: newId('tas'),
+      agencyId,
+      taskId,
+      userId,
+    })),
+  );
+}
 
 /**
  * Bulk-load enrichment (labels, subtask counts, blocked-by, comments) for a
@@ -227,6 +304,7 @@ async function enrichTasks(
   if (ids.length === 0) {
     return base.map((t) => ({
       ...t,
+      assignees: [] as Assignee[],
       labels: [],
       subtaskCount: 0,
       subtaskDoneCount: 0,
@@ -340,10 +418,17 @@ async function enrichTasks(
     commentsByTask.set(cr.taskId, Number(cr.total ?? 0));
   }
 
+  // Assignees (joined through the M:N table), grouped by task.
+  const withAssignees = await attachAssignees(agencyId, base);
+  const assigneesByTask = new Map<string, Assignee[]>(
+    withAssignees.map((t) => [t.id, t.assignees]),
+  );
+
   return base.map((t) => {
     const sub = subtaskByParent.get(t.id);
     return {
       ...t,
+      assignees: assigneesByTask.get(t.id) ?? [],
       labels: labelsByTask.get(t.id) ?? [],
       subtaskCount: sub?.total ?? 0,
       subtaskDoneCount: sub?.done ?? 0,
@@ -864,7 +949,21 @@ projectsRouter.get('/:id/tasks', async (req, res) => {
     const ids = assigneeFilter.filter((a) => a !== 'unassigned');
     const wantsUnassigned = assigneeFilter.includes('unassigned');
     const parts = [];
-    if (ids.length > 0) parts.push(inArray(projectTasks.assigneeId, ids));
+    // Match a task when ANY of its assignees is one of the requested users.
+    if (ids.length > 0) {
+      const assigned = db
+        .select({ taskId: taskAssignees.taskId })
+        .from(taskAssignees)
+        .where(
+          and(
+            eq(taskAssignees.agencyId, ctx.agencyId),
+            inArray(taskAssignees.userId, ids),
+          ),
+        );
+      parts.push(inArray(projectTasks.id, assigned));
+    }
+    // Unassigned = no primary assignee (the mirror is kept in sync with the
+    // join set, so this also means no taskAssignees rows).
     if (wantsUnassigned) parts.push(isNull(projectTasks.assigneeId));
     if (parts.length > 0) filters.push(or(...parts)!);
   }
@@ -1003,6 +1102,7 @@ const createTaskSchema = z.object({
   status: z.enum(TASK_STATUSES).optional(),
   milestoneId: z.string().min(1).nullable().optional(),
   assigneeId: z.string().min(1).optional(),
+  assigneeIds: z.array(z.string().min(1)).max(20).optional(),
   priority: z.enum(TASK_PRIORITIES).optional(),
   estimateMinutes: z.number().int().min(0).nullable().optional(),
   startDate: z.coerce.date().nullable().optional(),
@@ -1017,9 +1117,15 @@ projectsRouter.post('/:id/tasks', async (req, res) => {
   await getScopedProject(ctx, projectId);
   const body = createTaskSchema.parse(req.body);
 
-  if (body.assigneeId !== undefined) {
-    await requireAgencyUser(ctx, body.assigneeId);
+  // Resolve the assignee set: explicit `assigneeIds` wins, else the legacy
+  // single `assigneeId` (if any). Deduped; the first becomes the primary.
+  const assigneeIds = [
+    ...new Set(body.assigneeIds ?? (body.assigneeId ? [body.assigneeId] : [])),
+  ];
+  for (const uid of assigneeIds) {
+    await requireAgencyUser(ctx, uid);
   }
+  const primaryAssigneeId = assigneeIds[0] ?? null;
 
   // Subtasks inherit their parent's milestone when one isn't given.
   let parent: typeof projectTasks.$inferSelect | undefined;
@@ -1045,7 +1151,7 @@ projectsRouter.post('/:id/tasks', async (req, res) => {
     description: body.description ?? null,
     ...(body.status !== undefined ? { status: body.status } : {}),
     milestoneId,
-    assigneeId: body.assigneeId ?? null,
+    assigneeId: primaryAssigneeId,
     ...(body.priority !== undefined ? { priority: body.priority } : {}),
     estimateMinutes: body.estimateMinutes ?? null,
     startDate: body.startDate ?? null,
@@ -1054,6 +1160,9 @@ projectsRouter.post('/:id/tasks', async (req, res) => {
     parentTaskId: body.parentTaskId ?? null,
     ...(body.position !== undefined ? { position: body.position } : {}),
   });
+
+  // Sync the M:N join table with the resolved assignee set.
+  await syncTaskAssignees(ctx.agencyId, id, assigneeIds);
 
   await audit({
     agencyId: ctx.agencyId,
@@ -1066,7 +1175,7 @@ projectsRouter.post('/:id/tasks', async (req, res) => {
       projectId,
       taskTitle: body.title,
       status: body.status ?? 'todo',
-      ...(body.assigneeId ? { assigneeId: body.assigneeId } : {}),
+      ...(primaryAssigneeId ? { assigneeId: primaryAssigneeId } : {}),
       ...(milestoneId ? { milestoneId } : {}),
       ...(body.parentTaskId ? { parentTaskId: body.parentTaskId } : {}),
     },
@@ -1077,7 +1186,10 @@ projectsRouter.post('/:id/tasks', async (req, res) => {
     .select()
     .from(projectTasks)
     .where(eq(projectTasks.id, id));
-  created(res, serializeTask(row!));
+  const [enriched] = await attachAssignees(ctx.agencyId, [
+    serializeTask(row!),
+  ]);
+  created(res, enriched);
 });
 
 // POST /projects/:id/tasks/bulk — create many tasks from a list of titles.
@@ -1151,7 +1263,7 @@ projectsRouter.post('/:id/tasks/bulk', async (req, res) => {
     )
     .orderBy(asc(projectTasks.position));
 
-  created(res, rows.map(serializeTask));
+  created(res, await attachAssignees(ctx.agencyId, rows.map(serializeTask)));
 });
 
 /** Fetch a task scoped to the project + agency, or throw 404. */
@@ -1182,6 +1294,7 @@ const updateTaskSchema = z.object({
   status: z.enum(TASK_STATUSES).optional(),
   milestoneId: z.string().min(1).nullable().optional(),
   assigneeId: z.string().min(1).nullable().optional(),
+  assigneeIds: z.array(z.string().min(1)).max(20).nullable().optional(),
   priority: z.enum(TASK_PRIORITIES).optional(),
   estimateMinutes: z.number().int().min(0).nullable().optional(),
   startDate: z.coerce.date().nullable().optional(),
@@ -1197,8 +1310,17 @@ projectsRouter.patch('/:id/tasks/:taskId', async (req, res) => {
   const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
   const body = updateTaskSchema.parse(req.body);
 
-  if (body.assigneeId) {
-    await requireAgencyUser(ctx, body.assigneeId);
+  // Resolve the next assignee set. `assigneeIds` (when present) is authoritative
+  // and replaces the join; otherwise the legacy single `assigneeId` mirrors to
+  // a one-or-zero element set. `nextAssigneeIds === undefined` => leave as-is.
+  let nextAssigneeIds: string[] | undefined;
+  if (body.assigneeIds !== undefined) {
+    nextAssigneeIds = [...new Set(body.assigneeIds ?? [])];
+  } else if (body.assigneeId !== undefined) {
+    nextAssigneeIds = body.assigneeId ? [body.assigneeId] : [];
+  }
+  if (nextAssigneeIds !== undefined) {
+    for (const uid of nextAssigneeIds) await requireAgencyUser(ctx, uid);
   }
   if (body.milestoneId) {
     await requireProjectMilestone(ctx, projectId, body.milestoneId);
@@ -1233,7 +1355,11 @@ projectsRouter.patch('/:id/tasks/:taskId', async (req, res) => {
   if (body.description !== undefined) patch.description = body.description;
   if (body.status !== undefined) patch.status = body.status;
   if (body.milestoneId !== undefined) patch.milestoneId = body.milestoneId;
-  if (body.assigneeId !== undefined) patch.assigneeId = body.assigneeId;
+  // Mirror the primary (first) assignee onto the column for backward-compat.
+  const nextPrimaryAssigneeId =
+    nextAssigneeIds !== undefined ? (nextAssigneeIds[0] ?? null) : undefined;
+  if (nextPrimaryAssigneeId !== undefined)
+    patch.assigneeId = nextPrimaryAssigneeId;
   if (body.priority !== undefined) patch.priority = body.priority;
   if (body.estimateMinutes !== undefined)
     patch.estimateMinutes = body.estimateMinutes;
@@ -1258,12 +1384,18 @@ projectsRouter.patch('/:id/tasks/:taskId', async (req, res) => {
       ),
     );
 
+  // Replace the M:N join set when assignees were touched (either field).
+  if (nextAssigneeIds !== undefined) {
+    await syncTaskAssignees(ctx.agencyId, task.id, nextAssigneeIds);
+  }
+
   // Audit: a status change is its own action for the activity feed; otherwise
   // it's a generic task.update. Always carry the changed-field deltas.
   const statusChanged =
     body.status !== undefined && body.status !== task.status;
   const assigneeChanged =
-    body.assigneeId !== undefined && body.assigneeId !== task.assigneeId;
+    nextPrimaryAssigneeId !== undefined &&
+    nextPrimaryAssigneeId !== task.assigneeId;
   const milestoneChanged =
     body.milestoneId !== undefined && body.milestoneId !== task.milestoneId;
   const priorityChanged =
@@ -1285,7 +1417,7 @@ projectsRouter.patch('/:id/tasks/:taskId', async (req, res) => {
       ...(statusChanged
         ? { fromStatus: task.status, toStatus: body.status }
         : {}),
-      ...(assigneeChanged ? { assigneeId: body.assigneeId } : {}),
+      ...(assigneeChanged ? { assigneeId: nextPrimaryAssigneeId } : {}),
       ...(milestoneChanged ? { milestoneId: body.milestoneId } : {}),
       ...(priorityChanged
         ? { fromPriority: task.priority, toPriority: body.priority }
@@ -1299,7 +1431,8 @@ projectsRouter.patch('/:id/tasks/:taskId', async (req, res) => {
     .select()
     .from(projectTasks)
     .where(eq(projectTasks.id, task.id));
-  ok(res, serializeTask(row!));
+  const [enriched] = await attachAssignees(ctx.agencyId, [serializeTask(row!)]);
+  ok(res, enriched);
 });
 
 // GET /projects/:id/tasks/:taskId/subtasks  §3.4
@@ -2539,6 +2672,68 @@ projectsRouter.get('/:id/time-logs', async (req, res) => {
       taskTitle: l.taskTitle,
     })),
   );
+});
+
+// GET /projects/:id/tasks/:taskId/time-logs — task-scoped timeline.
+// Returns the task's logged entries (newest first), a summed total, and how
+// many timers are running on THIS task right now, so the task panel can show
+// "Total tracked: 3h 20m" alongside a per-entry timeline (who · start→end ·
+// duration · note).
+projectsRouter.get('/:id/tasks/:taskId/time-logs', async (req, res) => {
+  const ctx = getAuth(req);
+  const projectId = param(req, 'id');
+  await getScopedProject(ctx, projectId);
+  const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
+
+  const rows = await db
+    .select({
+      id: timeLogs.id,
+      minutes: timeLogs.minutes,
+      workDate: timeLogs.workDate,
+      note: timeLogs.note,
+      userId: timeLogs.userId,
+      userName: users.fullName,
+    })
+    .from(timeLogs)
+    .leftJoin(users, eq(users.id, timeLogs.userId))
+    .where(
+      and(
+        eq(timeLogs.agencyId, ctx.agencyId),
+        eq(timeLogs.taskId, task.id),
+      ),
+    )
+    .orderBy(desc(timeLogs.workDate));
+
+  const [{ totalMinutes } = { totalMinutes: 0 }] = await db
+    .select({
+      totalMinutes: sql<number>`coalesce(sum(${timeLogs.minutes}), 0)`,
+    })
+    .from(timeLogs)
+    .where(
+      and(eq(timeLogs.agencyId, ctx.agencyId), eq(timeLogs.taskId, task.id)),
+    );
+
+  const [{ activeCount } = { activeCount: 0 }] = await db
+    .select({ activeCount: sql<number>`count(*)` })
+    .from(timers)
+    .where(
+      and(eq(timers.agencyId, ctx.agencyId), eq(timers.taskId, task.id)),
+    );
+
+  ok(res, {
+    totalMinutes: Number(totalMinutes ?? 0),
+    logCount: rows.length,
+    activeTimerCount: Number(activeCount ?? 0),
+    logs: rows.map((l) => ({
+      id: l.id,
+      minutes: l.minutes,
+      // start (workDate) → end derived client-side from start + minutes.
+      workDate: toIso(l.workDate),
+      note: l.note,
+      userId: l.userId,
+      userName: l.userName,
+    })),
+  });
 });
 
 // ============================================================

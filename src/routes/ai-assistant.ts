@@ -18,9 +18,14 @@ import { aiLimiter } from '../middleware/rate-limit.js';
 import { getAuth } from '../middleware/tenant.js';
 import {
   DOCUMENT_TYPES,
+  REPURPOSE_TARGETS,
   generateChatReply,
   generateDocument,
   generateTaskBreakdown,
+  generateCaptions,
+  generateHashtags,
+  generateContentIdeas,
+  repurposeContent,
 } from '../services/ai.js';
 import { audit } from '../services/audit.js';
 
@@ -44,6 +49,25 @@ const TASK_STATUSES = [
   'done',
 ] as const;
 const TASK_STATUS_SET = new Set<string>(TASK_STATUSES);
+
+/**
+ * Resolve an optional clientId to its name, scoped to the caller's agency.
+ * Returns undefined when no id is given or the client isn't in this agency —
+ * the social helpers treat the brand name as optional grounding, so a missing
+ * client should never 404; it just drops the grounding.
+ */
+async function resolveClientName(
+  ctx: ReturnType<typeof getAuth>,
+  clientId?: string,
+): Promise<string | undefined> {
+  if (!clientId) return undefined;
+  const [row] = await db
+    .select({ name: clients.name })
+    .from(clients)
+    .where(and(eq(clients.id, clientId), eq(clients.agencyId, ctx.agencyId)))
+    .limit(1);
+  return row?.name;
+}
 
 /** Fetch a project scoped to the caller's agency, or throw 404. */
 async function getScopedProjectRow(
@@ -107,12 +131,14 @@ const chatSchema = z.object({
     )
     .min(1),
   projectId: z.string().min(1).optional(),
+  clientId: z.string().min(1).optional(),
 });
 
 /** Build a short grounding context string for the chat system prompt. */
 async function buildChatContext(
   ctx: ReturnType<typeof getAuth>,
   projectId?: string,
+  clientId?: string,
 ): Promise<string> {
   const lines: string[] = [];
 
@@ -200,6 +226,34 @@ async function buildChatContext(
     }
   }
 
+  if (clientId) {
+    const [client] = await db
+      .select({
+        name: clients.name,
+        status: clients.status,
+        industry: clients.industry,
+        website: clients.website,
+        relationshipHealth: clients.relationshipHealth,
+        internalNotes: clients.internalNotes,
+      })
+      .from(clients)
+      .where(
+        and(eq(clients.id, clientId), eq(clients.agencyId, ctx.agencyId)),
+      )
+      .limit(1);
+    if (client) {
+      lines.push(
+        `Focused client: ${client.name} [${client.status}].` +
+          (client.industry ? ` Industry: ${client.industry}.` : '') +
+          (client.website ? ` Website: ${client.website}.` : '') +
+          (client.relationshipHealth
+            ? ` Relationship health: ${client.relationshipHealth}.`
+            : '') +
+          (client.internalNotes ? ` Notes: ${client.internalNotes}.` : ''),
+      );
+    }
+  }
+
   return lines.join('\n');
 }
 
@@ -212,13 +266,17 @@ aiAssistantRouter.post('/chat', aiLimiter, async (req, res) => {
     await getScopedProjectRow(ctx, body.projectId);
   }
 
-  const systemContext = await buildChatContext(ctx, body.projectId);
+  const systemContext = await buildChatContext(
+    ctx,
+    body.projectId,
+    body.clientId,
+  );
   const result = await generateChatReply({
     systemContext,
     messages: body.messages,
   });
 
-  ok(res, { reply: result.reply });
+  ok(res, { reply: result.reply, source: result.source });
 });
 
 // ============================================================
@@ -338,5 +396,162 @@ aiAssistantRouter.post('/task-breakdown', aiLimiter, async (req, res) => {
     projectId: body.projectId,
     source: result.source,
     milestones: createdMilestones,
+  });
+});
+
+// ============================================================
+//  POST /ai/captions — write/rewrite caption variations
+// ============================================================
+const captionsSchema = z.object({
+  brief: z.string().min(1).max(5000),
+  platform: z.string().min(1).max(40).default('instagram'),
+  tone: z.string().max(40).optional(),
+  rewrite: z.boolean().default(false),
+  clientId: z.string().min(1).optional(),
+  variations: z.number().int().min(1).max(5).optional(),
+});
+
+aiAssistantRouter.post('/captions', aiLimiter, async (req, res) => {
+  const ctx = getAuth(req);
+  const body = captionsSchema.parse(req.body);
+  const brandName = await resolveClientName(ctx, body.clientId);
+
+  const result = await generateCaptions({
+    brief: body.brief,
+    platform: body.platform,
+    tone: body.tone,
+    rewrite: body.rewrite,
+    brandName,
+    variations: body.variations,
+  });
+
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'ai.captions',
+    entityType: 'ai_caption',
+    entityId: body.platform,
+    metadata: {
+      source: result.source,
+      platform: body.platform,
+      rewrite: body.rewrite,
+      count: result.variations.length,
+    },
+    ip: req.ip,
+  });
+
+  ok(res, { variations: result.variations, source: result.source });
+});
+
+// ============================================================
+//  POST /ai/hashtags — grouped hashtag suggestions
+// ============================================================
+const hashtagsSchema = z.object({
+  topic: z.string().min(1).max(5000),
+  platform: z.string().min(1).max(40).default('instagram'),
+  clientId: z.string().min(1).optional(),
+});
+
+aiAssistantRouter.post('/hashtags', aiLimiter, async (req, res) => {
+  const ctx = getAuth(req);
+  const body = hashtagsSchema.parse(req.body);
+  const brandName = await resolveClientName(ctx, body.clientId);
+
+  const result = await generateHashtags({
+    topic: body.topic,
+    platform: body.platform,
+    brandName,
+  });
+
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'ai.hashtags',
+    entityType: 'ai_hashtags',
+    entityId: body.platform,
+    metadata: { source: result.source, platform: body.platform },
+    ip: req.ip,
+  });
+
+  ok(res, { groups: result.groups, source: result.source });
+});
+
+// ============================================================
+//  POST /ai/content-ideas — brainstorm post ideas
+// ============================================================
+const contentIdeasSchema = z.object({
+  niche: z.string().min(1).max(2000),
+  count: z.number().int().min(1).max(12).optional(),
+  platform: z.string().max(40).optional(),
+  audience: z.string().max(500).optional(),
+  clientId: z.string().min(1).optional(),
+});
+
+aiAssistantRouter.post('/content-ideas', aiLimiter, async (req, res) => {
+  const ctx = getAuth(req);
+  const body = contentIdeasSchema.parse(req.body);
+  // If a clientId is given, prefer its name as the niche grounding.
+  const brandName = await resolveClientName(ctx, body.clientId);
+
+  const result = await generateContentIdeas({
+    niche: brandName ? `${brandName} (${body.niche})` : body.niche,
+    count: body.count,
+    platform: body.platform,
+    audience: body.audience,
+  });
+
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'ai.content_ideas',
+    entityType: 'ai_ideas',
+    entityId: body.platform ?? 'all',
+    metadata: { source: result.source, count: result.ideas.length },
+    ip: req.ip,
+  });
+
+  ok(res, { ideas: result.ideas, source: result.source });
+});
+
+// ============================================================
+//  POST /ai/repurpose — adapt content for another platform
+// ============================================================
+const repurposeSchema = z.object({
+  content: z.string().min(1).max(10000),
+  target: z.enum(REPURPOSE_TARGETS),
+  tone: z.string().max(40).optional(),
+  clientId: z.string().min(1).optional(),
+});
+
+aiAssistantRouter.post('/repurpose', aiLimiter, async (req, res) => {
+  const ctx = getAuth(req);
+  const body = repurposeSchema.parse(req.body);
+  const brandName = await resolveClientName(ctx, body.clientId);
+
+  const result = await repurposeContent({
+    content: body.content,
+    target: body.target,
+    tone: body.tone,
+    brandName,
+  });
+
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'ai.repurpose',
+    entityType: 'ai_repurpose',
+    entityId: body.target,
+    metadata: { source: result.source, target: body.target },
+    ip: req.ip,
+  });
+
+  ok(res, {
+    content: result.content,
+    targetLabel: result.targetLabel,
+    source: result.source,
   });
 });

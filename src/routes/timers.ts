@@ -13,11 +13,16 @@ import { ok, created, toIso } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { notFound, conflict } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
+import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
 
 export const timersRouter = Router();
 timersRouter.use(requireAuth);
+// Timers track work on projects/tasks → part of the Projects module.
+// GET=view, start/stop/edit=manage. Without this gate a projects:none member
+// could start/stop timers (privilege leak).
+timersRouter.use(requireModuleRW('projects'));
 
 type Ctx = ReturnType<typeof getAuth>;
 
@@ -133,20 +138,31 @@ async function fetchRunningTimer(
   return (row as RunningTimerRow | undefined) ?? null;
 }
 
-/** Resolve a task's title (for audit metadata) given a task id. */
+/**
+ * Resolve a task's title (for audit metadata) given a task id. Best-effort:
+ * this only labels the audit log, so a failure (e.g. a transient Turso network
+ * timeout) must NOT break starting/stopping a timer — degrade to null instead.
+ */
 async function taskTitleFor(
   ctx: Ctx,
   taskId: string | null,
 ): Promise<string | null> {
   if (!taskId) return null;
-  const [row] = await db
-    .select({ title: projectTasks.title })
-    .from(projectTasks)
-    .where(
-      and(eq(projectTasks.id, taskId), eq(projectTasks.agencyId, ctx.agencyId)),
-    )
-    .limit(1);
-  return row?.title ?? null;
+  try {
+    const [row] = await db
+      .select({ title: projectTasks.title })
+      .from(projectTasks)
+      .where(
+        and(
+          eq(projectTasks.id, taskId),
+          eq(projectTasks.agencyId, ctx.agencyId),
+        ),
+      )
+      .limit(1);
+    return row?.title ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -365,4 +381,53 @@ timersRouter.get('/active', async (req, res) => {
   const ctx = getAuth(req);
   const running = await fetchRunningTimer(ctx, ctx.userId);
   ok(res, running ? serializeRunning(running) : null);
+});
+
+// ============================================================
+//  PATCH /timers/logs/:logId — edit a logged entry's note
+//  (tenant-scoped; lets a user annotate a time log after stopping).
+// ============================================================
+const editLogSchema = z.object({
+  note: z.string().trim().max(2000).nullable(),
+});
+
+timersRouter.patch('/logs/:logId', async (req, res) => {
+  const ctx = getAuth(req);
+  const logId = req.params.logId;
+  const body = editLogSchema.parse(req.body);
+
+  const [existing] = await db
+    .select({
+      id: timeLogs.id,
+      projectId: timeLogs.projectId,
+      taskId: timeLogs.taskId,
+    })
+    .from(timeLogs)
+    .where(and(eq(timeLogs.id, logId), eq(timeLogs.agencyId, ctx.agencyId)))
+    .limit(1);
+  if (!existing) throw notFound('Time log not found.');
+
+  const note = body.note && body.note.length > 0 ? body.note : null;
+  await db.update(timeLogs).set({ note }).where(eq(timeLogs.id, logId));
+
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'timer.log.edit',
+    entityType: 'time_log',
+    entityId: logId,
+    metadata: {
+      projectId: existing.projectId,
+      taskId: existing.taskId,
+    },
+    ip: req.ip,
+  });
+
+  ok(res, {
+    id: logId,
+    note,
+    projectId: existing.projectId,
+    taskId: existing.taskId,
+  });
 });

@@ -1,0 +1,1 @@
+ALTER TABLE `sanctum_messages` ADD `attachments_json` text;

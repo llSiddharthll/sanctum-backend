@@ -22,12 +22,7 @@ import { newId, newOpaqueToken } from '../lib/ids.js';
 import { conflict, notFound, quotaExceeded } from '../lib/errors.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { requireModuleRW } from '../middleware/permissions.js';
-import {
-  assignedClientIds,
-  getAuth,
-  isPrivileged,
-  requireClientAccess,
-} from '../middleware/tenant.js';
+import { getAuth, requireClientAccess } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
 import { sendPortalWelcome } from '../services/email.js';
 
@@ -77,26 +72,12 @@ function safeJson(s: string): unknown {
 // GET /clients — list (owner/admin: all; member: assigned).
 clientsRouter.get('/', async (req, res) => {
   const ctx = getAuth(req);
-  let rows;
-  if (isPrivileged(ctx.role)) {
-    rows = await db
-      .select()
-      .from(clients)
-      .where(eq(clients.agencyId, ctx.agencyId));
-  } else {
-    const ids = await assignedClientIds(ctx);
-    rows = ids.length
-      ? await db
-          .select()
-          .from(clients)
-          .where(
-            and(
-              eq(clients.agencyId, ctx.agencyId),
-              inArray(clients.id, ids),
-            ),
-          )
-      : [];
-  }
+  // Access is governed by the 'clients' module permission (the router gate);
+  // every teammate who can view the module sees all of the agency's clients.
+  const rows = await db
+    .select()
+    .from(clients)
+    .where(eq(clients.agencyId, ctx.agencyId));
   ok(res, rows.map(serializeClient));
 });
 

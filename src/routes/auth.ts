@@ -1,15 +1,18 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, gt, isNull, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   agencies,
   customRoles,
+  invites,
+  passwordResets,
   plans,
   subscriptions,
   users,
 } from '../db/schema.js';
 import { hashPassword, verifyPassword } from '../lib/password.js';
+import { createPasswordReset } from '../services/password-reset.js';
 import {
   signAccessToken,
   signRefreshToken,
@@ -17,11 +20,14 @@ import {
 } from '../lib/jwt.js';
 import { setAuthCookies, clearAuthCookies } from '../lib/cookies.js';
 import { ok, created } from '../lib/http.js';
-import { newId } from '../lib/ids.js';
+import { newId, hashToken } from '../lib/ids.js';
 import {
   invalidCredentials,
   unauthenticated,
   notFound,
+  gone,
+  badRequest,
+  conflict,
 } from '../lib/errors.js';
 import { requireAuth, REFRESH_COOKIE } from '../middleware/auth.js';
 import { authLimiter } from '../middleware/rate-limit.js';
@@ -68,6 +74,18 @@ const signupSchema = z.object({
 authRouter.post('/signup', authLimiter, async (req, res) => {
   const body = signupSchema.parse(req.body);
   const email = body.email.toLowerCase();
+
+  // Email is the global login identifier (login resolves lower(email) with no
+  // agency scope), so it must be globally unique. Reject a duplicate signup
+  // before creating the agency to avoid an ambiguous login + orphaned agency.
+  const existingUser = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(sql`lower(${users.email}) = ${email}`)
+    .limit(1);
+  if (existingUser.length) {
+    throw conflict('An account with this email already exists. Try signing in.');
+  }
 
   const agencyId = newId('agc');
   let slug = slugify(body.agencyName);
@@ -179,6 +197,280 @@ authRouter.post('/login', authLimiter, async (req, res) => {
     },
     agencyId: user.agencyId,
   });
+});
+
+/**
+ * Resolve a pending, unexpired invite by its raw token, or throw. Lazily marks
+ * an over-due invite 'expired'. Shared by GET /invite (preview) and
+ * POST /accept-invite (consume).
+ */
+async function findPendingInvite(rawToken: string) {
+  const [invite] = await db
+    .select()
+    .from(invites)
+    .where(eq(invites.tokenHash, hashToken(rawToken)))
+    .limit(1);
+  if (!invite) throw notFound('This invite link is invalid.');
+  if (invite.status === 'accepted') {
+    throw gone('This invite has already been used. Try signing in instead.');
+  }
+  if (invite.status === 'revoked') throw gone('This invite was revoked.');
+  if (invite.expiresAt.getTime() <= Date.now()) {
+    if (invite.status !== 'expired') {
+      await db
+        .update(invites)
+        .set({ status: 'expired' })
+        .where(eq(invites.id, invite.id));
+    }
+    throw gone('This invite has expired. Ask your admin to re-invite you.');
+  }
+  return invite;
+}
+
+/** The teammate account created at invite time (active, random password). */
+async function inviteMember(invite: typeof invites.$inferSelect) {
+  const [member] = await db
+    .select()
+    .from(users)
+    .where(
+      and(
+        eq(users.agencyId, invite.agencyId),
+        sql`lower(${users.email}) = ${invite.email.toLowerCase()}`,
+      ),
+    )
+    .limit(1);
+  return member;
+}
+
+// GET /auth/invite?token=... — preview an invite (does NOT consume it) so the
+// accept page can greet the user with their email + agency.
+authRouter.get('/invite', async (req, res) => {
+  const token = typeof req.query.token === 'string' ? req.query.token : '';
+  if (!token) throw badRequest('Missing invite token.');
+  const invite = await findPendingInvite(token);
+  const [agency] = await db
+    .select({ name: agencies.name })
+    .from(agencies)
+    .where(eq(agencies.id, invite.agencyId))
+    .limit(1);
+  const member = await inviteMember(invite);
+  ok(res, {
+    email: invite.email,
+    role: invite.role,
+    agencyName: agency?.name ?? 'your team',
+    fullName: member?.fullName ?? null,
+  });
+});
+
+// POST /auth/accept-invite — set a password on the invited account, mark the
+// invite accepted, and log the member straight in (sets session cookies).
+const acceptInviteSchema = z.object({
+  token: z.string().min(1),
+  password: z.string().min(8).max(200),
+  fullName: z.string().trim().min(1).max(120).optional(),
+});
+
+authRouter.post('/accept-invite', authLimiter, async (req, res) => {
+  const body = acceptInviteSchema.parse(req.body);
+  const invite = await findPendingInvite(body.token);
+
+  const member = await inviteMember(invite);
+  if (!member) throw notFound('This invite is no longer valid.');
+  if (member.status !== 'active') throw gone('This account is not active.');
+
+  await db
+    .update(users)
+    .set({
+      passwordHash: await hashPassword(body.password),
+      ...(body.fullName ? { fullName: body.fullName } : {}),
+    })
+    .where(eq(users.id, member.id));
+
+  await db
+    .update(invites)
+    .set({ status: 'accepted', acceptedAt: new Date() })
+    .where(eq(invites.id, invite.id));
+
+  await issueSession(res, {
+    id: member.id,
+    agencyId: member.agencyId,
+    role: member.role,
+  });
+  await audit({
+    agencyId: member.agencyId,
+    actorType: member.role,
+    actorId: member.id,
+    action: 'team.invite.accept',
+    entityType: 'user',
+    entityId: member.id,
+    ip: req.ip,
+  });
+
+  ok(res, {
+    user: {
+      id: member.id,
+      email: member.email,
+      fullName: body.fullName ?? member.fullName,
+      role: member.role,
+    },
+    agencyId: member.agencyId,
+  });
+});
+
+// ---- Password reset (forgot password) ----------------------------------
+
+// POST /auth/forgot-password — email a reset link. Always 200 (never reveals
+// whether an account exists, to avoid email enumeration).
+const forgotSchema = z.object({ email: z.string().email() });
+
+authRouter.post('/forgot-password', authLimiter, async (req, res) => {
+  const { email } = forgotSchema.parse(req.body);
+  const [user] = await db
+    .select()
+    .from(users)
+    .where(sql`lower(${users.email}) = ${email.toLowerCase()}`)
+    .limit(1);
+
+  if (user && user.status === 'active') {
+    await createPasswordReset(user);
+    await audit({
+      agencyId: user.agencyId,
+      actorType: user.role,
+      actorId: user.id,
+      action: 'auth.password_reset.request',
+      entityType: 'user',
+      entityId: user.id,
+      ip: req.ip,
+    });
+  }
+  ok(res, { ok: true });
+});
+
+/** Resolve a non-expired, unused reset token or throw. */
+async function findValidReset(rawToken: string) {
+  const [row] = await db
+    .select()
+    .from(passwordResets)
+    .where(
+      and(
+        eq(passwordResets.tokenHash, hashToken(rawToken)),
+        isNull(passwordResets.usedAt),
+        gt(passwordResets.expiresAt, new Date()),
+      ),
+    )
+    .limit(1);
+  if (!row) throw gone('This reset link is invalid or has expired.');
+  return row;
+}
+
+// GET /auth/reset-password?token= — validate the link + return the account email.
+authRouter.get('/reset-password', async (req, res) => {
+  const token = typeof req.query.token === 'string' ? req.query.token : '';
+  if (!token) throw badRequest('Missing reset token.');
+  const reset = await findValidReset(token);
+  const [user] = await db
+    .select({ email: users.email })
+    .from(users)
+    .where(eq(users.id, reset.userId))
+    .limit(1);
+  if (!user) throw gone('This reset link is invalid or has expired.');
+  ok(res, { email: user.email });
+});
+
+// POST /auth/reset-password { token, password } — set a new password, consume
+// the token (and any other outstanding ones), and sign the user in.
+const resetSchema = z.object({
+  token: z.string().min(1),
+  password: z.string().min(8).max(200),
+});
+
+authRouter.post('/reset-password', authLimiter, async (req, res) => {
+  const body = resetSchema.parse(req.body);
+  const reset = await findValidReset(body.token);
+  const [user] = await db
+    .select()
+    .from(users)
+    .where(eq(users.id, reset.userId))
+    .limit(1);
+  if (!user || user.status !== 'active') {
+    throw gone('This account is not active.');
+  }
+
+  await db
+    .update(users)
+    .set({ passwordHash: await hashPassword(body.password) })
+    .where(eq(users.id, user.id));
+
+  // Burn every outstanding reset token for this user (single-use + cleanup).
+  await db
+    .update(passwordResets)
+    .set({ usedAt: new Date() })
+    .where(
+      and(
+        eq(passwordResets.userId, user.id),
+        isNull(passwordResets.usedAt),
+      ),
+    );
+
+  await issueSession(res, {
+    id: user.id,
+    agencyId: user.agencyId,
+    role: user.role,
+  });
+  await audit({
+    agencyId: user.agencyId,
+    actorType: user.role,
+    actorId: user.id,
+    action: 'auth.password_reset',
+    entityType: 'user',
+    entityId: user.id,
+    ip: req.ip,
+  });
+
+  ok(res, {
+    user: {
+      id: user.id,
+      email: user.email,
+      fullName: user.fullName,
+      role: user.role,
+    },
+    agencyId: user.agencyId,
+  });
+});
+
+// POST /auth/change-password { currentPassword, newPassword } — authenticated.
+const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1),
+  newPassword: z.string().min(8).max(200),
+});
+
+authRouter.post('/change-password', requireAuth, async (req, res) => {
+  const ctx = getAuth(req);
+  const body = changePasswordSchema.parse(req.body);
+  const [user] = await db
+    .select()
+    .from(users)
+    .where(eq(users.id, ctx.userId))
+    .limit(1);
+  if (!user) throw notFound('User not found.');
+
+  const valid = await verifyPassword(user.passwordHash, body.currentPassword);
+  if (!valid) throw badRequest('Your current password is incorrect.');
+
+  await db
+    .update(users)
+    .set({ passwordHash: await hashPassword(body.newPassword) })
+    .where(eq(users.id, user.id));
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'auth.password_change',
+    entityType: 'user',
+    entityId: ctx.userId,
+    ip: req.ip,
+  });
+  ok(res, { ok: true });
 });
 
 // POST /auth/refresh — rotate tokens from the refresh cookie.

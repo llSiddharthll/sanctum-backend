@@ -4,6 +4,8 @@ import { and, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   agencies,
+  attendanceRecords,
+  auditLog,
   clientAssignments,
   customRoles,
   invites,
@@ -13,6 +15,8 @@ import {
   timeLogs,
   users,
 } from '../db/schema.js';
+import { dayKeyInTz } from '../lib/attendance.js';
+import { loadPolicy } from '../services/attendance.js';
 import { ok, created, toIso, param } from '../lib/http.js';
 import { newId, newOpaqueToken } from '../lib/ids.js';
 import { conflict, forbidden, notFound } from '../lib/errors.js';
@@ -22,6 +26,8 @@ import { requireAuth, requireRole } from '../middleware/auth.js';
 import { getAuth, isPrivileged, requireClientAccess } from '../middleware/tenant.js';
 import { requireModuleRW } from '../middleware/permissions.js';
 import { audit } from '../services/audit.js';
+import { sendTeamInvite } from '../services/email.js';
+import { createPasswordReset } from '../services/password-reset.js';
 import {
   resolvePermissions,
   serializeOverrides,
@@ -210,6 +216,11 @@ usersRouter.get('/', async (req, res) => {
   const taskCount = new Map<string, number>();
   const projectIds = new Map<string, Set<string>>();
   const weekMinutes = new Map<string, number>();
+  // Presence: today's attendance keyed by user (agency timezone day).
+  const presence = new Map<
+    string,
+    { checkedIn: boolean; checkInAt: string | null; checkOutAt: string | null }
+  >();
   const ensure = (m: Map<string, Set<string>>, k: string) => {
     let s = m.get(k);
     if (!s) m.set(k, (s = new Set<string>()));
@@ -264,12 +275,39 @@ usersRouter.get('/', async (req, res) => {
     for (const r of logRows) {
       weekMinutes.set(r.uid, (weekMinutes.get(r.uid) ?? 0) + Number(r.minutes ?? 0));
     }
+
+    // Presence — today's attendance rows (agency timezone day), per user.
+    const policy = await loadPolicy(ctx.agencyId);
+    const today = dayKeyInTz(new Date(), policy.timezone);
+    const attRows = await db
+      .select({
+        userId: attendanceRecords.userId,
+        checkInAt: attendanceRecords.checkInAt,
+        checkOutAt: attendanceRecords.checkOutAt,
+      })
+      .from(attendanceRecords)
+      .where(
+        and(
+          eq(attendanceRecords.agencyId, ctx.agencyId),
+          eq(attendanceRecords.day, today),
+          inArray(attendanceRecords.userId, ids),
+        ),
+      );
+    for (const r of attRows) {
+      presence.set(r.userId, {
+        // "In" today means a check-in exists (regardless of later check-out).
+        checkedIn: !!r.checkInAt,
+        checkInAt: toIso(r.checkInAt),
+        checkOutAt: toIso(r.checkOutAt),
+      });
+    }
   }
 
   ok(
     res,
     baseRows.map((u) => {
       const loggedMinutesThisWeek = weekMinutes.get(u.id) ?? 0;
+      const p = presence.get(u.id);
       return {
         ...profileFields(
           u as MemberBaseRow,
@@ -284,6 +322,15 @@ usersRouter.get('/', async (req, res) => {
           loggedMinutesThisWeek,
           u.weeklyCapacityHrs ?? 0,
         ),
+        // Presence today: 'in' once checked in, 'out' once checked out, else null.
+        checkedInToday: p?.checkedIn ?? false,
+        checkInAt: p?.checkInAt ?? null,
+        checkOutAt: p?.checkOutAt ?? null,
+        presence: p
+          ? p.checkOutAt
+            ? ('out' as const)
+            : ('in' as const)
+          : (null as null),
       };
     }),
   );
@@ -405,6 +452,20 @@ usersRouter.post('/invite', requireRole('owner', 'admin'), async (req, res) => {
   };
 
   const inviteUrl = `${FRONTEND_ORIGIN}/accept-invite?token=${raw}`;
+
+  // Best-effort invite email (logs only when SMTP is unconfigured). The link is
+  // also returned so the inviter can copy/share it manually.
+  const [ag] = await db
+    .select({ name: agencies.name })
+    .from(agencies)
+    .where(eq(agencies.id, ctx.agencyId))
+    .limit(1);
+  void sendTeamInvite({
+    to: email,
+    agencyName: ag?.name ?? 'your team',
+    acceptUrl: inviteUrl,
+  }).catch(() => {});
+
   created(res, { member, inviteUrl });
 });
 
@@ -537,6 +598,27 @@ usersRouter.get('/:userId', async (req, res) => {
     );
   const totalLoggedMinutes = Number(total ?? 0);
 
+  // Presence today (agency timezone day) for the detail header.
+  const policy = await loadPolicy(ctx.agencyId);
+  const today = dayKeyInTz(new Date(), policy.timezone);
+  const [todayRec] = await db
+    .select({
+      checkInAt: attendanceRecords.checkInAt,
+      checkOutAt: attendanceRecords.checkOutAt,
+    })
+    .from(attendanceRecords)
+    .where(
+      and(
+        eq(attendanceRecords.agencyId, ctx.agencyId),
+        eq(attendanceRecords.userId, userId),
+        eq(attendanceRecords.day, today),
+      ),
+    )
+    .limit(1);
+  const checkedInToday = !!todayRec?.checkInAt;
+  const checkInAt = todayRec ? toIso(todayRec.checkInAt) : null;
+  const checkOutAt = todayRec ? toIso(todayRec.checkOutAt) : null;
+
   ok(res, {
     ...profileFields(
       u as MemberBaseRow,
@@ -544,6 +626,14 @@ usersRouter.get('/:userId', async (req, res) => {
       u.customRolePermsJson,
       u.customRoleName,
     ),
+    checkedInToday,
+    checkInAt,
+    checkOutAt,
+    presence: todayRec
+      ? checkOutAt
+        ? ('out' as const)
+        : ('in' as const)
+      : (null as null),
     projects: projectList,
     activeTasks: activeTasks.map((tk) => ({
       id: tk.id,
@@ -741,6 +831,45 @@ usersRouter.delete(
   },
 );
 
+// POST /team/:userId/reset-password — owner/admin sends a member a reset link
+// (e.g. to help someone who's locked out). Returns the link so it can also be
+// copied/shared manually when SMTP isn't configured.
+usersRouter.post(
+  '/:userId/reset-password',
+  requireRole('owner', 'admin'),
+  async (req, res) => {
+    const ctx = getAuth(req);
+    const userId = param(req, 'userId');
+    const [member] = await db
+      .select({
+        id: users.id,
+        agencyId: users.agencyId,
+        email: users.email,
+        fullName: users.fullName,
+        status: users.status,
+      })
+      .from(users)
+      .where(and(eq(users.id, userId), eq(users.agencyId, ctx.agencyId)))
+      .limit(1);
+    if (!member) throw notFound('Member not found.');
+    if (member.status !== 'active') {
+      throw conflict('This member is not active.');
+    }
+
+    const { resetUrl } = await createPasswordReset(member, { byAdmin: true });
+    await audit({
+      agencyId: ctx.agencyId,
+      actorType: ctx.role,
+      actorId: ctx.userId,
+      action: 'team.password_reset',
+      entityType: 'user',
+      entityId: userId,
+      ip: req.ip,
+    });
+    ok(res, { ok: true, resetUrl });
+  },
+);
+
 // ============================================================
 //  TIME LOGS — POST/GET /team/:userId/time-logs
 // ============================================================
@@ -896,6 +1025,63 @@ usersRouter.get('/:userId/time-logs', async (req, res) => {
       projectName: l.projectName,
       taskId: l.taskId,
     })),
+  );
+});
+
+// ============================================================
+//  ACTIVITY — GET /team/:userId/activity (audit feed for this actor)
+// ============================================================
+const activityQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+});
+
+// GET /team/:userId/activity — recent audit-log events this member performed
+// (self, or owner/admin). Tenant-scoped to the caller's agency.
+usersRouter.get('/:userId/activity', async (req, res) => {
+  const ctx = getAuth(req);
+  const userId = param(req, 'userId');
+  if (userId !== ctx.userId && !isPrivileged(ctx.role)) {
+    throw forbidden('You can only view your own activity.');
+  }
+  await requireAgencyMember(ctx.agencyId, userId);
+  const { limit } = activityQuery.parse(req.query);
+
+  const rows = await db
+    .select({
+      id: auditLog.id,
+      action: auditLog.action,
+      entityType: auditLog.entityType,
+      entityId: auditLog.entityId,
+      metadataJson: auditLog.metadataJson,
+      createdAt: auditLog.createdAt,
+    })
+    .from(auditLog)
+    .where(
+      and(eq(auditLog.agencyId, ctx.agencyId), eq(auditLog.actorId, userId)),
+    )
+    .orderBy(desc(auditLog.createdAt))
+    .limit(limit ?? 40);
+
+  ok(
+    res,
+    rows.map((r) => {
+      let metadata: Record<string, unknown> | null = null;
+      if (r.metadataJson) {
+        try {
+          metadata = JSON.parse(r.metadataJson) as Record<string, unknown>;
+        } catch {
+          metadata = null;
+        }
+      }
+      return {
+        id: r.id,
+        action: r.action,
+        entityType: r.entityType,
+        entityId: r.entityId,
+        metadata,
+        createdAt: toIso(r.createdAt),
+      };
+    }),
   );
 });
 

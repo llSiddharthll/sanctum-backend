@@ -1,6 +1,6 @@
 import type { NextFunction, Request, Response } from 'express';
 import { verifyAccessToken, type Role } from '../lib/jwt.js';
-import { forbidden, unauthenticated } from '../lib/errors.js';
+import { AppError, forbidden, unauthenticated } from '../lib/errors.js';
 
 export const ACCESS_COOKIE = 'sanctum_at';
 export const REFRESH_COOKIE = 'sanctum_rt';
@@ -35,7 +35,10 @@ export async function requireAuth(
     };
     next();
   } catch (err) {
-    if ((err as { code?: string })?.code) return next(err);
+    // Pass our own typed errors through untouched. Anything else (notably
+    // jose's JWTExpired/JWS errors, which also carry a `.code`) is an expired
+    // or malformed token → 401, so the client's refresh-on-401 flow can run.
+    if (err instanceof AppError) return next(err);
     next(unauthenticated('Invalid or expired access token.'));
   }
 }

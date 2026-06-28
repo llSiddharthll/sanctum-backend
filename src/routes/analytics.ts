@@ -3,16 +3,19 @@ import { and, count, eq } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { clients, contentPosts } from '../db/schema.js';
 import { ok } from '../lib/http.js';
-import { requireAuth, requireRole } from '../middleware/auth.js';
+import { requireAuth } from '../middleware/auth.js';
+import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth } from '../middleware/tenant.js';
 
 export const analyticsRouter = Router();
 analyticsRouter.use(requireAuth);
 
 // GET /analytics/summary — agency-wide counts by status + client/post totals.
+// Gated on the Dashboard module (view), so members see the overview too — it's
+// agency content stats, consistent with members seeing all clients.
 analyticsRouter.get(
   '/summary',
-  requireRole('owner', 'admin'),
+  requireModuleRW('dashboard'),
   async (req, res) => {
     const ctx = getAuth(req);
 

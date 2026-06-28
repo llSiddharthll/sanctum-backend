@@ -42,6 +42,12 @@ export function serializeRecord(r: typeof attendanceRecords.$inferSelect) {
     isLate: r.isLate,
     source: r.source,
     note: r.note,
+    checkInLat: r.checkInLat,
+    checkInLng: r.checkInLng,
+    checkInLocation: r.checkInLocation,
+    checkOutLat: r.checkOutLat,
+    checkOutLng: r.checkOutLng,
+    checkOutLocation: r.checkOutLocation,
   };
 }
 

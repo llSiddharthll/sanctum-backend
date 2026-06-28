@@ -120,6 +120,34 @@
       "when": 1782515674152,
       "tag": "0016_parallel_justice",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "6",
+      "when": 1782609122669,
+      "tag": "0017_short_luke_cage",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "6",
+      "when": 1782661604314,
+      "tag": "0018_cheerful_shockwave",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "6",
+      "when": 1782663147395,
+      "tag": "0019_calm_kabuki",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "6",
+      "when": 1782683310238,
+      "tag": "0020_omniscient_skreet",
+      "breakpoints": true
     }
   ]
 }

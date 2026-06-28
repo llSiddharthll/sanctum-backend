@@ -1,5 +1,6 @@
 import { v2 as cloudinary } from 'cloudinary';
 import { env } from '../env.js';
+import { newId } from '../lib/ids.js';
 
 cloudinary.config({
   cloud_name: env.CLOUDINARY_CLOUD_NAME,
@@ -24,6 +25,7 @@ export interface SignedUpload {
   timestamp: number;
   signature: string;
   folder: string;
+  publicId: string;
   resourceType: 'image' | 'video';
   uploadUrl: string;
   allowedFormats: string[];
@@ -42,10 +44,15 @@ export function signUpload(params: SignParams): SignedUpload {
   const folder = params.postId
     ? `${base}/${params.postId}`
     : `${base}/_staging`;
+  // Server-assigned asset id (stored at `folder/publicId`). The browser sends
+  // it back as `public_id`, so it MUST be part of the signed param set below —
+  // otherwise Cloudinary rejects the upload with "Invalid Signature".
+  const publicId = newId('media');
 
   // Parameters that are signed must match exactly what the client sends.
   const paramsToSign: Record<string, string | number> = {
     folder,
+    public_id: publicId,
     timestamp,
   };
 
@@ -60,6 +67,7 @@ export function signUpload(params: SignParams): SignedUpload {
     timestamp,
     signature,
     folder,
+    publicId,
     resourceType: params.resourceType,
     uploadUrl: `https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/${params.resourceType}/upload`,
     allowedFormats: ALLOWED_FORMATS,

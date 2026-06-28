@@ -316,18 +316,26 @@ export function checkFencing(
     return 'You can only check in from an approved network.';
   }
   if (policy.enforceGeo) {
-    if (
-      ctx.lat == null ||
-      ctx.lng == null ||
-      policy.geoLat == null ||
-      policy.geoLng == null ||
-      policy.geoRadiusM == null
-    ) {
-      return 'Location is required to check in. Enable location access.';
+    // Sharing your location is mandatory when geo enforcement is on.
+    if (ctx.lat == null || ctx.lng == null) {
+      return 'Location is required to check in. Please enable location access and try again.';
     }
-    const dist = distanceMeters(ctx.lat, ctx.lng, policy.geoLat, policy.geoLng);
-    if (dist > policy.geoRadiusM) {
-      return 'You are too far from the approved location to check in.';
+    // A geo-fence (centre + radius) is an OPTIONAL extra restriction: only
+    // enforce distance when one is actually configured.
+    if (
+      policy.geoLat != null &&
+      policy.geoLng != null &&
+      policy.geoRadiusM != null
+    ) {
+      const dist = distanceMeters(
+        ctx.lat,
+        ctx.lng,
+        policy.geoLat,
+        policy.geoLng,
+      );
+      if (dist > policy.geoRadiusM) {
+        return 'You are too far from the approved location to check in.';
+      }
     }
   }
   return null;

@@ -740,3 +740,535 @@ export async function generateTaskBreakdown(
   }
   return fallbackBreakdown();
 }
+
+// ===========================================================================
+//  Social-content AI helpers (captions, hashtags, ideas, repurpose)
+//
+//  Every function here follows the same contract as the rest of this module:
+//  it tries Gemini and silently falls back to a deterministic local generator,
+//  so a missing GEMINI_API_KEY NEVER throws. The `source` flag tells the caller
+//  (and UI) which path produced the output.
+// ===========================================================================
+
+/** Tone presets shared by caption + repurpose helpers. */
+export const CONTENT_TONES = [
+  'professional',
+  'casual',
+  'playful',
+  'inspirational',
+  'bold',
+  'witty',
+  'educational',
+  'luxury',
+] as const;
+export type ContentTone = (typeof CONTENT_TONES)[number];
+
+/** Tidy a single line of model output: drop list markers, quotes, fences. */
+function cleanLine(s: string): string {
+  return s
+    .replace(/^\s*[-*•\d.)\]]+\s*/, '')
+    .replace(/^["“'']+|["”'']+$/g, '')
+    .trim();
+}
+
+/** Split model text into non-empty, de-duplicated, trimmed lines. */
+function toLines(text: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of stripCodeFences(text).split('\n')) {
+    const line = cleanLine(raw);
+    if (!line) continue;
+    const key = line.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(line);
+  }
+  return out;
+}
+
+/**
+ * Parse a JSON array out of model text, validating each element against the
+ * provided zod schema. Returns `null` (caller falls back) on any failure.
+ */
+function parseJsonArray<T>(
+  text: string,
+  schema: z.ZodType<T>,
+): T[] | null {
+  const cleaned = stripCodeFences(text);
+  const first = cleaned.indexOf('[');
+  const last = cleaned.lastIndexOf(']');
+  if (first === -1 || last <= first) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleaned.slice(first, last + 1));
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed)) return null;
+  const out: T[] = [];
+  for (const item of parsed) {
+    const r = schema.safeParse(item);
+    if (r.success) out.push(r.data);
+  }
+  return out.length ? out : null;
+}
+
+// ---------------------------------------------------------------------------
+//  Caption writer / rewriter
+// ---------------------------------------------------------------------------
+
+export interface CaptionInput {
+  /** A brief/topic, OR an existing caption to rewrite. */
+  brief: string;
+  platform: string;
+  tone?: string;
+  /** When true, treat `brief` as an existing caption to improve/rewrite. */
+  rewrite?: boolean;
+  /** Optional brand/client name for grounding. */
+  brandName?: string;
+  variations?: number;
+}
+
+export interface CaptionResult {
+  variations: string[];
+  source: 'gemini' | 'fallback';
+}
+
+function buildCaptionPrompt(input: CaptionInput, count: number): string {
+  return [
+    `You are an expert social media copywriter for a content agency.`,
+    input.rewrite
+      ? `Rewrite and improve the following ${input.platform} caption.`
+      : `Write ${input.platform} captions from the following brief.`,
+    input.brandName ? `Brand: ${input.brandName}.` : '',
+    input.tone ? `Tone: ${input.tone}.` : '',
+    input.rewrite ? `Existing caption:\n${input.brief}` : `Brief:\n${input.brief}`,
+    '',
+    `Produce exactly ${count} distinct caption options. Each should be platform-appropriate for ${input.platform}, scroll-stopping, and include a light call-to-action. Use 0-3 tasteful emojis where natural. Do NOT include hashtags.`,
+    'Respond with ONLY a raw JSON array of strings — no markdown fences, no numbering, no commentary.',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+const CAPTION_HOOKS = [
+  (t: string, b: string) => `Stop scrolling 👀 ${t} is changing how ${b} shows up. Here's the why ⬇️`,
+  (t: string, b: string) => `The truth about ${t} nobody at ${b} tells you. Save this one.`,
+  (t: string, b: string) => `${b} POV: ${t} done right. Which take is yours? 💬`,
+  (t: string, b: string) => `3 things ${b} learned about ${t} this week. #2 surprised us. ✨`,
+  (t: string, b: string) => `Behind the scenes at ${b}: how we approach ${t}. Comment "more" for part 2.`,
+  (t: string, b: string) => `If ${t} feels overwhelming, read this. ${b} breaks it down. Follow for more.`,
+];
+
+function fallbackCaptions(input: CaptionInput, count: number): CaptionResult {
+  const brand = input.brandName?.trim() || 'your brand';
+  const topic = input.brief.trim().split('\n')[0]?.slice(0, 80) || 'this';
+  const seed = seedFrom(`${brand}|${topic}|${input.platform}`);
+  const variations: string[] = [];
+  for (let i = 0; i < count; i++) {
+    const hook = CAPTION_HOOKS[(seed + i) % CAPTION_HOOKS.length]!;
+    variations.push(hook(topic, brand));
+  }
+  return { variations, source: 'fallback' };
+}
+
+export async function generateCaptions(
+  input: CaptionInput,
+): Promise<CaptionResult> {
+  const count = Math.min(Math.max(input.variations ?? 3, 1), 5);
+  const text = await callGeminiText({
+    contents: [{ role: 'user', text: buildCaptionPrompt(input, count) }],
+  });
+  if (text && text.trim()) {
+    const arr = parseJsonArray(text, z.string().min(1));
+    if (arr && arr.length) {
+      return {
+        variations: arr.map((s) => s.trim()).slice(0, count),
+        source: 'gemini',
+      };
+    }
+    // The model answered but not as JSON — salvage line-by-line.
+    const lines = toLines(text).filter((l) => l.length > 10);
+    if (lines.length) {
+      return { variations: lines.slice(0, count), source: 'gemini' };
+    }
+  }
+  return fallbackCaptions(input, count);
+}
+
+// ---------------------------------------------------------------------------
+//  Hashtag suggestions (grouped: broad / niche / branded)
+// ---------------------------------------------------------------------------
+
+export interface HashtagInput {
+  /** A caption or topic to derive hashtags from. */
+  topic: string;
+  platform: string;
+  brandName?: string;
+}
+
+export interface HashtagGroups {
+  broad: string[];
+  niche: string[];
+  branded: string[];
+}
+
+export interface HashtagResult {
+  groups: HashtagGroups;
+  source: 'gemini' | 'fallback';
+}
+
+/** Normalize a token into a single #hashtag (alnum only, no leading #). */
+function toHashtag(raw: string): string | null {
+  const cleaned = raw
+    .replace(/^#+/, '')
+    .replace(/[^a-zA-Z0-9]/g, '')
+    .trim();
+  if (!cleaned) return null;
+  return `#${cleaned}`;
+}
+
+const hashtagGroupsSchema = z.object({
+  broad: z.array(z.string()).optional(),
+  niche: z.array(z.string()).optional(),
+  branded: z.array(z.string()).optional(),
+});
+
+function buildHashtagPrompt(input: HashtagInput): string {
+  return [
+    `You are a social media growth specialist. Suggest hashtags for a ${input.platform} post.`,
+    input.brandName ? `Brand: ${input.brandName}.` : '',
+    `Caption / topic:\n${input.topic}`,
+    '',
+    'Group them into:',
+    '- "broad": 6-8 high-reach popular hashtags.',
+    '- "niche": 6-8 specific, lower-competition hashtags closely tied to the topic.',
+    '- "branded": 2-4 brand/campaign-style hashtags (use the brand name where given).',
+    'Each value is a single hashtag string starting with "#", no spaces.',
+    'Respond with ONLY a raw JSON object: {"broad":[...],"niche":[...],"branded":[...]} — no fences, no commentary.',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+const FALLBACK_BROAD = [
+  '#socialmedia', '#contentcreator', '#marketing', '#branding',
+  '#digitalmarketing', '#smallbusiness', '#instagood', '#trending',
+];
+function camelCase(s: string): string {
+  return s
+    .split(/[^a-zA-Z0-9]+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join('');
+}
+
+function fallbackHashtags(input: HashtagInput): HashtagResult {
+  const words = input.topic
+    .toLowerCase()
+    .split(/[^a-zA-Z0-9]+/)
+    .filter((w) => w.length > 3)
+    .slice(0, 8);
+  const niche = Array.from(
+    new Set(words.map((w) => toHashtag(w)).filter((x): x is string => !!x)),
+  ).slice(0, 8);
+  const platformTag = toHashtag(input.platform);
+  const broad = Array.from(
+    new Set([...FALLBACK_BROAD, ...(platformTag ? [platformTag] : [])]),
+  ).slice(0, 8);
+  const brand = input.brandName?.trim();
+  const branded = brand
+    ? [`#${camelCase(brand)}`, `#${camelCase(brand)}Official`]
+    : ['#OurBrand'];
+  return { groups: { broad, niche, branded }, source: 'fallback' };
+}
+
+function normalizeGroup(arr: string[] | undefined, max: number): string[] {
+  if (!arr) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of arr) {
+    const tag = toHashtag(raw);
+    if (!tag) continue;
+    const key = tag.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(tag);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+export async function generateHashtags(
+  input: HashtagInput,
+): Promise<HashtagResult> {
+  const text = await callGeminiText({
+    contents: [{ role: 'user', text: buildHashtagPrompt(input) }],
+  });
+  if (text && text.trim()) {
+    const cleaned = stripCodeFences(text);
+    const first = cleaned.indexOf('{');
+    const last = cleaned.lastIndexOf('}');
+    if (first !== -1 && last > first) {
+      try {
+        const parsed = JSON.parse(cleaned.slice(first, last + 1));
+        const validated = hashtagGroupsSchema.safeParse(parsed);
+        if (validated.success) {
+          const groups: HashtagGroups = {
+            broad: normalizeGroup(validated.data.broad, 8),
+            niche: normalizeGroup(validated.data.niche, 8),
+            branded: normalizeGroup(validated.data.branded, 4),
+          };
+          if (
+            groups.broad.length ||
+            groups.niche.length ||
+            groups.branded.length
+          ) {
+            return { groups, source: 'gemini' };
+          }
+        }
+      } catch {
+        // fall through
+      }
+    }
+  }
+  return fallbackHashtags(input);
+}
+
+// ---------------------------------------------------------------------------
+//  Content ideas / brainstorm
+// ---------------------------------------------------------------------------
+
+export const IDEA_FORMATS = ['reel', 'carousel', 'story', 'post', 'live'] as const;
+
+export interface ContentIdeaInput {
+  /** Client / brand / niche to brainstorm for. */
+  niche: string;
+  count?: number;
+  platform?: string;
+  audience?: string;
+}
+
+export interface ContentIdea {
+  hook: string;
+  format: string;
+  rationale: string;
+}
+
+export interface ContentIdeaResult {
+  ideas: ContentIdea[];
+  source: 'gemini' | 'fallback';
+}
+
+const contentIdeaSchema = z.object({
+  hook: z.string(),
+  format: z.string().optional(),
+  rationale: z.string().optional(),
+});
+
+function buildIdeasPrompt(input: ContentIdeaInput, count: number): string {
+  return [
+    'You are a senior content strategist at a social media agency. Brainstorm fresh, specific post ideas.',
+    `Client / niche: ${input.niche}.`,
+    input.platform ? `Primary platform: ${input.platform}.` : '',
+    input.audience ? `Target audience: ${input.audience}.` : '',
+    '',
+    `Produce exactly ${count} ideas. For each idea provide:`,
+    '- "hook": a scroll-stopping hook / headline for the post.',
+    `- "format": one of ${IDEA_FORMATS.join(', ')}.`,
+    '- "rationale": one short sentence on why it works.',
+    'Respond with ONLY a raw JSON array of objects {"hook","format","rationale"} — no fences, no commentary.',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+const IDEA_TEMPLATES: Array<(n: string) => ContentIdea> = [
+  (n) => ({
+    hook: `5 myths about ${n} — busted`,
+    format: 'carousel',
+    rationale: 'Myth-busting drives saves and positions the brand as an authority.',
+  }),
+  (n) => ({
+    hook: `A day in the life working in ${n}`,
+    format: 'reel',
+    rationale: 'BTS day-in-the-life content humanizes the brand and boosts reach.',
+  }),
+  (n) => ({
+    hook: `The biggest mistake people make with ${n}`,
+    format: 'reel',
+    rationale: 'Problem-led hooks earn comments from people who relate.',
+  }),
+  (n) => ({
+    hook: `Before vs. after: ${n} edition`,
+    format: 'post',
+    rationale: 'Transformation content is highly shareable and proof-driven.',
+  }),
+  (n) => ({
+    hook: `Quick tip: get more from ${n} in 30 seconds`,
+    format: 'story',
+    rationale: 'Bite-sized value keeps story completion rates high.',
+  }),
+  (n) => ({
+    hook: `We asked our audience about ${n} — here's what they said`,
+    format: 'carousel',
+    rationale: 'Community-sourced content increases relevance and engagement.',
+  }),
+  (n) => ({
+    hook: `${n}: what's actually worth your time in 2026`,
+    format: 'post',
+    rationale: 'Timely round-ups capture search and save intent.',
+  }),
+  (n) => ({
+    hook: `Ask me anything about ${n}`,
+    format: 'live',
+    rationale: 'Live Q&As deepen trust and surface future content topics.',
+  }),
+];
+
+function fallbackIdeas(input: ContentIdeaInput, count: number): ContentIdeaResult {
+  const niche = input.niche.trim() || 'your niche';
+  const seed = seedFrom(niche);
+  const ideas: ContentIdea[] = [];
+  for (let i = 0; i < count; i++) {
+    const tmpl = IDEA_TEMPLATES[(seed + i) % IDEA_TEMPLATES.length]!;
+    ideas.push(tmpl(niche));
+  }
+  return { ideas, source: 'fallback' };
+}
+
+export async function generateContentIdeas(
+  input: ContentIdeaInput,
+): Promise<ContentIdeaResult> {
+  const count = Math.min(Math.max(input.count ?? 6, 1), 12);
+  const text = await callGeminiText({
+    contents: [{ role: 'user', text: buildIdeasPrompt(input, count) }],
+  });
+  if (text && text.trim()) {
+    const arr = parseJsonArray(text, contentIdeaSchema);
+    if (arr && arr.length) {
+      const ideas = arr
+        .filter((i) => i.hook.trim())
+        .map((i) => ({
+          hook: i.hook.trim(),
+          format: (i.format ?? 'post').trim().toLowerCase(),
+          rationale: (i.rationale ?? '').trim(),
+        }));
+      if (ideas.length) return { ideas: ideas.slice(0, count), source: 'gemini' };
+    }
+  }
+  return fallbackIdeas(input, count);
+}
+
+// ---------------------------------------------------------------------------
+//  Repurpose content across platforms
+// ---------------------------------------------------------------------------
+
+export const REPURPOSE_TARGETS = [
+  'instagram',
+  'linkedin',
+  'x_thread',
+  'facebook',
+  'tiktok',
+  'youtube',
+  'newsletter',
+] as const;
+export type RepurposeTarget = (typeof REPURPOSE_TARGETS)[number];
+
+const REPURPOSE_LABELS: Record<RepurposeTarget, string> = {
+  instagram: 'Instagram caption',
+  linkedin: 'LinkedIn post',
+  x_thread: 'X (Twitter) thread',
+  facebook: 'Facebook post',
+  tiktok: 'TikTok script / caption',
+  youtube: 'YouTube description',
+  newsletter: 'email newsletter blurb',
+};
+
+export interface RepurposeInput {
+  /** The source content to adapt. */
+  content: string;
+  target: RepurposeTarget;
+  tone?: string;
+  brandName?: string;
+}
+
+export interface RepurposeResult {
+  /** Markdown-formatted adapted content. */
+  content: string;
+  targetLabel: string;
+  source: 'gemini' | 'fallback';
+}
+
+function buildRepurposePrompt(input: RepurposeInput): string {
+  const label = REPURPOSE_LABELS[input.target];
+  const guidance: Record<RepurposeTarget, string> = {
+    instagram: 'Keep it punchy with line breaks and a few emojis; end with a CTA. Suggest 3-5 hashtags on a new line.',
+    linkedin: 'Professional, value-first, first-person. Short paragraphs, a strong opening line, and a reflective closing question.',
+    x_thread: 'Write a numbered thread of 4-7 tweets, each under 280 characters. Lead with a hook tweet.',
+    facebook: 'Conversational and community-oriented; a clear CTA to comment or share.',
+    tiktok: 'A short spoken-style script with an on-screen hook in the first 2 seconds, then 3-4 beats, then a CTA.',
+    youtube: 'An SEO-friendly description: 2-3 sentence summary, key timestamps placeholder, and a subscribe CTA.',
+    newsletter: 'A warm, skimmable blurb with a subject-line suggestion and a single clear CTA.',
+  };
+  return [
+    `You are a multi-platform content strategist. Repurpose the source content below into a ${label}.`,
+    input.brandName ? `Brand: ${input.brandName}.` : '',
+    input.tone ? `Tone: ${input.tone}.` : '',
+    `Platform guidance: ${guidance[input.target]}`,
+    '',
+    `Source content:\n${input.content}`,
+    '',
+    'Keep the core message but adapt structure, length, and style to the target platform.',
+    'Respond with ONLY the adapted content in Markdown — no preamble, no explanation, no code fences.',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+function fallbackRepurpose(input: RepurposeInput): RepurposeResult {
+  const label = REPURPOSE_LABELS[input.target];
+  const brand = input.brandName?.trim() || 'We';
+  const src = input.content.trim();
+  let body: string;
+  switch (input.target) {
+    case 'x_thread':
+      body = [
+        `1/ ${src.slice(0, 240)}`,
+        `2/ Here's why it matters for you 👇`,
+        `3/ The key takeaway: keep it simple and consistent.`,
+        `4/ Follow for more. What would you add? 💬`,
+      ].join('\n\n');
+      break;
+    case 'linkedin':
+      body = `${src}\n\nAt ${brand}, we believe this is worth sharing.\n\nWhat's your take?`;
+      break;
+    case 'newsletter':
+      body = `**Subject:** A quick note from ${brand}\n\n${src}\n\n_Reply and let us know your thoughts._`;
+      break;
+    default:
+      body = `${src}\n\n— ${brand} ✨`;
+  }
+  return {
+    content: body,
+    targetLabel: label,
+    source: 'fallback',
+  };
+}
+
+export async function repurposeContent(
+  input: RepurposeInput,
+): Promise<RepurposeResult> {
+  const label = REPURPOSE_LABELS[input.target];
+  const text = await callGeminiText({
+    contents: [{ role: 'user', text: buildRepurposePrompt(input) }],
+  });
+  if (text && text.trim()) {
+    return {
+      content: stripCodeFences(text),
+      targetLabel: label,
+      source: 'gemini',
+    };
+  }
+  return fallbackRepurpose(input);
+}

@@ -5,22 +5,30 @@ import { and, eq } from 'drizzle-orm';
 import { env } from '../env.js';
 import { verifyAccessToken, type Role } from '../lib/jwt.js';
 import { db } from '../db/client.js';
-import { threadParticipants, users } from '../db/schema.js';
+import { portalTokens, threadParticipants, users } from '../db/schema.js';
 import { ACCESS_COOKIE } from '../middleware/auth.js';
+import { isAllowedOrigin } from '../middleware/origin.js';
+import { hashToken } from '../lib/ids.js';
 import { createMessage, markRead } from '../services/messages.js';
-import { setIo, threadRoom, userRoom } from './io.js';
+import { setIo, threadRoom, userRoom, portalRoom } from './io.js';
 
 /** Same allowlist as middleware/cors.ts — credentialed handshakes only. */
 const allowList = new Set(
   [env.FRONTEND_ORIGIN, 'http://localhost:3000'].filter(Boolean),
 );
+const allowPrivateLan = env.NODE_ENV !== 'production';
 
-/** Per-socket auth context, mirroring req.auth on the REST side. */
+/** Per-socket auth context, mirroring req.auth on the REST side. A connection
+ * is either an authenticated agency `user` or a public `portal` (client). */
 interface SocketData {
-  userId: string;
+  kind: 'user' | 'portal';
   agencyId: string;
+  // user connections
+  userId: string;
   role: Role;
   name: string | null;
+  // portal connections
+  clientId: string;
 }
 
 type AppSocket = Socket<
@@ -42,16 +50,43 @@ export function initSocket(httpServer: HttpServer): Server {
       origin(origin, cb) {
         // No Origin (native/curl/server-to-server) -> allow.
         if (!origin) return cb(null, true);
-        if (allowList.has(origin)) return cb(null, true);
+        if (isAllowedOrigin(origin, allowList, allowPrivateLan)) {
+          return cb(null, true);
+        }
         return cb(new Error('CORS_NOT_ALLOWED'), false);
       },
       credentials: true,
     },
   });
 
-  // ---- Handshake auth: cookie 'sanctum_at' OR auth.token fallback ----
+  // ---- Handshake auth: agency user (cookie / auth.token) OR portal token ----
   io.use(async (socket, next) => {
     try {
+      const data = socket.data as SocketData;
+
+      // Public portal connection: validate the opaque token like the REST side.
+      const portalToken = socket.handshake.auth?.portalToken as
+        | string
+        | undefined;
+      if (portalToken) {
+        const [tok] = await db
+          .select()
+          .from(portalTokens)
+          .where(eq(portalTokens.tokenHash, hashToken(portalToken)))
+          .limit(1);
+        if (
+          !tok ||
+          tok.revoked ||
+          (tok.expiresAt && tok.expiresAt.getTime() <= Date.now())
+        ) {
+          return next(new Error('unauthorized'));
+        }
+        data.kind = 'portal';
+        data.agencyId = tok.agencyId;
+        data.clientId = tok.clientId;
+        return next();
+      }
+
       const header = socket.handshake.headers.cookie;
       const cookieToken = header
         ? (parseCookie(header)[ACCESS_COOKIE] as string | undefined)
@@ -67,7 +102,7 @@ export function initSocket(httpServer: HttpServer): Server {
         .where(eq(users.id, claims.sub))
         .limit(1);
 
-      const data = socket.data as SocketData;
+      data.kind = 'user';
       data.userId = claims.sub;
       data.agencyId = claims.agencyId;
       data.role = claims.role;
@@ -79,6 +114,12 @@ export function initSocket(httpServer: HttpServer): Server {
   });
 
   io.on('connection', async (socket: AppSocket) => {
+    // Public portal sockets only RECEIVE (portal:refresh); no message handlers.
+    if (socket.data.kind === 'portal') {
+      if (socket.data.clientId) socket.join(portalRoom(socket.data.clientId));
+      return;
+    }
+
     const { userId, agencyId } = socket.data;
 
     try {

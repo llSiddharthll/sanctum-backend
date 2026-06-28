@@ -10,6 +10,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth, requireClientAccess } from '../middleware/tenant.js';
 import { signUpload, destroyAsset } from '../services/cloudinary.js';
+import { broadcastPortalRefresh } from '../realtime/io.js';
 
 export const mediaRouter = Router();
 mediaRouter.use(requireAuth);
@@ -117,6 +118,9 @@ mediaRouter.post('/posts/:postId', async (req, res) => {
       },
     });
 
+  // Live-update the client portal so newly attached media appears instantly.
+  broadcastPortalRefresh(body.clientId);
+
   created(res, {
     id,
     cloudinaryPublicId: body.cloudinaryPublicId,
@@ -162,6 +166,9 @@ mediaRouter.delete('/:mediaId', async (req, res) => {
         eq(usageCounters.period, period),
       ),
     );
+
+  // Live-update the client portal so removed media disappears instantly.
+  broadcastPortalRefresh(media.clientId);
 
   ok(res, { deleted: true });
 });

@@ -166,6 +166,25 @@ export const invites = sqliteTable(
   ],
 );
 
+// Single-use, short-lived password-reset tokens (sha256-hashed at rest).
+export const passwordResets = sqliteTable(
+  t('password_resets'),
+  {
+    id: text('id').primaryKey(),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    tokenHash: text('token_hash').notNull().unique(),
+    expiresAt: ts('expires_at').notNull(),
+    usedAt: ts('used_at'),
+    createdAt: ts('created_at').notNull().default(now),
+  },
+  (tbl) => [index('ix_password_resets_user').on(tbl.userId)],
+);
+
 // ============================================================
 //  CLIENTS (the agency's end clients)
 // ============================================================
@@ -716,6 +735,32 @@ export const projectTasks = sqliteTable(
 );
 
 // ============================================================
+//  TASK_ASSIGNEES (M:N users <-> tasks)
+//  Multiple assignees per task. projectTasks.assigneeId mirrors the
+//  "primary" (first) assignee for backward compatibility.
+// ============================================================
+export const taskAssignees = sqliteTable(
+  t('task_assignees'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    taskId: text('task_id')
+      .notNull()
+      .references(() => projectTasks.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    createdAt: ts('created_at').notNull().default(now),
+  },
+  (tbl) => [
+    uniqueIndex('ux_task_assignee').on(tbl.taskId, tbl.userId),
+    index('ix_task_assignees_task').on(tbl.taskId),
+  ],
+);
+
+// ============================================================
 //  PROJECT_MILESTONES (dated checkpoints under a project)
 // ============================================================
 export const projectMilestones = sqliteTable(
@@ -1210,6 +1255,8 @@ export const messages = sqliteTable(
       onDelete: 'set null',
     }),
     body: text('body').notNull(),
+    // JSON array of { url, type:'image'|'file', name, mime?, bytes? }.
+    attachmentsJson: text('attachments_json'),
     createdAt: ts('created_at').notNull().default(now),
     editedAt: ts('edited_at'),
   },
@@ -1372,6 +1419,13 @@ export const attendanceRecords = sqliteTable(
     checkInIp: text('check_in_ip'),
     checkInLat: real('check_in_lat'),
     checkInLng: real('check_in_lng'),
+    // Human-readable area for the check-in (reverse-geocoded from the coords).
+    checkInLocation: text('check_in_location'),
+    // Check-out location capture (mirrors the check-in fields).
+    checkOutIp: text('check_out_ip'),
+    checkOutLat: real('check_out_lat'),
+    checkOutLng: real('check_out_lng'),
+    checkOutLocation: text('check_out_location'),
     createdAt: ts('created_at').notNull().default(now),
     updatedAt: ts('updated_at').notNull().default(now),
   },

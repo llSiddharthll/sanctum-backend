@@ -16,6 +16,9 @@ import { invalidState, notFound } from '../lib/errors.js';
 import { portalLimiter } from '../middleware/rate-limit.js';
 import { requirePortalToken } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
+import { agencyApprovers, notifyMany } from '../services/notifications.js';
+import { notifyClientApproval } from '../services/client-notify.js';
+import { broadcastPortalRefresh } from '../realtime/io.js';
 import type { PortalContext } from '../types/index.js';
 
 export const portalRouter = Router();
@@ -33,6 +36,54 @@ function safeArr(s: string): string[] {
     return Array.isArray(v) ? v.filter((x) => typeof x === 'string') : [];
   } catch {
     return [];
+  }
+}
+
+/** Client name + account owner (for attributing portal activity). */
+async function clientBrief(
+  clientId: string,
+): Promise<{ name: string; ownerId: string | null }> {
+  const [c] = await db
+    .select({ name: clients.name, ownerId: clients.ownerId })
+    .from(clients)
+    .where(eq(clients.id, clientId))
+    .limit(1);
+  return { name: c?.name ?? 'A client', ownerId: c?.ownerId ?? null };
+}
+
+/**
+ * Fan a portal activity (approval / changes / comment) out to the agency as an
+ * in-app notification — owners/admins plus the client's account owner. Live
+ * delivery rides Socket.IO; Turso is the source of truth. Best-effort: a notify
+ * failure must never break the client's portal action.
+ */
+async function notifyPortalActivity(opts: {
+  agencyId: string;
+  clientId: string;
+  ownerId: string | null;
+  type: string;
+  title: string;
+  body: string | null;
+  postId: string;
+}): Promise<void> {
+  try {
+    const approvers = await agencyApprovers(opts.agencyId);
+    const recipients = new Set(approvers);
+    if (opts.ownerId) recipients.add(opts.ownerId);
+    if (recipients.size === 0) return;
+    await notifyMany([...recipients], {
+      agencyId: opts.agencyId,
+      type: opts.type,
+      title: opts.title,
+      body: opts.body,
+      entityType: 'post',
+      entityId: opts.postId,
+      // Deep-link straight to the post so the bell opens its detail + thread.
+      link: `/clients/${opts.clientId}/calendar?post=${opts.postId}`,
+    });
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[portal:notify] failed:', (err as Error)?.message ?? err);
   }
 }
 
@@ -55,6 +106,11 @@ portalRouter.get('/resolve', async (req, res) => {
   const visible = client.portalVisibleStatuses
     .split(',')
     .filter(Boolean);
+  // Always surface posts the client themselves sent back for changes, so a
+  // "Request changes" action doesn't make the post vanish from their own
+  // portal — they need to keep tracking it until the agency revises it. (The
+  // stored config historically omitted this status.)
+  if (!visible.includes('changes_requested')) visible.push('changes_requested');
 
   const posts = await db
     .select()
@@ -219,6 +275,35 @@ portalRouter.post('/posts/:postId/decision', async (req, res) => {
     ip: req.ip,
   });
 
+  // Real-time notification to the agency (owners/admins + account owner).
+  const brief = await clientBrief(p.clientId);
+  const who = body.actorLabel?.trim() || brief.name;
+  const captionSnippet = (post.caption ?? '').trim().slice(0, 80);
+  await notifyPortalActivity({
+    agencyId: p.agencyId,
+    clientId: p.clientId,
+    ownerId: brief.ownerId,
+    type: body.decision === 'approved' ? 'post.approved' : 'post.changes',
+    title:
+      body.decision === 'approved'
+        ? `${who} approved a post`
+        : `${who} requested changes`,
+    body: body.note?.trim() || (captionSnippet ? `“${captionSnippet}”` : null),
+    postId: post.id,
+  });
+
+  // Email the client a receipt for their approval (best-effort).
+  if (body.decision === 'approved') {
+    void notifyClientApproval({
+      agencyId: p.agencyId,
+      clientId: p.clientId,
+      caption: post.caption,
+      reviewer: body.actorLabel ?? null,
+    }).catch(() => {});
+  }
+  // Keep any other open portal sessions for this client in sync.
+  broadcastPortalRefresh(p.clientId);
+
   ok(res, {
     postId: post.id,
     decision: body.decision,
@@ -262,6 +347,20 @@ portalRouter.post('/posts/:postId/comments', async (req, res) => {
     ip: req.ip,
   });
 
+  // Real-time notification to the agency (owners/admins + account owner).
+  const brief = await clientBrief(p.clientId);
+  const who = body.actorLabel?.trim() || brief.name;
+  await notifyPortalActivity({
+    agencyId: p.agencyId,
+    clientId: p.clientId,
+    ownerId: brief.ownerId,
+    type: 'post.comment',
+    title: `${who} commented`,
+    body: body.body.trim().slice(0, 120),
+    postId: post.id,
+  });
+
+  broadcastPortalRefresh(p.clientId);
   created(res, {
     id,
     body: body.body,
@@ -270,10 +369,17 @@ portalRouter.post('/posts/:postId/comments', async (req, res) => {
   });
 });
 
-// GET /portal/posts/:postId/comments
+// GET /portal/posts/:postId/comments — the two-way thread visible to the client.
 portalRouter.get('/posts/:postId/comments', async (req, res) => {
   const p = getPortal(req);
   const post = await scopedPost(p, req.params.postId);
+  // Staff replies are attributed to the agency brand (not an internal name).
+  const [agency] = await db
+    .select({ name: agencies.name })
+    .from(agencies)
+    .where(eq(agencies.id, p.agencyId))
+    .limit(1);
+  const teamName = agency?.name ?? 'The team';
   const rows = await db
     .select()
     .from(postComments)
@@ -291,6 +397,12 @@ portalRouter.get('/posts/:postId/comments', async (req, res) => {
       body: c.body,
       authorType: c.authorType,
       authorLabel: c.authorLabel,
+      // Resolved display name for the portal UI: the reviewer's own label for
+      // client comments, the agency brand for staff replies.
+      authorName:
+        c.authorType === 'client'
+          ? c.authorLabel || 'You'
+          : teamName,
       createdAt: toIso(c.createdAt),
     })),
   );

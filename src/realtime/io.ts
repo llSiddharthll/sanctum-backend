@@ -20,6 +20,8 @@ export function getIo(): Server | null {
 // ---- Room naming ----
 export const threadRoom = (id: string): string => `thread:${id}`;
 export const userRoom = (id: string): string => `user:${id}`;
+/** Public client portal room — keyed by clientId (token-authed sockets join). */
+export const portalRoom = (clientId: string): string => `portal:${clientId}`;
 
 // ============================================================
 //  Broadcast helpers (no-ops when the socket layer is absent)
@@ -77,6 +79,20 @@ export function broadcastNotification(userId: string, payload: unknown): void {
   io.to(userRoom(userId)).emit('notification:new', payload);
 }
 
+/**
+ * Something the client can see changed for this client's content (a post was
+ * sent/edited/transitioned, or the agency replied). Tell any open portal to
+ * refetch. Delivery-only; the portal reconciles via REST.
+ */
+export function broadcastPortalRefresh(
+  clientId: string,
+  payload?: unknown,
+): void {
+  const io = ioRef;
+  if (!io) return;
+  io.to(portalRoom(clientId)).emit('portal:refresh', payload ?? {});
+}
+
 /** Someone advanced their read cursor — tell the thread room (live receipts). */
 export function broadcastThreadRead(
   threadId: string,
@@ -85,4 +101,24 @@ export function broadcastThreadRead(
   const io = ioRef;
   if (!io) return;
   io.to(threadRoom(threadId)).emit('thread:read', payload);
+}
+
+/** A message was edited — replace it in the thread room. */
+export function broadcastMessageUpdated(
+  threadId: string,
+  message: unknown,
+): void {
+  const io = ioRef;
+  if (!io) return;
+  io.to(threadRoom(threadId)).emit('message:updated', message);
+}
+
+/** A message was deleted — remove it from the thread room. */
+export function broadcastMessageDeleted(
+  threadId: string,
+  payload: { threadId: string; messageId: string },
+): void {
+  const io = ioRef;
+  if (!io) return;
+  io.to(threadRoom(threadId)).emit('message:deleted', payload);
 }

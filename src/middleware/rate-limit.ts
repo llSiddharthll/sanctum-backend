@@ -4,6 +4,9 @@ function envelope(code: string, message: string) {
   return { error: { code, message } };
 }
 
+/** Skip rate limiting under the automated test runner (NODE_ENV=test). */
+const skipInTest = () => process.env.NODE_ENV === 'test';
+
 /**
  * Numeric rate-limit configuration — the single source of truth for both the
  * limiters below and any handler that wants to surface the limits (e.g.
@@ -22,6 +25,7 @@ export const globalLimiter = rateLimit({
   limit: rateLimitConfig.global.max,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
+  skip: skipInTest,
   message: envelope('RATE_LIMITED', 'Too many requests.'),
 });
 
@@ -31,6 +35,7 @@ export const authLimiter = rateLimit({
   limit: rateLimitConfig.auth.max,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
+  skip: skipInTest,
   message: envelope('RATE_LIMITED', 'Too many attempts, try again later.'),
 });
 
@@ -40,6 +45,7 @@ export const aiLimiter = rateLimit({
   limit: rateLimitConfig.ai.max,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
+  skip: skipInTest,
   message: envelope('RATE_LIMITED', 'AI rate limit reached.'),
 });
 
@@ -49,5 +55,6 @@ export const portalLimiter = rateLimit({
   limit: rateLimitConfig.portal.max,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
+  skip: skipInTest,
   message: envelope('RATE_LIMITED', 'Too many requests.'),
 });

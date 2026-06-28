@@ -218,6 +218,8 @@ attendanceRouter.get('/today', async (req, res) => {
 const punchSchema = z.object({
   lat: z.number().min(-90).max(90).optional(),
   lng: z.number().min(-180).max(180).optional(),
+  // Human-readable area resolved on the client (reverse-geocoded from coords).
+  location: z.string().max(200).optional(),
 });
 
 attendanceRouter.post('/check-in', async (req, res) => {
@@ -241,19 +243,33 @@ attendanceRouter.post('/check-in', async (req, res) => {
       and(eq(attendanceRecords.userId, ctx.userId), eq(attendanceRecords.day, day)),
     )
     .limit(1);
-  if (existing && existing.checkInAt) {
-    throw conflict('You have already checked in today.');
+  // Already checked in and STILL working (not checked out) → nothing to do.
+  if (existing && existing.checkInAt && !existing.checkOutAt) {
+    throw conflict('You are already checked in today.');
   }
 
-  const derived = deriveDayStatus(policy, { checkInAt: now, checkOutAt: null });
+  // Re-check-in: someone who checked out (often by mistake) can clock back in
+  // the same day. We keep the ORIGINAL check-in time, wipe the (mistaken)
+  // check-out, and re-open the day so worked time keeps accruing.
+  const reopening = !!(existing && existing.checkInAt && existing.checkOutAt);
+  const checkInAt = reopening ? existing!.checkInAt! : now;
+  const derived = deriveDayStatus(policy, { checkInAt, checkOutAt: null });
   const values = {
-    checkInAt: now,
+    checkInAt,
+    checkOutAt: null,
+    checkOutIp: null,
+    checkOutLat: null,
+    checkOutLng: null,
+    checkOutLocation: null,
+    workedMinutes: 0,
+    overtimeMinutes: 0,
     status: derived.status,
     isLate: derived.isLate,
     source: 'self' as const,
     checkInIp: req.ip ?? null,
     checkInLat: body.lat ?? null,
     checkInLng: body.lng ?? null,
+    checkInLocation: body.location ?? null,
     updatedAt: now,
   };
 
@@ -284,7 +300,7 @@ attendanceRouter.post('/check-in', async (req, res) => {
     action: 'attendance.check_in',
     entityType: 'attendance',
     entityId: row!.id,
-    metadata: { day, late: derived.isLate },
+    metadata: { day, late: derived.isLate, reopened: reopening },
     ip: req.ip,
   });
   created(res, serializeRecord(row!));
@@ -292,6 +308,7 @@ attendanceRouter.post('/check-in', async (req, res) => {
 
 attendanceRouter.post('/check-out', async (req, res) => {
   const ctx = getAuth(req);
+  const body = punchSchema.parse(req.body ?? {});
   const policy = await loadPolicy(ctx.agencyId);
   const now = new Date();
   const day = dayKeyInTz(now, policy.timezone);
@@ -314,6 +331,10 @@ attendanceRouter.post('/check-out', async (req, res) => {
     .update(attendanceRecords)
     .set({
       checkOutAt: now,
+      checkOutIp: req.ip ?? null,
+      checkOutLat: body.lat ?? null,
+      checkOutLng: body.lng ?? null,
+      checkOutLocation: body.location ?? null,
       workedMinutes: derived.workedMinutes,
       overtimeMinutes: derived.overtimeMinutes,
       status: derived.status,
@@ -601,6 +622,8 @@ attendanceRouter.get('/whos-in', async (req, res) => {
         checkOutAt: rec ? toIso(rec.checkOutAt) : null,
         workedMinutes: rec?.workedMinutes ?? 0,
         isLate: rec?.isLate ?? false,
+        checkInLocation: rec?.checkInLocation ?? null,
+        checkOutLocation: rec?.checkOutLocation ?? null,
       };
     }),
   );

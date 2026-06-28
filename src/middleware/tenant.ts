@@ -38,9 +38,11 @@ export async function assignedClientIds(
 }
 
 /**
- * Verify a client belongs to the caller's agency AND (for members) is assigned.
- * Returns the client row or throws 404 — cross-tenant existence is never
- * revealed.
+ * Verify a client belongs to the caller's agency. Returns the client row or
+ * throws 404 — cross-tenant existence is never revealed. Access within the
+ * agency is governed by the 'clients' module permission (the route gate), not
+ * by per-member assignment: any teammate who can use the Clients module reaches
+ * every client in their agency.
  */
 export async function requireClientAccess(
   ctx: AuthContext,
@@ -53,11 +55,6 @@ export async function requireClientAccess(
     .limit(1);
 
   if (!client) throw notFound('Client not found.');
-
-  if (!isPrivileged(ctx.role)) {
-    const ids = await assignedClientIds(ctx);
-    if (!ids.includes(clientId)) throw notFound('Client not found.');
-  }
   return client;
 }
 

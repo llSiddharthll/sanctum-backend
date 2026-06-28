@@ -18,12 +18,7 @@ import { newId } from '../lib/ids.js';
 import { conflict, notFound } from '../lib/errors.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { requireModuleRW } from '../middleware/permissions.js';
-import {
-  assignedClientIds,
-  getAuth,
-  isPrivileged,
-  requireClientAccess,
-} from '../middleware/tenant.js';
+import { getAuth, requireClientAccess } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
 import type { AuthContext } from '../types/index.js';
 
@@ -32,9 +27,13 @@ crmRouter.use(requireAuth);
 // CRM data is part of the Clients module: GET=view, writes=manage.
 crmRouter.use(requireModuleRW('clients'));
 
-/** Client ids the caller may touch (null = all, for owner/admin). */
-async function scopedClientIds(ctx: AuthContext): Promise<string[] | null> {
-  return isPrivileged(ctx.role) ? null : await assignedClientIds(ctx);
+/**
+ * Client ids the caller may touch — always null (= all of the agency's
+ * clients). Access is governed by the 'clients' module permission (the router
+ * gate); CRM data is no longer scoped to per-member client assignments.
+ */
+async function scopedClientIds(_ctx: AuthContext): Promise<string[] | null> {
+  return null;
 }
 
 // ============================================================

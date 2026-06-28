@@ -16,9 +16,40 @@ import {
   broadcastThreadCreated,
   broadcastThreadRead,
   broadcastThreadUpdate,
+  broadcastMessageUpdated,
+  broadcastMessageDeleted,
 } from '../realtime/io.js';
+import { notify } from './notifications.js';
 
 const PREVIEW_MAX = 140;
+
+export interface MessageAttachment {
+  url: string;
+  type: 'image' | 'file';
+  name: string;
+  mime?: string | null;
+  bytes?: number | null;
+}
+
+/** Parse the stored attachments JSON into a safe array. */
+function parseAttachments(raw: string | null | undefined): MessageAttachment[] {
+  if (!raw) return [];
+  try {
+    const v = JSON.parse(raw);
+    if (!Array.isArray(v)) return [];
+    return v
+      .filter((a) => a && typeof a.url === 'string')
+      .map((a) => ({
+        url: String(a.url),
+        type: a.type === 'image' ? 'image' : 'file',
+        name: typeof a.name === 'string' ? a.name : 'file',
+        mime: a.mime ?? null,
+        bytes: typeof a.bytes === 'number' ? a.bytes : null,
+      }));
+  } catch {
+    return [];
+  }
+}
 
 function preview(body: string): string {
   const trimmed = body.trim();
@@ -59,6 +90,7 @@ export interface SerializedMessage {
   senderName: string | null;
   senderAvatarUrl: string | null;
   body: string;
+  attachments: MessageAttachment[];
   createdAt: string | null;
   editedAt: string | null;
 }
@@ -286,6 +318,7 @@ function serializeMessageRow(row: {
   threadId: string;
   senderId: string | null;
   body: string;
+  attachmentsJson?: string | null;
   createdAt: Date | null;
   editedAt: Date | null;
   senderName: string | null;
@@ -297,6 +330,7 @@ function serializeMessageRow(row: {
     senderName: row.senderName ?? null,
     senderAvatarUrl: null,
     body: row.body,
+    attachments: parseAttachments(row.attachmentsJson),
     createdAt: toIso(row.createdAt),
     editedAt: toIso(row.editedAt),
   };
@@ -309,6 +343,7 @@ function serializeMessageRow(row: {
 export interface ListThreadsOptions {
   status?: 'open' | 'awaiting' | 'closed';
   search?: string;
+  clientId?: string;
 }
 
 /** Threads the user participates in, newest activity first, with unread counts. */
@@ -322,6 +357,7 @@ export async function listThreads(
     eq(threadParticipants.userId, userId),
   ];
   if (opts.status) filters.push(eq(messageThreads.status, opts.status));
+  if (opts.clientId) filters.push(eq(messageThreads.clientId, opts.clientId));
   if (opts.search && opts.search.trim()) {
     filters.push(
       sql`lower(${messageThreads.subject}) like ${'%' + opts.search.trim().toLowerCase() + '%'}`,
@@ -541,6 +577,7 @@ export async function listMessages(
       threadId: messages.threadId,
       senderId: messages.senderId,
       body: messages.body,
+      attachmentsJson: messages.attachmentsJson,
       createdAt: messages.createdAt,
       editedAt: messages.editedAt,
       senderName: users.fullName,
@@ -560,16 +597,26 @@ export async function listMessages(
  * read cursor, and broadcast 'message:new' + 'thread:updated'. Called by BOTH
  * the REST route and the socket 'message:send' handler.
  */
+export interface CreateMessageOptions {
+  attachments?: MessageAttachment[];
+}
+
 export async function createMessage(
   agencyId: string,
   senderId: string,
   threadId: string,
   body: string,
+  opts: CreateMessageOptions = {},
 ): Promise<SerializedMessage> {
   const trimmed = body.trim();
-  if (!trimmed) throw badRequest('Message body is required.');
+  const attachments = (opts.attachments ?? []).filter(
+    (a) => a && typeof a.url === 'string',
+  );
+  if (!trimmed && attachments.length === 0) {
+    throw badRequest('Message body or an attachment is required.');
+  }
 
-  await requireParticipant(agencyId, senderId, threadId);
+  const { thread } = await requireParticipant(agencyId, senderId, threadId);
 
   const now = new Date();
   const id = newId('msg');
@@ -579,15 +626,18 @@ export async function createMessage(
     threadId,
     senderId,
     body: trimmed,
+    attachmentsJson: attachments.length ? JSON.stringify(attachments) : null,
     createdAt: now,
   });
 
-  // Bump the thread's activity + preview.
+  // Bump the thread's activity + preview (attachment-only → a paperclip hint).
   await db
     .update(messageThreads)
     .set({
       lastMessageAt: now,
-      lastMessagePreview: preview(trimmed),
+      lastMessagePreview: trimmed
+        ? preview(trimmed)
+        : `📎 ${attachments.length} attachment${attachments.length === 1 ? '' : 's'}`,
       updatedAt: now,
     })
     .where(
@@ -614,21 +664,161 @@ export async function createMessage(
     .from(users)
     .where(eq(users.id, senderId))
     .limit(1);
+  const senderName = senderRow?.name ?? null;
 
   const message = serializeMessageRow({
     id,
     threadId,
     senderId,
     body: trimmed,
+    attachmentsJson: attachments.length ? JSON.stringify(attachments) : null,
     createdAt: now,
     editedAt: null,
-    senderName: senderRow?.name ?? null,
+    senderName,
   });
 
   const userIds = await participantUserIds(agencyId, threadId);
   broadcastNewMessage(userIds, threadId, message);
 
+  // @mentions → in-app notification to mentioned participants.
+  await notifyMentions(agencyId, threadId, thread.subject, senderId, senderName, trimmed);
+
   return message;
+}
+
+/** Parse `@name` tokens and notify any matching thread participants. */
+async function notifyMentions(
+  agencyId: string,
+  threadId: string,
+  subject: string,
+  senderId: string,
+  senderName: string | null,
+  body: string,
+): Promise<void> {
+  if (!body.includes('@')) return;
+  const tokens = new Set(
+    (body.match(/@([\p{L}\p{N}_]+)/gu) ?? []).map((t) => t.slice(1).toLowerCase()),
+  );
+  if (tokens.size === 0) return;
+
+  const rows = await db
+    .select({ userId: threadParticipants.userId, name: users.fullName })
+    .from(threadParticipants)
+    .leftJoin(users, eq(users.id, threadParticipants.userId))
+    .where(
+      and(
+        eq(threadParticipants.agencyId, agencyId),
+        eq(threadParticipants.threadId, threadId),
+      ),
+    );
+
+  for (const r of rows) {
+    const rawName = r.name as string | null;
+    const name = (rawName ?? '').trim();
+    if (r.userId === senderId || !name) continue;
+    const first = name.split(/\s+/)[0]?.toLowerCase();
+    const full = name.replace(/\s+/g, '').toLowerCase();
+    if ((first && tokens.has(first)) || tokens.has(full)) {
+      await notify({
+        agencyId,
+        userId: r.userId,
+        type: 'message.mention',
+        title: `${senderName ?? 'Someone'} mentioned you`,
+        body: `${subject}: ${preview(body)}`,
+        entityType: 'thread',
+        entityId: threadId,
+        link: `/messages?thread=${threadId}`,
+      });
+    }
+  }
+}
+
+/** Edit your own message (body only). Broadcasts 'message:updated'. */
+export async function editMessage(
+  agencyId: string,
+  userId: string,
+  threadId: string,
+  messageId: string,
+  body: string,
+): Promise<SerializedMessage> {
+  const trimmed = body.trim();
+  if (!trimmed) throw badRequest('Message body is required.');
+  await requireParticipant(agencyId, userId, threadId);
+
+  const [msg] = await db
+    .select()
+    .from(messages)
+    .where(
+      and(
+        eq(messages.id, messageId),
+        eq(messages.threadId, threadId),
+        eq(messages.agencyId, agencyId),
+      ),
+    )
+    .limit(1);
+  if (!msg) throw notFound('Message not found.');
+  if (msg.senderId !== userId) {
+    throw forbidden('You can only edit your own messages.');
+  }
+
+  const now = new Date();
+  await db
+    .update(messages)
+    .set({ body: trimmed, editedAt: now })
+    .where(eq(messages.id, messageId));
+
+  const [senderRow] = await db
+    .select({ name: users.fullName })
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+
+  const message = serializeMessageRow({
+    id: messageId,
+    threadId,
+    senderId: userId,
+    body: trimmed,
+    attachmentsJson: msg.attachmentsJson,
+    createdAt: msg.createdAt,
+    editedAt: now,
+    senderName: senderRow?.name ?? null,
+  });
+  broadcastMessageUpdated(threadId, message);
+  return message;
+}
+
+/** Delete a message — your own, or any if you're owner/admin. Broadcasts. */
+export async function deleteMessage(
+  agencyId: string,
+  userId: string,
+  role: string,
+  threadId: string,
+  messageId: string,
+): Promise<void> {
+  await requireParticipant(agencyId, userId, threadId);
+
+  const [msg] = await db
+    .select({ senderId: messages.senderId })
+    .from(messages)
+    .where(
+      and(
+        eq(messages.id, messageId),
+        eq(messages.threadId, threadId),
+        eq(messages.agencyId, agencyId),
+      ),
+    )
+    .limit(1);
+  if (!msg) throw notFound('Message not found.');
+
+  const privileged = role === 'owner' || role === 'admin';
+  if (msg.senderId !== userId && !privileged) {
+    throw forbidden('You can only delete your own messages.');
+  }
+
+  await db
+    .delete(messages)
+    .where(and(eq(messages.id, messageId), eq(messages.agencyId, agencyId)));
+  broadcastMessageDeleted(threadId, { threadId, messageId });
 }
 
 /** Advance the viewer's read cursor and broadcast a live read receipt. */
@@ -659,6 +849,9 @@ export async function markRead(
 export interface UpdateThreadInput {
   subject?: string;
   status?: 'open' | 'awaiting' | 'closed';
+  /** null clears the link; undefined leaves it unchanged. */
+  clientId?: string | null;
+  projectId?: string | null;
   addParticipantIds?: string[];
   removeParticipantIds?: string[];
 }
@@ -681,6 +874,16 @@ export async function updateThread(
     patch.subject = s;
   }
   if (input.status !== undefined) patch.status = input.status;
+  if (input.clientId !== undefined) {
+    if (input.clientId) await assertAgencyClient(agencyId, input.clientId);
+    patch.clientId = input.clientId; // null clears the link
+    // Clearing the client also clears a now-orphaned project link.
+    if (input.clientId === null) patch.projectId = null;
+  }
+  if (input.projectId !== undefined) {
+    if (input.projectId) await assertAgencyProject(agencyId, input.projectId);
+    patch.projectId = input.projectId;
+  }
 
   await db
     .update(messageThreads)

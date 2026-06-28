@@ -10,6 +10,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth, requireClientAccess } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
+import { broadcastPortalRefresh } from '../realtime/io.js';
 
 // Mounted under /clients/:clientId/posts/:postId — mergeParams pulls both ids.
 export const approvalsRouter = Router({ mergeParams: true });
@@ -95,6 +96,8 @@ approvalsRouter.post('/comments', async (req, res) => {
     entityId: post.id,
     ip: req.ip,
   });
+  // Live-refresh any open client portal so the agency reply appears instantly.
+  broadcastPortalRefresh(clientId);
   created(res, { id, body: body.body, authorType: 'user' });
 });
 
