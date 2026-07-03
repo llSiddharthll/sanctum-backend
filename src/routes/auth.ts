@@ -50,7 +50,7 @@ function slugify(name: string): string {
 async function issueSession(
   res: import('express').Response,
   user: { id: string; agencyId: string; role: 'owner' | 'admin' | 'member' },
-) {
+): Promise<{ access: string; refresh: string }> {
   const access = await signAccessToken({
     userId: user.id,
     agencyId: user.agencyId,
@@ -60,7 +60,12 @@ async function issueSession(
     userId: user.id,
     agencyId: user.agencyId,
   });
+  // Cookies stay for desktop browsers; the tokens are ALSO returned in the body
+  // so the SPA can store + send them as `Authorization: Bearer` — the cross-site
+  // cookie (Vercel ↔ Render) is blocked by iOS/iPadOS WebKit, which was bouncing
+  // iPad/iPhone users back to login. Bearer auth works on every device.
   setAuthCookies(res, { access, refresh });
+  return { access, refresh };
 }
 
 // POST /auth/signup — create agency + first owner.
@@ -130,7 +135,11 @@ authRouter.post('/signup', authLimiter, async (req, res) => {
     status: 'active',
   });
 
-  await issueSession(res, { id: userId, agencyId, role: 'owner' });
+  const tokens = await issueSession(res, {
+    id: userId,
+    agencyId,
+    role: 'owner',
+  });
   await audit({
     agencyId,
     actorType: 'owner',
@@ -144,6 +153,7 @@ authRouter.post('/signup', authLimiter, async (req, res) => {
   created(res, {
     user: { id: userId, email, fullName: body.fullName, role: 'owner' },
     agency: { id: agencyId, name: body.agencyName, slug },
+    tokens,
   });
 });
 
@@ -175,7 +185,7 @@ authRouter.post('/login', authLimiter, async (req, res) => {
     .set({ lastLoginAt: new Date() })
     .where(eq(users.id, user.id));
 
-  await issueSession(res, {
+  const tokens = await issueSession(res, {
     id: user.id,
     agencyId: user.agencyId,
     role: user.role,
@@ -196,6 +206,7 @@ authRouter.post('/login', authLimiter, async (req, res) => {
       role: user.role,
     },
     agencyId: user.agencyId,
+    tokens,
   });
 });
 
@@ -291,7 +302,7 @@ authRouter.post('/accept-invite', authLimiter, async (req, res) => {
     .set({ status: 'accepted', acceptedAt: new Date() })
     .where(eq(invites.id, invite.id));
 
-  await issueSession(res, {
+  const tokens = await issueSession(res, {
     id: member.id,
     agencyId: member.agencyId,
     role: member.role,
@@ -314,6 +325,7 @@ authRouter.post('/accept-invite', authLimiter, async (req, res) => {
       role: member.role,
     },
     agencyId: member.agencyId,
+    tokens,
   });
 });
 
@@ -412,7 +424,7 @@ authRouter.post('/reset-password', authLimiter, async (req, res) => {
       ),
     );
 
-  await issueSession(res, {
+  const tokens = await issueSession(res, {
     id: user.id,
     agencyId: user.agencyId,
     role: user.role,
@@ -435,6 +447,7 @@ authRouter.post('/reset-password', authLimiter, async (req, res) => {
       role: user.role,
     },
     agencyId: user.agencyId,
+    tokens,
   });
 });
 
@@ -475,7 +488,19 @@ authRouter.post('/change-password', requireAuth, async (req, res) => {
 
 // POST /auth/refresh — rotate tokens from the refresh cookie.
 authRouter.post('/refresh', authLimiter, async (req, res) => {
-  const token = req.cookies?.[REFRESH_COOKIE] as string | undefined;
+  // Prefer the cookie (desktop); fall back to a body field or Bearer header so
+  // the SPA can refresh on devices where the cross-site cookie is blocked (iOS).
+  const header = req.headers.authorization;
+  const bearer =
+    header && header.startsWith('Bearer ')
+      ? header.slice('Bearer '.length)
+      : undefined;
+  const bodyToken =
+    req.body && typeof req.body.refreshToken === 'string'
+      ? (req.body.refreshToken as string)
+      : undefined;
+  const token =
+    (req.cookies?.[REFRESH_COOKIE] as string | undefined) ?? bodyToken ?? bearer;
   if (!token) throw unauthenticated('No refresh token.');
 
   let claims;
@@ -498,12 +523,12 @@ authRouter.post('/refresh', authLimiter, async (req, res) => {
     throw unauthenticated('Session no longer valid.');
   }
 
-  await issueSession(res, {
+  const tokens = await issueSession(res, {
     id: user.id,
     agencyId: user.agencyId,
     role: user.role,
   });
-  ok(res, { refreshed: true });
+  ok(res, { refreshed: true, tokens });
 });
 
 // POST /auth/logout
