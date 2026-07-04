@@ -1,14 +1,16 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, asc, eq, ne } from 'drizzle-orm';
+import { and, asc, eq, ne, or } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   agencies,
   clients,
   contentPosts,
+  documents,
   postApprovals,
   postComments,
   postMedia,
+  projects,
 } from '../db/schema.js';
 import { ok, created, toIso } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
@@ -156,6 +158,36 @@ portalRouter.get('/resolve', async (req, res) => {
     });
   }
 
+  // Client-facing documents: flagged clientVisible AND belonging to this client
+  // directly (clientId) or via a project owned by this client. Internal-only
+  // documents (clientVisible=false) are never exposed to the portal.
+  const docRows = await db
+    .select({
+      id: documents.id,
+      name: documents.name,
+      category: documents.category,
+      fileUrl: documents.fileUrl,
+      resourceType: documents.resourceType,
+      format: documents.format,
+      sizeBytes: documents.sizeBytes,
+      projectId: documents.projectId,
+      projectName: projects.name,
+      createdAt: documents.createdAt,
+    })
+    .from(documents)
+    .leftJoin(projects, eq(projects.id, documents.projectId))
+    .where(
+      and(
+        eq(documents.agencyId, p.agencyId),
+        eq(documents.clientVisible, true),
+        or(
+          eq(documents.clientId, p.clientId),
+          eq(projects.clientId, p.clientId),
+        ),
+      ),
+    )
+    .orderBy(asc(documents.name));
+
   ok(res, {
     agency: agency
       ? {
@@ -173,6 +205,18 @@ portalRouter.get('/resolve', async (req, res) => {
     },
     portal: { visibleStatuses: visible, canApprove: true, canComment: true },
     posts: result,
+    documents: docRows.map((d) => ({
+      id: d.id,
+      name: d.name,
+      category: d.category,
+      fileUrl: d.fileUrl,
+      resourceType: d.resourceType,
+      format: d.format,
+      sizeBytes: d.sizeBytes,
+      projectId: d.projectId,
+      projectName: d.projectName,
+      createdAt: toIso(d.createdAt),
+    })),
   });
 });
 

@@ -207,7 +207,10 @@ const createSchema = z.object({
   format: z.string().max(40).optional(),
   mimeType: z.string().max(160).optional(),
   sizeBytes: z.number().int().min(0).optional(),
-  clientVisible: z.boolean().optional(),
+  clientVisible: z
+    .union([z.boolean(), z.literal(0), z.literal(1)])
+    .transform((v) => Boolean(v))
+    .optional(),
 });
 
 documentsRouter.post('/', async (req, res) => {
@@ -252,7 +255,10 @@ const updateSchema = z.object({
   category: z.enum(DOCUMENT_CATEGORIES).optional(),
   clientId: z.string().min(1).nullable().optional(),
   projectId: z.string().min(1).nullable().optional(),
-  clientVisible: z.boolean().optional(),
+  clientVisible: z
+    .union([z.boolean(), z.literal(0), z.literal(1)])
+    .transform((v) => Boolean(v))
+    .optional(),
 });
 
 documentsRouter.patch('/:id', async (req, res) => {
