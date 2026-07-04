@@ -347,28 +347,6 @@ export const ROLE_PRESETS: RolePreset[] = [
       settings: 'none',
     },
   },
-  {
-    key: 'accountant',
-    name: 'Accountant',
-    description:
-      'Owns the money. Full access to finance (invoices, expenses, reports), with read-only visibility into clients and projects for context; no content, team or settings.',
-    baseRole: 'member',
-    colorToken: 'gold',
-    permissions: {
-      dashboard: 'view',
-      clients: 'view',
-      projects: 'view',
-      team: 'none',
-      attendance: 'view',
-      calendar: 'none',
-      messages: 'view',
-      documents: 'view',
-      sheets: 'view',
-      ai: 'none',
-      finance: 'manage',
-      settings: 'none',
-    },
-  },
 ];
 
 export function rolePresetCatalog(): RolePreset[] {

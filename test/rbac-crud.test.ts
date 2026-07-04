@@ -87,11 +87,7 @@ describe('RBAC — predefined role presets', () => {
       key: string;
       permissions: Record<string, string>;
     }>;
-    expect(presets.map((p) => p.key).sort()).toEqual([
-      'accountant',
-      'employee',
-      'manager',
-    ]);
+    expect(presets.map((p) => p.key).sort()).toEqual(['employee', 'manager']);
     expect(presets.find((p) => p.key === 'manager')!.permissions.finance).toBe(
       'view',
     );
