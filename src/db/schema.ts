@@ -235,6 +235,12 @@ export const clients = sqliteTable(
     portalVisibleStatuses: text('portal_visible_statuses')
       .notNull()
       .default('pending_approval,approved,scheduled,posted'),
+    // Client-side portal role: 'approver' (Client Admin — can approve/reject
+    // content) or 'reviewer' (Client Employee — can view + comment/request
+    // changes, but NOT approve). Governs the portal's canApprove capability.
+    portalRole: text('portal_role', { enum: ['approver', 'reviewer'] })
+      .notNull()
+      .default('approver'),
     // Account manager / relationship owner (distinct from task assignment).
     ownerId: text('owner_id').references(() => users.id, {
       onDelete: 'set null',

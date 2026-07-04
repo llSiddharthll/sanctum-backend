@@ -1,0 +1,1 @@
+ALTER TABLE `sanctum_clients` ADD `portal_role` text DEFAULT 'approver' NOT NULL;

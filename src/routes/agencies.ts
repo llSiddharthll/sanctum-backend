@@ -27,6 +27,7 @@ import {
   serializeOverrides,
   parseRoleDefaults,
   sanitizeRoleDefaults,
+  rolePresetCatalog,
 } from '../lib/permissions.js';
 import { audit } from '../services/audit.js';
 import { rateLimitConfig } from '../middleware/rate-limit.js';
@@ -232,6 +233,8 @@ agenciesRouter.get(
       // owner is always full access (and not editable); admin + member are
       // resolved from stored defaults, falling back to full access.
       roles: resolveRolePermissions(agency.rolePermissionsJson),
+      // Predefined role templates the owner can apply in one click.
+      presets: rolePresetCatalog(),
     });
   },
 );

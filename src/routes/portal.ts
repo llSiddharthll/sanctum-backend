@@ -14,7 +14,7 @@ import {
 } from '../db/schema.js';
 import { ok, created, toIso } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
-import { invalidState, notFound } from '../lib/errors.js';
+import { invalidState, notFound, forbidden } from '../lib/errors.js';
 import { portalLimiter } from '../middleware/rate-limit.js';
 import { requirePortalToken } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
@@ -203,7 +203,14 @@ portalRouter.get('/resolve', async (req, res) => {
       brandColor: client.brandColor,
       handles: client.handlesJson ? JSON.parse(client.handlesJson) : null,
     },
-    portal: { visibleStatuses: visible, canApprove: true, canComment: true },
+    portal: {
+      visibleStatuses: visible,
+      // Client Admin (approver) can approve; Client Reviewer can only comment /
+      // request changes. Everyone with the link can comment.
+      canApprove: client.portalRole !== 'reviewer',
+      canComment: true,
+      portalRole: client.portalRole,
+    },
     posts: result,
     documents: docRows.map((d) => ({
       id: d.id,
@@ -277,6 +284,21 @@ portalRouter.post('/posts/:postId/decision', async (req, res) => {
   const p = getPortal(req);
   const post = await scopedPost(p, req.params.postId);
   const body = decisionSchema.parse(req.body);
+
+  // Client Reviewer portals can request changes but NOT approve — enforce
+  // server-side regardless of the UI (the token is the client's identity).
+  if (body.decision === 'approved') {
+    const [cli] = await db
+      .select({ portalRole: clients.portalRole })
+      .from(clients)
+      .where(eq(clients.id, p.clientId))
+      .limit(1);
+    if (cli?.portalRole === 'reviewer') {
+      throw forbidden(
+        'This portal can review and request changes, but only a Client Admin can approve content.',
+      );
+    }
+  }
 
   // Only approvable while awaiting review.
   if (!['pending_approval', 'approved', 'changes_requested'].includes(post.status)) {

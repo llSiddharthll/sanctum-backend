@@ -14,8 +14,28 @@ import {
   type PermissionMap,
 } from '../lib/permissions.js';
 
-/** HTTP methods that only READ — they require `view`; everything else `manage`. */
+/** HTTP methods that only READ — they require `view`. */
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+/**
+ * Map an HTTP method to the CRUD access tier it requires:
+ *   GET/HEAD/OPTIONS → view (Read)
+ *   POST/PUT/PATCH   → edit (Create / Update)
+ *   DELETE           → manage (Delete)
+ */
+function levelForMethod(method: string): AccessLevel {
+  if (SAFE_METHODS.has(method)) return 'view';
+  if (method === 'DELETE') return 'manage';
+  return 'edit';
+}
+
+/** Friendly verb for a denied tier, used in 403 messages. */
+const LEVEL_VERB: Record<AccessLevel, string> = {
+  none: 'access',
+  view: 'view',
+  edit: 'edit',
+  manage: 'manage or delete in',
+};
 
 /**
  * Load (and memoize on the request) the caller's effective permission map.
@@ -85,8 +105,8 @@ export function requireModule(module: ModuleKey, level: AccessLevel = 'view') {
 
 /**
  * Method-aware module gate for a whole router: GET/HEAD/OPTIONS need `view`,
- * any mutating method needs `manage`. Mount once at the top of a module router
- * (after requireAuth) to enforce read/write access uniformly.
+ * POST/PUT/PATCH need `edit`, and DELETE needs `manage`. Mount once at the top
+ * of a module router (after requireAuth) to enforce CRUD access uniformly.
  */
 export function requireModuleRW(module: ModuleKey) {
   return async (
@@ -95,14 +115,12 @@ export function requireModuleRW(module: ModuleKey) {
     next: NextFunction,
   ): Promise<void> => {
     try {
-      const needed: AccessLevel = SAFE_METHODS.has(req.method)
-        ? 'view'
-        : 'manage';
+      const needed = levelForMethod(req.method);
       const perms = await loadPermissions(req);
       if (!meetsLevel(perms[module], needed)) {
         next(
           forbidden(
-            `You don't have ${needed} access to ${MODULE_LABELS[module]}.`,
+            `You don't have permission to ${LEVEL_VERB[needed]} ${MODULE_LABELS[module]}.`,
           ),
         );
         return;

@@ -56,6 +56,7 @@ function serializeClient(c: typeof clients.$inferSelect) {
     internalNotes: c.internalNotes,
     ownerId: c.ownerId,
     portalVisibleStatuses: c.portalVisibleStatuses.split(','),
+    portalRole: c.portalRole,
     createdAt: toIso(c.createdAt),
     updatedAt: toIso(c.updatedAt),
   };
@@ -124,6 +125,9 @@ const createSchema = z.object({
   internalNotes: z.string().trim().max(5000).nullable().optional(),
   // Account manager / relationship owner.
   ownerId: z.string().nullable().optional(),
+  // Client-side portal role: 'approver' (Client Admin) or 'reviewer' (Client
+  // Employee — comment/request-changes only, cannot approve).
+  portalRole: z.enum(['approver', 'reviewer']).optional(),
   // `isActive` toggle ('Active client' checkbox) maps to status.
   isActive: z.boolean().optional(),
 });
@@ -161,6 +165,7 @@ clientsRouter.post('/', requireRole('owner', 'admin'), async (req, res) => {
     nextFollowUpAt: body.nextFollowUpAt ?? null,
     internalNotes: body.internalNotes ?? null,
     ownerId: body.ownerId ?? null,
+    ...(body.portalRole !== undefined ? { portalRole: body.portalRole } : {}),
     // 'Active client' toggle: isActive=true -> 'active', false -> 'archived'.
     ...(body.isActive !== undefined
       ? { status: body.isActive ? 'active' : 'archived' }
@@ -343,6 +348,7 @@ clientsRouter.patch(
     patch.nextFollowUpAt = body.nextFollowUpAt;
   if (body.internalNotes !== undefined) patch.internalNotes = body.internalNotes;
   if (body.ownerId !== undefined) patch.ownerId = body.ownerId;
+  if (body.portalRole !== undefined) patch.portalRole = body.portalRole;
   // 'Active client' toggle takes precedence; falls back to explicit status.
   if (body.isActive !== undefined)
     patch.status = body.isActive ? 'active' : 'archived';

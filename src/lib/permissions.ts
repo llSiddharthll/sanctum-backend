@@ -2,10 +2,15 @@
  * Module-level RBAC: a fixed catalog of product "modules" (mirroring the
  * sidebar) and a per-user access level for each one.
  *
- * Access levels are ordered: none < view < manage.
+ * Access levels are ordered CRUD tiers: none < view < edit < manage.
  *   - none   → the module is hidden / fully blocked (403)
- *   - view   → read-only access (GET endpoints)
- *   - manage → full access (read + write)
+ *   - view   → read-only  (Read: GET endpoints)
+ *   - edit   → read + write, no destructive deletes (Create + Update: POST/PATCH/PUT)
+ *   - manage → full access incl. Delete (Create + Update + Delete)
+ *
+ * Each tier maps to the CRUD operations it permits — see LEVEL_ACTIONS. The
+ * middleware derives the required tier from the HTTP method (GET→view,
+ * POST/PATCH/PUT→edit, DELETE→manage).
  *
  * Roles still govern tenancy + the existing owner/admin write gates; module
  * permissions are an ADDITIONAL restriction layer on top. The default level
@@ -33,10 +38,38 @@ export const MODULES = [
 
 export type ModuleKey = (typeof MODULES)[number];
 
-export const ACCESS_LEVELS = ['none', 'view', 'manage'] as const;
+export const ACCESS_LEVELS = ['none', 'view', 'edit', 'manage'] as const;
 export type AccessLevel = (typeof ACCESS_LEVELS)[number];
 
 export type PermissionMap = Record<ModuleKey, AccessLevel>;
+
+/** The four CRUD operations a tier can grant. */
+export const MODULE_ACTIONS = ['view', 'create', 'update', 'delete'] as const;
+export type ModuleAction = (typeof MODULE_ACTIONS)[number];
+
+/** Which CRUD operations each access tier permits (for the UI + API). */
+export const LEVEL_ACTIONS: Record<AccessLevel, ModuleAction[]> = {
+  none: [],
+  view: ['view'],
+  edit: ['view', 'create', 'update'],
+  manage: ['view', 'create', 'update', 'delete'],
+};
+
+/** The minimum tier that grants a given CRUD action. */
+export const ACTION_MIN_LEVEL: Record<ModuleAction, AccessLevel> = {
+  view: 'view',
+  create: 'edit',
+  update: 'edit',
+  delete: 'manage',
+};
+
+/** `true` when the tier `have` permits the CRUD `action`. */
+export function levelAllowsAction(
+  have: AccessLevel,
+  action: ModuleAction,
+): boolean {
+  return meetsLevel(have, ACTION_MIN_LEVEL[action]);
+}
 
 /** Roles whose defaults are configurable (owner is always full access). */
 export const CONFIGURABLE_ROLES = ['admin', 'member'] as const;
@@ -46,7 +79,12 @@ export type ConfigurableRole = (typeof CONFIGURABLE_ROLES)[number];
 export type RoleDefaults = Record<ConfigurableRole, Partial<PermissionMap>>;
 
 /** Numeric rank for comparisons (higher = more access). */
-const RANK: Record<AccessLevel, number> = { none: 0, view: 1, manage: 2 };
+const RANK: Record<AccessLevel, number> = {
+  none: 0,
+  view: 1,
+  edit: 2,
+  manage: 3,
+};
 
 /** The level assumed for a module when a user has no explicit override. */
 const DEFAULT_LEVEL: AccessLevel = 'manage';
@@ -233,10 +271,106 @@ export function moduleCatalog(): Array<{
   key: ModuleKey;
   label: string;
   description: string;
+  /** CRUD actions each tier grants — surfaced so the UI can explain the tiers. */
+  actions?: Record<AccessLevel, ModuleAction[]>;
 }> {
   return MODULES.map((key) => ({
     key,
     label: MODULE_LABELS[key],
     description: MODULE_DESCRIPTIONS[key],
+    actions: LEVEL_ACTIONS,
   }));
+}
+
+// ============================================================
+//  PREDEFINED ROLE PRESETS (one-click custom roles)
+// ============================================================
+
+/** A named permission template an owner/admin can apply as a custom role. */
+export interface RolePreset {
+  key: string;
+  name: string;
+  description: string;
+  baseRole: ConfigurableRole;
+  colorToken: string;
+  permissions: Partial<PermissionMap>;
+}
+
+/**
+ * Opinionated, ready-made agency roles. Applying one creates a custom_role with
+ * this exact permission map (which the owner can then fine-tune). Owner / Admin
+ * / Member remain the built-in tiers; these cover the common team shapes so an
+ * owner never starts from a blank matrix.
+ */
+export const ROLE_PRESETS: RolePreset[] = [
+  {
+    key: 'manager',
+    name: 'Manager',
+    description:
+      'Runs delivery. Full access to clients, projects, content, calendar, attendance and messages; can view finance; cannot change agency settings.',
+    baseRole: 'admin',
+    colorToken: 'ocean',
+    permissions: {
+      dashboard: 'manage',
+      clients: 'manage',
+      projects: 'manage',
+      team: 'edit',
+      attendance: 'manage',
+      calendar: 'manage',
+      messages: 'manage',
+      documents: 'manage',
+      sheets: 'manage',
+      ai: 'manage',
+      finance: 'view',
+      settings: 'view',
+    },
+  },
+  {
+    key: 'employee',
+    name: 'Employee',
+    description:
+      'Does the work. Create and edit tasks, calendar posts, documents and messages, and log attendance — but cannot delete, and no access to finance or agency settings.',
+    baseRole: 'member',
+    colorToken: 'pine',
+    permissions: {
+      dashboard: 'view',
+      clients: 'view',
+      projects: 'edit',
+      team: 'view',
+      attendance: 'edit',
+      calendar: 'edit',
+      messages: 'edit',
+      documents: 'edit',
+      sheets: 'edit',
+      ai: 'edit',
+      finance: 'none',
+      settings: 'none',
+    },
+  },
+  {
+    key: 'accountant',
+    name: 'Accountant',
+    description:
+      'Owns the money. Full access to finance (invoices, expenses, reports), with read-only visibility into clients and projects for context; no content, team or settings.',
+    baseRole: 'member',
+    colorToken: 'gold',
+    permissions: {
+      dashboard: 'view',
+      clients: 'view',
+      projects: 'view',
+      team: 'none',
+      attendance: 'view',
+      calendar: 'none',
+      messages: 'view',
+      documents: 'view',
+      sheets: 'view',
+      ai: 'none',
+      finance: 'manage',
+      settings: 'none',
+    },
+  },
+];
+
+export function rolePresetCatalog(): RolePreset[] {
+  return ROLE_PRESETS;
 }
