@@ -49,6 +49,9 @@ export const agencies = sqliteTable(t('agencies'), {
   slug: text('slug').notNull().unique(),
   logoUrl: text('logo_url'),
   brandColor: text('brand_color'),
+  // Agency-wide UI theme preset (frontend theme/registry.ts key). Owner/admin
+  // sets it in Settings; applies to all the agency's users.
+  themePreset: text('theme_preset').notNull().default('evergreen'),
   status: text('status', { enum: ['active', 'suspended', 'deleted'] })
     .notNull()
     .default('active'),

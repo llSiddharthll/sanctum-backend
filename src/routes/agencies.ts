@@ -51,15 +51,20 @@ agenciesRouter.get('/', async (req, res) => {
     slug: agency.slug,
     logoUrl: agency.logoUrl,
     brandColor: agency.brandColor,
+    themePreset: agency.themePreset,
     status: agency.status,
   });
 });
 
-// PATCH /agency — owner/admin edit branding.
+// Allowed UI theme presets (must mirror frontend theme/registry.ts keys).
+const THEME_PRESETS = ['evergreen', 'goldcrest'] as const;
+
+// PATCH /agency — owner/admin edit branding + theme.
 const patchSchema = z.object({
   name: z.string().min(1).max(120).optional(),
   logoUrl: z.string().url().nullable().optional(),
   brandColor: z.string().max(20).nullable().optional(),
+  themePreset: z.enum(THEME_PRESETS).optional(),
 });
 
 agenciesRouter.patch(
@@ -73,6 +78,7 @@ agenciesRouter.patch(
   if (body.name !== undefined) patch.name = body.name;
   if (body.logoUrl !== undefined) patch.logoUrl = body.logoUrl;
   if (body.brandColor !== undefined) patch.brandColor = body.brandColor;
+  if (body.themePreset !== undefined) patch.themePreset = body.themePreset;
 
   await db.update(agencies).set(patch).where(eq(agencies.id, ctx.agencyId));
   const [row] = await db
@@ -85,6 +91,7 @@ agenciesRouter.patch(
     slug: row!.slug,
     logoUrl: row!.logoUrl,
     brandColor: row!.brandColor,
+    themePreset: row!.themePreset,
   });
 });
 

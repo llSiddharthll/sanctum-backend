@@ -606,7 +606,12 @@ authRouter.get('/me', requireAuth, async (req, res) => {
       roleName: customRole?.name ?? builtinLabel,
     },
     agency: agency
-      ? { id: agency.id, name: agency.name, slug: agency.slug }
+      ? {
+          id: agency.id,
+          name: agency.name,
+          slug: agency.slug,
+          themePreset: agency.themePreset,
+        }
       : null,
     plan: plan
       ? {

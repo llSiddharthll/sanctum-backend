@@ -1,0 +1,1 @@
+ALTER TABLE `sanctum_agencies` ADD `theme_preset` text DEFAULT 'evergreen' NOT NULL;
