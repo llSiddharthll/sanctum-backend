@@ -14,7 +14,9 @@ import { setIo, threadRoom, userRoom, portalRoom } from './io.js';
 
 /** Same allowlist as middleware/cors.ts — credentialed handshakes only. */
 const allowList = new Set(
-  [env.FRONTEND_ORIGIN, 'http://localhost:3000'].filter(Boolean),
+  [...env.FRONTEND_ORIGIN.split(','), 'http://localhost:3000']
+    .map((s) => s.trim())
+    .filter(Boolean),
 );
 const allowPrivateLan = env.NODE_ENV !== 'production';
 

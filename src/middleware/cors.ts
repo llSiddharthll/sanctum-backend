@@ -9,7 +9,9 @@ import { isAllowedOrigin } from './origin.js';
  * (incompatible with credentials: true).
  */
 const allowList = new Set(
-  [env.FRONTEND_ORIGIN, 'http://localhost:3000'].filter(Boolean),
+  [...env.FRONTEND_ORIGIN.split(','), 'http://localhost:3000']
+    .map((s) => s.trim())
+    .filter(Boolean),
 );
 
 export const corsMw = cors({

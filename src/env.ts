@@ -12,8 +12,29 @@ const envSchema = z.object({
     .default('development'),
   PORT: z.coerce.number().int().positive().default(8080),
 
-  // CORS
-  FRONTEND_ORIGIN: z.string().url(),
+  // CORS — one or more allowed frontend origins (comma-separated). Each part
+  // must be a valid URL. Supports migrations where the app is reachable at both
+  // a platform URL (e.g. *.netlify.app) and a custom domain during DNS cutover.
+  FRONTEND_ORIGIN: z
+    .string()
+    .min(1)
+    .refine(
+      (v) =>
+        v
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .every((o) => {
+            try {
+              // eslint-disable-next-line no-new
+              new URL(o);
+              return true;
+            } catch {
+              return false;
+            }
+          }),
+      { message: 'FRONTEND_ORIGIN must be a comma-separated list of URLs' },
+    ),
 
   // Table prefixing (collision-safety). Default "sanctum_". "" allowed.
   TABLE_PREFIX: z.string().default('sanctum_'),
