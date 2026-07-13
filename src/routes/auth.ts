@@ -28,7 +28,9 @@ import {
   gone,
   badRequest,
   conflict,
+  forbidden,
 } from '../lib/errors.js';
+import { env } from '../env.js';
 import { requireAuth, REFRESH_COOKIE } from '../middleware/auth.js';
 import { authLimiter } from '../middleware/rate-limit.js';
 import { getAuth } from '../middleware/tenant.js';
@@ -77,6 +79,13 @@ const signupSchema = z.object({
 });
 
 authRouter.post('/signup', authLimiter, async (req, res) => {
+  // Internal-use deployments disable public self-signup (ALLOW_SIGNUP=false).
+  // New teammates are added via invite instead.
+  if (!env.ALLOW_SIGNUP) {
+    throw forbidden(
+      'Public sign-up is disabled. Ask an admin to invite you to the workspace.',
+    );
+  }
   const body = signupSchema.parse(req.body);
   const email = body.email.toLowerCase();
 

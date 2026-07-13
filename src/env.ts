@@ -12,6 +12,13 @@ const envSchema = z.object({
     .default('development'),
   PORT: z.coerce.number().int().positive().default(8080),
 
+  // Public self-signup (create-agency). Default ON so dev/tests work; set
+  // ALLOW_SIGNUP=false for internal-only deployments to disable POST /auth/signup.
+  ALLOW_SIGNUP: z
+    .string()
+    .default('true')
+    .transform((v) => v !== 'false'),
+
   // CORS — one or more allowed frontend origins (comma-separated). Each part
   // must be a valid URL. Supports migrations where the app is reachable at both
   // a platform URL (e.g. *.netlify.app) and a custom domain during DNS cutover.
