@@ -57,7 +57,7 @@ agenciesRouter.get('/', async (req, res) => {
 });
 
 // Allowed UI theme presets (must mirror frontend theme/registry.ts keys).
-const THEME_PRESETS = ['evergreen', 'goldcrest'] as const;
+const THEME_PRESETS = ['evergreen', 'goldcrest', 'tangerine'] as const;
 
 // PATCH /agency — owner/admin edit branding + theme.
 const patchSchema = z.object({
