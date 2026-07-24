@@ -197,6 +197,68 @@ export function basicHtml(opts: {
 </html>`;
 }
 
+// Pre-rendered flashy full-bleed banners (per email type). Each is a complete
+// designed graphic (hero + headline + copy + CTA + footer) baked to an image so
+// fonts / gradients / glow render identically everywhere and survive aggressive
+// mobile clients that override webfonts. The whole banner is the clickable CTA.
+export const BANNERS = {
+  reset:
+    'https://res.cloudinary.com/dkqo3uz5o/image/upload/v1784909753/branding/sanctum-email-reset.png',
+  invite:
+    'https://res.cloudinary.com/dkqo3uz5o/image/upload/v1784910726/branding/sanctum-email-invite.png',
+  review:
+    'https://res.cloudinary.com/dkqo3uz5o/image/upload/v1784910736/branding/sanctum-email-review.png',
+  rereview:
+    'https://res.cloudinary.com/dkqo3uz5o/image/upload/v1784910745/branding/sanctum-email-rereview.png',
+  approval:
+    'https://res.cloudinary.com/dkqo3uz5o/image/upload/v1784910756/branding/sanctum-email-approval.png',
+} as const;
+
+/**
+ * Flashy "banner" email: one full-bleed designed image (the whole message +
+ * CTA), wrapped in a link, on a dark page. Includes a small real-text fallback
+ * link so the mail isn't image-only (keeps it out of spam and works when images
+ * are blocked). Designed to mirror premium marketing emails.
+ */
+export function bannerHtml(opts: {
+  imageUrl: string;
+  linkUrl?: string;
+  alt: string;
+  preheader?: string;
+  fallbackLabel?: string;
+}): string {
+  const pre = esc(opts.preheader ?? opts.alt);
+  const img = `<img src="${opts.imageUrl}" width="600" alt="${esc(opts.alt)}" style="display:block;width:100%;max-width:600px;height:auto;border:0;outline:none">`;
+  const banner = opts.linkUrl
+    ? `<a href="${opts.linkUrl}" style="display:block;text-decoration:none">${img}</a>`
+    : img;
+  const fallback =
+    opts.linkUrl && opts.fallbackLabel
+      ? `<tr><td align="center" style="padding:18px 24px 4px;font-size:12px;line-height:1.6;color:#7C756B;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif">
+           ${esc(opts.fallbackLabel)}<br>
+           <a href="${opts.linkUrl}" style="color:#EF7E1A;text-decoration:underline;word-break:break-all">${opts.linkUrl}</a>
+         </td></tr>`
+      : '';
+  return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="x-apple-disable-message-reformatting">
+<meta name="color-scheme" content="dark light">
+</head>
+<body style="margin:0;padding:0;background:#0C0906">
+  <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent">${pre}&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;</div>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#0C0906">
+    <tr><td align="center" style="padding:20px 12px 30px">
+      <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:600px;max-width:600px">
+        <tr><td style="font-size:0;line-height:0">${banner}</td></tr>
+        ${fallback}
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+}
+
 export async function sendEmail(msg: EmailMessage): Promise<{ ok: boolean }> {
   const tx = getTransporter();
   if (!tx) {
@@ -248,11 +310,12 @@ export async function sendPortalWelcome(input: {
     to: input.to,
     subject: `${input.agencyName}: your content review portal`,
     text,
-    html: basicHtml({
-      heading: `${input.agencyName} — content for review`,
-      body: `${input.agencyName} has prepared content for ${input.clientName}. Review and approve it — no login required.`,
-      buttonLabel: 'Open your portal',
-      buttonUrl: input.portalUrl,
+    html: bannerHtml({
+      imageUrl: BANNERS.review,
+      linkUrl: input.portalUrl,
+      alt: `${input.agencyName} — content ready to review`,
+      preheader: `${input.agencyName} has prepared content for ${input.clientName} — review and approve, no login required.`,
+      fallbackLabel: 'Button not working? Open your review portal here:',
     }),
   });
 }
@@ -271,11 +334,12 @@ export async function sendTeamInvite(input: {
     to: input.to,
     subject: `You're invited to ${input.agencyName} on Sanctum`,
     text,
-    html: basicHtml({
-      heading: `Join ${input.agencyName} on Sanctum`,
-      body: `${lead} to join ${input.agencyName}. Set your password and you'll be signed in. This link expires in 7 days.`,
-      buttonLabel: 'Accept invite & set password',
-      buttonUrl: input.acceptUrl,
+    html: bannerHtml({
+      imageUrl: BANNERS.invite,
+      linkUrl: input.acceptUrl,
+      alt: `You're invited to join ${input.agencyName} on Sanctum`,
+      preheader: `${lead} to join ${input.agencyName} on Sanctum — set your password to begin. Link valid 7 days.`,
+      fallbackLabel: 'Button not working? Accept your invite here (valid 7 days):',
     }),
   });
 }
@@ -295,11 +359,13 @@ export async function sendPasswordReset(input: {
     to: input.to,
     subject: 'Reset your Sanctum password',
     text,
-    html: basicHtml({
-      heading: 'Reset your password',
-      body: `${reason} Choose a new password below — this link expires in 1 hour. If you didn't request this, you can safely ignore this email.`,
-      buttonLabel: 'Reset password',
-      buttonUrl: input.resetUrl,
+    html: bannerHtml({
+      imageUrl: BANNERS.reset,
+      linkUrl: input.resetUrl,
+      alt: 'Reset your Sanctum password — Creative Monk',
+      preheader:
+        'A request was made to reset your Sanctum password — this link is valid for 1 hour.',
+      fallbackLabel: "Button not working? Copy and paste this link (valid 1 hour):",
     }),
   });
 }

@@ -10,7 +10,7 @@ import { db } from '../db/client.js';
 import { agencies, clients, clientContacts, portalTokens } from '../db/schema.js';
 import { newId, newOpaqueToken } from '../lib/ids.js';
 import { env } from '../env.js';
-import { sendEmail, basicHtml } from './email.js';
+import { sendEmail, bannerHtml, BANNERS } from './email.js';
 
 async function recipientFor(
   agencyId: string,
@@ -97,11 +97,12 @@ export async function notifyClientReviewReady(opts: {
     to,
     subject: `${agency}: ${opts.kind === 'changes' ? 'updated content to re-review' : 'content ready to review'}`,
     text: `${body}\n\n${portalUrl}`,
-    html: basicHtml({
-      heading,
-      body,
-      buttonLabel: 'Open your review portal',
-      buttonUrl: portalUrl,
+    html: bannerHtml({
+      imageUrl: opts.kind === 'changes' ? BANNERS.rereview : BANNERS.review,
+      linkUrl: portalUrl,
+      alt: heading,
+      preheader: body,
+      fallbackLabel: 'Button not working? Open your review portal here:',
     }),
   });
 }
@@ -123,6 +124,10 @@ export async function notifyClientApproval(opts: {
     to,
     subject: `${agency}: approval confirmed`,
     text: body,
-    html: basicHtml({ heading: 'Approval confirmed ✓', body }),
+    html: bannerHtml({
+      imageUrl: BANNERS.approval,
+      alt: 'Approval confirmed — Creative Monk',
+      preheader: body,
+    }),
   });
 }
