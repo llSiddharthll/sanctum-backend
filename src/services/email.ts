@@ -38,18 +38,30 @@ function fromAddress(): string {
 
 // ---- Brand system (Creative Monk) ------------------------------------------
 // Colours are pulled straight from the logo; the primary orange is #EF7E1A.
+// Intentional DARK premium theme — designed dark so mobile dark-mode can't
+// invert it into a muddy mess, and so the warm orange pops. The hero fades
+// into cardBg (#1B1712) for a seamless top.
 const BRAND = {
   orange: '#EF7E1A',
   orangeDark: '#D96A0C',
   orangeSoft: '#FBA340',
-  ink: '#1B1A17',
-  body: '#4B4A45',
-  muted: '#9A968E',
-  line: '#EFE9E1',
-  cardBg: '#FFFFFF',
-  pageBg: '#F6F2EC', // warm off-white that complements the orange
+  heading: '#FCF8F2',
+  body: '#C7BFB4',
+  muted: '#8B8378',
+  line: '#2C2720',
+  cardBg: '#1B1712',
+  panelBg: '#221D17',
+  pageBg: '#0E0C0A',
+  chipBg: '#2A1B0E',
+  chipLine: '#503417',
+  chipText: '#F6A24E',
   logoUrl:
-    'https://res.cloudinary.com/dkqo3uz5o/image/upload/w_140,h_140,c_fit,q_auto,f_png/branding/creativemonk-logo.png',
+    'https://res.cloudinary.com/dkqo3uz5o/image/upload/w_120,h_120,c_fit,q_auto,f_png/branding/creativemonk-logo.png',
+  // Pre-rendered glassmorphism hero (gradient mesh + frosted panel + logo),
+  // bottom faded into cardBg. Baked as an image so it renders identically in
+  // every client (Gmail strips CSS gradients / inline SVG / backdrop-filter).
+  heroUrl:
+    'https://res.cloudinary.com/dkqo3uz5o/image/upload/v1784907462/branding/creativemonk-email-hero-dark.png',
   site: 'https://app.thecreativemonk.in',
 } as const;
 
@@ -79,23 +91,25 @@ export function basicHtml(opts: {
   const brandName = env.EMAIL_FROM_NAME || 'Sanctum';
   const preheader = esc(opts.preheader ?? opts.body.replace(/\s+/g, ' ').slice(0, 140));
 
-  // Bulletproof CTA (with MSO/Outlook VML fallback) — only when a link is given.
+  // Bulletproof, full-width CTA (with MSO/Outlook VML fallback).
   const button =
     opts.buttonLabel && opts.buttonUrl
       ? `
-      <tr>
-        <td align="left" style="padding:8px 0 4px">
-          <!--[if mso]>
-          <v:roundrect xmlns:v="urn:schemas-microsoft-com:vml" xmlns:w="urn:schemas-microsoft-com:office:word" href="${opts.buttonUrl}" style="height:48px;v-text-anchor:middle;width:300px;" arcsize="18%" strokecolor="#D96A0C" fillcolor="#EF7E1A">
-            <w:anchorlock/>
-            <center style="color:#ffffff;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:15px;font-weight:700;">${esc(opts.buttonLabel)}</center>
-          </v:roundrect>
-          <![endif]-->
-          <!--[if !mso]><!-- -->
-          <a href="${opts.buttonUrl}" style="display:inline-block;background:linear-gradient(135deg,${BRAND.orangeSoft} 0%,${BRAND.orange} 55%,${BRAND.orangeDark} 100%);background-color:${BRAND.orange};color:#ffffff;text-decoration:none;font-size:15px;font-weight:700;line-height:48px;padding:0 34px;border-radius:12px;box-shadow:0 6px 16px rgba(239,126,26,0.32);letter-spacing:.2px">${esc(opts.buttonLabel)}</a>
-          <!--<![endif]-->
-        </td>
-      </tr>`
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+        <tr>
+          <td align="center" style="padding:2px 0">
+            <!--[if mso]>
+            <v:roundrect xmlns:v="urn:schemas-microsoft-com:vml" xmlns:w="urn:schemas-microsoft-com:office:word" href="${opts.buttonUrl}" style="height:54px;v-text-anchor:middle;width:512px;" arcsize="24%" strokecolor="#D96A0C" fillcolor="#EF7E1A">
+              <w:anchorlock/>
+              <center style="color:#ffffff;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:16px;font-weight:700;">${esc(opts.buttonLabel)} &#8594;</center>
+            </v:roundrect>
+            <![endif]-->
+            <!--[if !mso]><!-- -->
+            <a href="${opts.buttonUrl}" style="display:block;width:100%;background:linear-gradient(135deg,${BRAND.orangeSoft} 0%,${BRAND.orange} 52%,${BRAND.orangeDark} 100%);background-color:${BRAND.orange};color:#ffffff;text-decoration:none;font-size:16px;font-weight:700;line-height:54px;height:54px;text-align:center;border-radius:14px;box-shadow:0 10px 26px rgba(239,126,26,0.38);letter-spacing:.3px">${esc(opts.buttonLabel)} &#8594;</a>
+            <!--<![endif]-->
+          </td>
+        </tr>
+      </table>`
       : '';
 
   return `<!doctype html>
@@ -109,48 +123,54 @@ export function basicHtml(opts: {
 <title>${esc(brandName)}</title>
 <!--[if mso]><xml><o:OfficeDocumentSettings><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml><![endif]-->
 </head>
-<body style="margin:0;padding:0;background:${BRAND.pageBg};-webkit-font-smoothing:antialiased;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif">
+<body style="margin:0;padding:0;background:${BRAND.pageBg};-webkit-font-smoothing:antialiased;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Helvetica,Arial,sans-serif">
   <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;visibility:hidden">${preheader}&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;</div>
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.pageBg}">
     <tr>
-      <td align="center" style="padding:32px 16px">
-        <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:600px;max-width:600px">
+      <td align="center" style="padding:28px 12px 36px">
+        <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:600px;max-width:600px;box-shadow:0 30px 70px rgba(0,0,0,0.55);border-radius:28px">
 
-          <!-- Header / brand lockup -->
+          <!-- Glassmorphism hero (pre-rendered, fades into the card) -->
           <tr>
-            <td style="padding:4px 4px 22px">
-              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
-                <tr>
-                  <td width="60" valign="middle" style="padding-right:14px">
-                    <table role="presentation" cellpadding="0" cellspacing="0" border="0">
-                      <tr><td align="center" valign="middle" width="56" height="56" style="width:56px;height:56px;background:#ffffff;border:1px solid ${BRAND.line};border-radius:16px;box-shadow:0 4px 12px rgba(27,26,23,0.06)">
-                        <img src="${BRAND.logoUrl}" width="38" height="38" alt="Creative Monk" style="display:block;border:0;outline:none;text-decoration:none">
-                      </td></tr>
-                    </table>
-                  </td>
-                  <td valign="middle">
-                    <div style="font-size:17px;font-weight:800;color:${BRAND.ink};letter-spacing:.2px;line-height:1.1">Creative&nbsp;Monk</div>
-                    <div style="font-size:11px;font-weight:700;color:${BRAND.orange};letter-spacing:2px;text-transform:uppercase;margin-top:3px">Sanctum</div>
-                  </td>
-                </tr>
-              </table>
+            <td style="font-size:0;line-height:0;background:${BRAND.pageBg}">
+              <a href="${BRAND.site}" style="text-decoration:none">
+                <img src="${BRAND.heroUrl}" width="600" alt="Creative Monk · Sanctum" style="display:block;width:100%;max-width:600px;height:auto;border:0;outline:none">
+              </a>
             </td>
           </tr>
 
-          <!-- Card -->
+          <!-- Card body (dark) -->
           <tr>
-            <td style="background:${BRAND.cardBg};border:1px solid ${BRAND.line};border-radius:20px;box-shadow:0 12px 30px rgba(27,26,23,0.07);overflow:hidden">
-              <!-- accent bar -->
-              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
-                <tr><td height="5" style="height:5px;background:linear-gradient(90deg,${BRAND.orangeSoft} 0%,${BRAND.orange} 55%,${BRAND.orangeDark} 100%);font-size:0;line-height:0">&nbsp;</td></tr>
-              </table>
+            <td style="background:${BRAND.cardBg};border:1px solid ${BRAND.line};border-top:0;border-radius:0 0 28px 28px">
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
                 <tr>
-                  <td style="padding:34px 40px 38px">
+                  <td style="padding:14px 32px 32px">
                     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
-                      <tr><td style="font-size:22px;line-height:1.3;font-weight:800;color:${BRAND.ink};padding-bottom:14px">${esc(opts.heading)}</td></tr>
-                      <tr><td style="font-size:15px;line-height:1.7;color:${BRAND.body};white-space:pre-line">${esc(opts.body)}</td></tr>
-                      ${button ? `<tr><td style="padding-top:26px"><table role="presentation" cellpadding="0" cellspacing="0" border="0">${button}</table></td></tr>` : ''}
+                      <!-- eyebrow chip -->
+                      <tr><td style="padding-bottom:18px">
+                        <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>
+                          <td style="background:${BRAND.chipBg};border:1px solid ${BRAND.chipLine};border-radius:100px;padding:7px 16px;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:${BRAND.chipText}">Sanctum</td>
+                        </tr></table>
+                      </td></tr>
+                      <tr><td style="font-size:29px;line-height:1.22;font-weight:800;color:${BRAND.heading};padding-bottom:16px;letter-spacing:-0.6px">${esc(opts.heading)}</td></tr>
+                      <tr><td style="font-size:16px;line-height:1.72;color:${BRAND.body};white-space:pre-line">${esc(opts.body)}</td></tr>
+                      ${button ? `<tr><td style="padding-top:30px">${button}</td></tr>` : ''}
+                    </table>
+                  </td>
+                </tr>
+                <!-- divider + helper note -->
+                <tr><td style="padding:0 32px"><div style="height:1px;background:${BRAND.line};line-height:1px;font-size:0">&nbsp;</div></td></tr>
+                <tr>
+                  <td style="padding:22px 32px 30px">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.panelBg};border:1px solid ${BRAND.line};border-radius:16px">
+                      <tr>
+                        <td valign="middle" width="40" style="padding:16px 0 16px 18px">
+                          <img src="${BRAND.logoUrl}" width="28" height="28" alt="" style="display:block;border:0">
+                        </td>
+                        <td valign="middle" style="padding:16px 18px 16px 12px;font-size:12.5px;line-height:1.6;color:${BRAND.muted}">
+                          Sent by <span style="color:${BRAND.heading};font-weight:700">Creative&nbsp;Monk</span> — an automated message from your Sanctum workspace. If it wasn't expected, you can ignore it.
+                        </td>
+                      </tr>
                     </table>
                   </td>
                 </tr>
@@ -160,12 +180,12 @@ export function basicHtml(opts: {
 
           <!-- Footer -->
           <tr>
-            <td style="padding:24px 8px 8px" align="center">
-              <div style="font-size:12px;line-height:1.6;color:${BRAND.muted}">
-                Sent by <span style="color:${BRAND.ink};font-weight:600">${esc(brandName)}</span> · powered by Creative&nbsp;Monk<br>
-                <a href="${BRAND.site}" style="color:${BRAND.orange};text-decoration:none;font-weight:600">app.thecreativemonk.in</a>
+            <td style="padding:22px 8px 4px" align="center">
+              <div style="font-size:12px;line-height:1.7;color:${BRAND.muted}">
+                <a href="${BRAND.site}" style="color:${BRAND.chipText};text-decoration:none;font-weight:700">app.thecreativemonk.in</a>
+                &nbsp;·&nbsp; Studio operations, elevated.
               </div>
-              <div style="font-size:11px;color:${BRAND.muted};margin-top:12px">© ${year} Creative Monk. All rights reserved.</div>
+              <div style="font-size:11px;color:${BRAND.muted};margin-top:10px">© ${year} Creative Monk. All rights reserved.</div>
             </td>
           </tr>
 
