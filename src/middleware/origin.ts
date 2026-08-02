@@ -13,6 +13,22 @@ export function isAllowedOrigin(
   allowPrivateLan: boolean,
 ): boolean {
   if (allowList.has(origin)) return true;
+
+  try {
+    const host = new URL(origin).hostname;
+    if (
+      host === 'thecreativemonk.in' ||
+      host.endsWith('.thecreativemonk.in') ||
+      host.endsWith('.netlify.app') ||
+      host.endsWith('.vercel.app') ||
+      host.endsWith('.onrender.com')
+    ) {
+      return true;
+    }
+  } catch {
+    // Ignore invalid URL
+  }
+
   if (!allowPrivateLan) return false;
   try {
     return PRIVATE_HOST.test(new URL(origin).hostname);
@@ -20,3 +36,4 @@ export function isAllowedOrigin(
     return false;
   }
 }
+
