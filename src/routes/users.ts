@@ -41,7 +41,7 @@ usersRouter.use(requireAuth);
 // Module gate: GET needs `view`, writes need `manage` on the Team module.
 usersRouter.use(requireModuleRW('team'));
 
-const FRONTEND_ORIGIN = env.FRONTEND_ORIGIN || 'http://localhost:3000';
+const FRONTEND_ORIGIN = env.FRONTEND_ORIGIN ? env.FRONTEND_ORIGIN.split(',')[0].trim() : 'http://localhost:3000';
 
 // ---- Helpers -------------------------------------------------
 
@@ -464,7 +464,9 @@ usersRouter.post('/invite', requireRole('owner', 'admin'), async (req, res) => {
     to: email,
     agencyName: ag?.name ?? 'your team',
     acceptUrl: inviteUrl,
-  }).catch(() => {});
+  }).catch((err) => {
+    console.error('[email:invite:error]', err);
+  });
 
   created(res, { member, inviteUrl });
 });

@@ -11,12 +11,16 @@ healthRouter.get('/', async (_req, res) => {
   } catch {
     database = 'down';
   }
+  
+  const { emailEnabled } = await import('../env.js');
+
   // Always 200 for liveness; report db status in the body.
   res.status(200).json({
     status: 'ok',
     service: 'sanctum-api',
     uptime: Math.floor(process.uptime()),
     db: database,
+    email: emailEnabled,
     time: new Date().toISOString(),
   });
 });
