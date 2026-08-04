@@ -19,9 +19,10 @@ export function isAllowedOrigin(
     if (
       host === 'thecreativemonk.in' ||
       host.endsWith('.thecreativemonk.in') ||
+      host === 'creativemonk.in' ||
+      host.endsWith('.creativemonk.in') ||
       host.endsWith('.netlify.app') ||
-      host.endsWith('.vercel.app') ||
-      host.endsWith('.onrender.com')
+      host.endsWith('.vercel.app')
     ) {
       return true;
     }
