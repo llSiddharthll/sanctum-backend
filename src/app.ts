@@ -32,6 +32,8 @@ import { attendanceRouter } from './routes/attendance.js';
 import { notificationsRouter } from './routes/notifications.js';
 import { crmRouter } from './routes/crm.js';
 import { meRouter } from './routes/me.js';
+import { pushRouter } from './routes/push.js';
+import { intakeRouter } from './routes/intake.js';
 
 export function createApp() {
   const app = express();
@@ -58,6 +60,8 @@ export function createApp() {
   api.use('/projects', projectsRouter);
   api.use('/timers', timersRouter);
   api.use('/me', meRouter);
+  api.use('/push', pushRouter);
+  api.use('/intake', intakeRouter);
   api.use('/expenses', expensesRouter);
   api.use('/finance', financeRouter);
 
