@@ -8,6 +8,8 @@ pnpm-debug.log*
 .env
 .env.*
 !.env.example
+env.yaml
+env.prod.yaml
 
 # os / editor
 .DS_Store
