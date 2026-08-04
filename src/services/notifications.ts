@@ -8,6 +8,7 @@ import { db } from '../db/client.js';
 import { notifications, users } from '../db/schema.js';
 import { newId } from '../lib/ids.js';
 import { broadcastNotification } from '../realtime/io.js';
+import { sendPushToUser } from './push-send.js';
 import { toIso } from '../lib/http.js';
 
 export interface NotifyInput {
@@ -60,6 +61,19 @@ export async function notify(input: NotifyInput): Promise<void> {
     link: input.link ?? null,
     readAt: null,
     createdAt: createdAt.toISOString(),
+  });
+
+  // Device push (best-effort, fire-and-forget) so users are alerted even when
+  // the app is closed. Every notification type flows through here.
+  void sendPushToUser(input.userId, {
+    title: input.title,
+    body: input.body ?? undefined,
+    data: {
+      type: input.type,
+      ...(input.entityType ? { entityType: input.entityType } : {}),
+      ...(input.entityId ? { entityId: input.entityId } : {}),
+      ...(input.link ? { link: input.link } : {}),
+    },
   });
 }
 

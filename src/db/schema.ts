@@ -1621,6 +1621,26 @@ export const notifications = sqliteTable(
 );
 
 // ============================================================
+//  PUSH_TOKENS (FCM device tokens for push notifications)
+// ============================================================
+export const pushTokens = sqliteTable(
+  t('push_tokens'),
+  {
+    token: text('token').primaryKey(),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    platform: text('platform'),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [index('ix_push_tokens_user').on(tbl.userId)],
+);
+
+// ============================================================
 //  CLIENT_CONTACTS (multiple people per client)
 // ============================================================
 export const clientContacts = sqliteTable(
