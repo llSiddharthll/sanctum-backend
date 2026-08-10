@@ -22,6 +22,7 @@ import {
   dayKeyInTz,
   deriveDayStatus,
   checkFencing,
+  checkCheckoutRadius,
   isWorkingDayKey,
 } from '../lib/attendance.js';
 import {
@@ -30,6 +31,7 @@ import {
   buildMonth,
   loadHolidayMap,
   loadLeaveDayMap,
+  autoResetStalePunches,
   type CalendarDay,
 } from '../services/attendance.js';
 
@@ -194,6 +196,7 @@ attendanceRouter.put('/policy', async (req, res) => {
 attendanceRouter.get('/today', async (req, res) => {
   const ctx = getAuth(req);
   const policy = await loadPolicy(ctx.agencyId);
+  await autoResetStalePunches(ctx.agencyId, ctx.userId, policy.timezone);
   const now = new Date();
   const day = dayKeyInTz(now, policy.timezone);
   const [rec] = await db
@@ -226,6 +229,10 @@ attendanceRouter.post('/check-in', async (req, res) => {
   const ctx = getAuth(req);
   const body = punchSchema.parse(req.body ?? {});
   const policy = await loadPolicy(ctx.agencyId);
+
+  // Auto reset any stale unclosed punches from previous days (after 12 AM)
+  await autoResetStalePunches(ctx.agencyId, ctx.userId, policy.timezone);
+
   const now = new Date();
   const day = dayKeyInTz(now, policy.timezone);
 
@@ -310,6 +317,10 @@ attendanceRouter.post('/check-out', async (req, res) => {
   const ctx = getAuth(req);
   const body = punchSchema.parse(req.body ?? {});
   const policy = await loadPolicy(ctx.agencyId);
+
+  // Auto reset any stale unclosed punches from previous days (after 12 AM)
+  await autoResetStalePunches(ctx.agencyId, ctx.userId, policy.timezone);
+
   const now = new Date();
   const day = dayKeyInTz(now, policy.timezone);
 
@@ -322,6 +333,13 @@ attendanceRouter.post('/check-out', async (req, res) => {
     .limit(1);
   if (!rec || !rec.checkInAt) throw conflict('You have not checked in today.');
   if (rec.checkOutAt) throw conflict('You have already checked out today.');
+
+  // Validate check-out is within 500m radius of check-in location
+  const radiusErr = checkCheckoutRadius(
+    { lat: rec.checkInLat, lng: rec.checkInLng },
+    { lat: body.lat ?? null, lng: body.lng ?? null },
+  );
+  if (radiusErr) throw forbidden(radiusErr);
 
   const derived = deriveDayStatus(policy, {
     checkInAt: rec.checkInAt,

@@ -255,4 +255,50 @@ export function yearBounds(year: number): { first: string; last: string } {
   return { first: `${year}-01-01`, last: `${year}-12-31` };
 }
 
+/**
+ * Automatically resets / settles unclosed punches from past days (after 12 AM midnight).
+ * Any attendance record where checkInAt IS NOT NULL, checkOutAt IS NULL, and day < todayKey
+ * is automatically marked as 'half_day' so the user can regularize it and check in fresh today.
+ */
+export async function autoResetStalePunches(
+  agencyId: string,
+  userId?: string,
+  timezone = 'Asia/Kolkata',
+): Promise<number> {
+  const todayKey = dayKeyInTz(new Date(), timezone);
+  const stale = await db
+    .select()
+    .from(attendanceRecords)
+    .where(
+      and(
+        eq(attendanceRecords.agencyId, agencyId),
+        ...(userId ? [eq(attendanceRecords.userId, userId)] : []),
+        lte(attendanceRecords.day, todayKey),
+      ),
+    );
+
+  const toReset = stale.filter(
+    (r) => r.day < todayKey && r.checkInAt != null && r.checkOutAt == null,
+  );
+
+  if (toReset.length === 0) return 0;
+
+  const now = new Date();
+  for (const r of toReset) {
+    await db
+      .update(attendanceRecords)
+      .set({
+        status: 'half_day',
+        workedMinutes: 0,
+        note: r.note
+          ? `${r.note} (Auto-reset after 12 AM: missing checkout marked half_day)`
+          : 'Auto-reset after 12 AM: missing checkout marked half_day',
+        updatedAt: now,
+      })
+      .where(eq(attendanceRecords.id, r.id));
+  }
+
+  return toReset.length;
+}
+
 export { inArray };

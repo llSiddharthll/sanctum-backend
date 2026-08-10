@@ -1,10 +1,10 @@
 import { db } from '../db/client.js';
 import { passwordResets } from '../db/schema.js';
 import { newId, newOpaqueToken } from '../lib/ids.js';
-import { env } from '../env.js';
 import { sendPasswordReset } from './email.js';
+import { getFrontendOrigin } from '../lib/frontend-url.js';
+import type { Request } from 'express';
 
-const FRONTEND_ORIGIN = env.FRONTEND_ORIGIN || 'http://localhost:3000';
 /** Reset links are short-lived. */
 export const RESET_TTL_MS = 60 * 60 * 1000; // 1 hour
 
@@ -21,7 +21,7 @@ export async function createPasswordReset(
     email: string;
     fullName: string | null;
   },
-  opts: { byAdmin?: boolean } = {},
+  opts: { byAdmin?: boolean; req?: Request } = {},
 ): Promise<{ resetUrl: string }> {
   const { raw, hash } = newOpaqueToken();
   await db.insert(passwordResets).values({
@@ -32,7 +32,8 @@ export async function createPasswordReset(
     expiresAt: new Date(Date.now() + RESET_TTL_MS),
   });
 
-  const resetUrl = `${FRONTEND_ORIGIN}/reset-password?token=${raw}`;
+  const origin = getFrontendOrigin(opts.req);
+  const resetUrl = `${origin}/reset-password?token=${raw}`;
   void sendPasswordReset({
     to: user.email,
     resetUrl,

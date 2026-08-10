@@ -353,7 +353,7 @@ authRouter.post('/forgot-password', authLimiter, async (req, res) => {
     .limit(1);
 
   if (user && user.status === 'active') {
-    await createPasswordReset(user);
+    await createPasswordReset(user, { req });
     await audit({
       agencyId: user.agencyId,
       actorType: user.role,

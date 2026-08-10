@@ -1,0 +1,15 @@
+# Google App Engine Flexible / Standard deployment configuration for Sanctum Backend
+runtime: nodejs24
+instance_class: F1
+
+env_variables:
+  NODE_ENV: "production"
+  PORT: "8080"
+  FRONTEND_ORIGIN: "https://app.thecreativemonk.in"
+  TABLE_PREFIX: "sanctum_"
+  SMTP_HOST: "smtp.hostinger.com"
+  SMTP_PORT: "465"
+  EMAIL_USER: "app@creativemonk.in"
+  EMAIL_FROM_NAME: "Sanctum"
+
+# Includes secrets from env.yaml when deploying via gcloud app deploy --env-vars-file=env.yaml

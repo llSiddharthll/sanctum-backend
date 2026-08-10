@@ -21,7 +21,6 @@ import { ok, created, toIso, param } from '../lib/http.js';
 import { newId, newOpaqueToken } from '../lib/ids.js';
 import { conflict, forbidden, notFound } from '../lib/errors.js';
 import { hashPassword } from '../lib/password.js';
-import { env } from '../env.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { getAuth, isPrivileged, requireClientAccess } from '../middleware/tenant.js';
 import { requireModuleRW } from '../middleware/permissions.js';
@@ -36,12 +35,12 @@ import {
 } from '../lib/permissions.js';
 import crypto from 'node:crypto';
 
+import { getFrontendOrigin } from '../lib/frontend-url.js';
+
 export const usersRouter = Router();
 usersRouter.use(requireAuth);
 // Module gate: GET needs `view`, writes need `manage` on the Team module.
 usersRouter.use(requireModuleRW('team'));
-
-const FRONTEND_ORIGIN = env.FRONTEND_ORIGIN ? env.FRONTEND_ORIGIN.split(',')[0].trim() : 'http://localhost:3000';
 
 // ---- Helpers -------------------------------------------------
 
@@ -451,7 +450,7 @@ usersRouter.post('/invite', requireRole('owner', 'admin'), async (req, res) => {
     utilizationPct: 0,
   };
 
-  const inviteUrl = `${FRONTEND_ORIGIN}/accept-invite?token=${raw}`;
+  const inviteUrl = `${getFrontendOrigin(req)}/accept-invite?token=${raw}`;
 
   // Best-effort invite email (logs only when SMTP is unconfigured). The link is
   // also returned so the inviter can copy/share it manually.

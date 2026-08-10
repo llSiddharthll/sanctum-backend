@@ -25,6 +25,7 @@ import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth, requireClientAccess } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
 import { sendPortalWelcome } from '../services/email.js';
+import { getFrontendOrigin } from '../lib/frontend-url.js';
 
 export const clientsRouter = Router();
 clientsRouter.use(requireAuth);
@@ -545,7 +546,7 @@ clientsRouter.post(
     .where(eq(agencies.id, ctx.agencyId))
     .limit(1);
 
-  const portalUrl = `${process.env.FRONTEND_ORIGIN ?? ''}/portal/${raw}`;
+  const portalUrl = `${getFrontendOrigin(req)}/portal/${raw}`;
   await sendPortalWelcome({
     to: recipient,
     clientName: client.name,

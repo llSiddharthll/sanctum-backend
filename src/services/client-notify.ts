@@ -9,7 +9,6 @@ import { and, eq } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { agencies, clients, clientContacts, portalTokens } from '../db/schema.js';
 import { newId, newOpaqueToken } from '../lib/ids.js';
-import { env } from '../env.js';
 import { sendEmail, bannerHtml, BANNERS } from './email.js';
 
 async function recipientFor(
@@ -54,6 +53,8 @@ async function clientName(clientId: string): Promise<string> {
   return c?.name ?? 'your brand';
 }
 
+import { getFrontendOrigin } from '../lib/frontend-url.js';
+
 async function mintPortalUrl(
   agencyId: string,
   clientId: string,
@@ -68,7 +69,7 @@ async function mintPortalUrl(
     label: 'auto-notify',
     createdBy: createdBy ?? null,
   });
-  return `${env.FRONTEND_ORIGIN}/portal/${raw}`;
+  return `${getFrontendOrigin()}/portal/${raw}`;
 }
 
 /** "New content ready" / "your requested changes are ready" → emails the client. */

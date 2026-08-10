@@ -341,6 +341,29 @@ export function checkFencing(
   return null;
 }
 
+export const MAX_CHECKOUT_RADIUS_METERS = 500;
+
+/**
+ * Validate that check-out happens from the same location as check-in
+ * within a 500m radius.
+ */
+export function checkCheckoutRadius(
+  checkIn: { lat?: number | null; lng?: number | null },
+  checkOut: { lat?: number | null; lng?: number | null },
+): string | null {
+  if (checkIn.lat != null && checkIn.lng != null) {
+    if (checkOut.lat == null || checkOut.lng == null) {
+      return 'Location is required to check out. Please enable location access and try again.';
+    }
+    const dist = distanceMeters(checkIn.lat, checkIn.lng, checkOut.lat, checkOut.lng);
+    if (dist > MAX_CHECKOUT_RADIUS_METERS) {
+      const roundedDist = Math.round(dist);
+      return `Checkout must be within 500 meters of your check-in location (you are ${roundedDist}m away).`;
+    }
+  }
+  return null;
+}
+
 /** Format minutes as "8h 30m" / "45m" / "0m". */
 export function formatMinutes(minutes: number): string {
   const total = Math.max(0, Math.round(minutes));

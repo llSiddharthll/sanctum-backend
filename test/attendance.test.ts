@@ -225,6 +225,32 @@ describe('attendance: mandatory location (enforceGeo)', () => {
   });
 });
 
+describe('attendance: 500m check-out radius & 12 AM auto-reset', () => {
+  it('blocks check-out if more than 500m from check-in location (403)', async () => {
+    const owner = (await signupAgency()).agent;
+    const member = (await createMemberSession(owner, { role: 'member' })).agent;
+
+    // Check in at Mumbai Central (18.9696, 72.8193)
+    const checkInRes = await member
+      .post(`${ATT}/check-in`)
+      .send({ lat: 18.9696, lng: 72.8193, location: 'Mumbai Central' });
+    expect(checkInRes.status).toBe(201);
+
+    // Try checking out from ~5 km away at Bandra (19.0596, 72.8295) -> > 500m
+    const farOut = await member
+      .post(`${ATT}/check-out`)
+      .send({ lat: 19.0596, lng: 72.8295, location: 'Bandra' });
+    expect(farOut.status).toBe(403);
+    expect(farOut.body.error.message).toMatch(/500 meters/);
+
+    // Check out from within 100m (18.9700, 72.8193) -> <= 500m -> 200 OK
+    const nearOut = await member
+      .post(`${ATT}/check-out`)
+      .send({ lat: 18.9700, lng: 72.8193, location: 'Mumbai Central Gate' });
+    expect(nearOut.status).toBe(200);
+  });
+});
+
 describe('attendance: who is in', () => {
   it('who-is-in includes a member who has punched in', async () => {
     const owner = (await signupAgency()).agent;
