@@ -91,10 +91,11 @@ async function main(): Promise<void> {
     {
       id: 'agency',
       name: 'Agency',
-      maxClients: 10,
-      maxTeamMembers: 15,
-      maxAiGenerations: 30,
-      maxStorageBytes: 15 * GB,
+      // Self-hosted (single-agency on GCP): no client/team caps. null = unlimited.
+      maxClients: null,
+      maxTeamMembers: null,
+      maxAiGenerations: 1000,
+      maxStorageBytes: 100 * GB,
       priceCentsMonthly: 9900,
       isActive: true,
       sortOrder: 2,
