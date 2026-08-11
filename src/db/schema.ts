@@ -1327,6 +1327,87 @@ export const documents = sqliteTable(
 );
 
 // ============================================================
+//  LEADS (inbound pipeline — a lead becomes a client on conversion)
+// ============================================================
+export const LEAD_STAGES = [
+  'new',
+  'contacted',
+  'qualified',
+  'converted',
+  'lost',
+  'spam',
+] as const;
+
+export const leads = sqliteTable(
+  t('leads'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    company: text('company'),
+    email: text('email'),
+    phone: text('phone'),
+    source: text('source'),
+    service: text('service'),
+    budget: text('budget'),
+    message: text('message'),
+    stage: text('stage', { enum: LEAD_STAGES }).notNull().default('new'),
+    // Optional potential value, stored as INTEGER PAISE (see money convention).
+    estimatedValue: integer('estimated_value'),
+    ownerId: text('owner_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    convertedClientId: text('converted_client_id').references(() => clients.id, {
+      onDelete: 'set null',
+    }),
+    lastActivityAt: ts('last_activity_at'),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [
+    index('ix_leads_agency_stage_created').on(
+      tbl.agencyId,
+      tbl.stage,
+      tbl.createdAt,
+    ),
+  ],
+);
+
+export const leadActivities = sqliteTable(
+  t('lead_activities'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    leadId: text('lead_id')
+      .notNull()
+      .references(() => leads.id, { onDelete: 'cascade' }),
+    authorId: text('author_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    type: text('type', {
+      enum: ['note', 'call', 'meeting', 'email', 'follow_up', 'stage_change'],
+    })
+      .notNull()
+      .default('note'),
+    body: text('body').notNull(),
+    // For 'follow_up' entries: a due date + completion stamp.
+    dueAt: ts('due_at'),
+    completedAt: ts('completed_at'),
+    createdAt: ts('created_at').notNull().default(now),
+  },
+  (tbl) => [
+    index('ix_lead_activities_lead_created').on(tbl.leadId, tbl.createdAt),
+  ],
+);
+
+export type Lead = typeof leads.$inferSelect;
+export type LeadActivity = typeof leadActivities.$inferSelect;
+
+// ============================================================
 //  SHEETS (lightweight spreadsheets; data is a JSON string)
 // ============================================================
 export const sheets = sqliteTable(

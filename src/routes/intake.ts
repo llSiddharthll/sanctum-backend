@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { and, eq } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { clients, clientContacts, clientNotes, users } from '../db/schema.js';
+import { leads, users } from '../db/schema.js';
 import { newId } from '../lib/ids.js';
 import { ok } from '../lib/http.js';
 import { notifyMany, agencyApprovers } from '../services/notifications.js';
@@ -44,56 +44,26 @@ intakeRouter.post('/lead', async (req, res) => {
     .limit(1);
   const ownerId = owner?.id ?? null;
 
-  const clientId = newId('cli');
-  const clientName = (body.company && body.company.trim()) || body.name;
-  const summary = [
-    body.source ? `Source: ${body.source}` : null,
-    body.service ? `Interested in: ${body.service}` : null,
-    body.budget ? `Budget: ${body.budget}` : null,
-  ]
-    .filter(Boolean)
-    .join(' · ');
-
-  // 1) The client (source = inbound).
-  await db.insert(clients).values({
-    id: clientId,
+  // Create a LEAD (stage = new) — it enters the pipeline and only becomes a
+  // client once someone converts it. Website enquiry text is preserved.
+  const leadId = newId('led');
+  await db.insert(leads).values({
+    id: leadId,
     agencyId,
-    name: clientName,
-    contactEmail: body.email || null,
+    name: body.name,
+    company: body.company || null,
+    email: body.email || null,
     phone: body.phone || null,
-    clientSource: 'inbound',
+    source: body.source || 'website-contact',
+    service: body.service || null,
+    budget: body.budget || null,
+    message: body.message || null,
     ownerId,
-    internalNotes: `Website lead — ${body.name}${summary ? ' · ' + summary : ''}`,
+    stage: 'new',
+    lastActivityAt: new Date(),
   });
 
-  // 2) Primary contact = the person who filled the form.
-  try {
-    await db.insert(clientContacts).values({
-      id: newId('cnt'),
-      agencyId,
-      clientId,
-      name: body.name,
-      email: body.email || null,
-      phone: body.phone || null,
-      isPrimary: true,
-    });
-  } catch {}
-
-  // 3) CRM note with the enquiry.
-  try {
-    const noteBody =
-      [body.message, summary].filter(Boolean).join('\n\n') || 'New website enquiry.';
-    await db.insert(clientNotes).values({
-      id: newId('nte'),
-      agencyId,
-      clientId,
-      authorId: ownerId,
-      type: 'note',
-      body: noteBody,
-    });
-  } catch {}
-
-  // 4) Notify owners/admins (in-app + push).
+  // Notify owners/admins (in-app + push).
   try {
     const recipients = await agencyApprovers(agencyId);
     await notifyMany(recipients, {
@@ -103,11 +73,11 @@ intakeRouter.post('/lead', async (req, res) => {
       body: `${body.name}${body.company ? ' · ' + body.company : ''}${
         body.service ? ' — ' + body.service : ''
       }`,
-      entityType: 'client',
-      entityId: clientId,
-      link: `/clients/${clientId}`,
+      entityType: 'lead',
+      entityId: leadId,
+      link: `/clients?tab=leads&lead=${leadId}`,
     });
   } catch {}
 
-  return ok(res, { clientId });
+  return ok(res, { leadId });
 });
