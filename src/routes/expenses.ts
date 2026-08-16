@@ -6,7 +6,7 @@ import { clients, expenses, projects, users } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { notFound } from '../lib/errors.js';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
 import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
@@ -14,6 +14,8 @@ import { audit } from '../services/audit.js';
 export const expensesRouter = Router();
 expensesRouter.use(requireAuth);
 expensesRouter.use(requireModuleRW('finance'));
+// Money is owner ONLY (hard backstop over the finance module gate).
+expensesRouter.use(requireRole('owner'));
 
 const EXPENSE_CATEGORIES = [
   'software',

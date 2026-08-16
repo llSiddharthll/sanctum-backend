@@ -11,6 +11,7 @@ import {
 import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { conflict, forbidden, notFound } from '../lib/errors.js';
+import { loadPermissions } from '../middleware/permissions.js';
 import { getAuth, isPrivileged } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
 import {
@@ -23,10 +24,15 @@ import { deriveDayStatus } from '../lib/attendance.js';
 
 export const regularizationsRouter = Router();
 
-function requirePrivileged(req: Request): void {
-  if (!isPrivileged(getAuth(req).role)) {
-    throw forbidden('Only owners/admins can do that.');
-  }
+/**
+ * Who may approve/see regularization requests: owners/admins, OR an
+ * "attendance manager" — a member-tier user with `manage` on the Attendance
+ * module. Mirrors the checkout-approval gate in attendance.ts.
+ */
+async function canApproveAttendance(req: Request): Promise<boolean> {
+  if (isPrivileged(getAuth(req).role)) return true;
+  const perms = await loadPermissions(req);
+  return perms.attendance === 'manage';
 }
 
 function serialize(
@@ -57,7 +63,8 @@ regularizationsRouter.get('/', async (req, res) => {
   const scope = (req.query.scope as string | undefined) ?? 'me';
   const filters = [eq(attendanceRegularizations.agencyId, ctx.agencyId)];
   if (scope === 'all' || scope === 'pending') {
-    if (!isPrivileged(ctx.role)) throw forbidden('Admins only.');
+    if (!(await canApproveAttendance(req)))
+      throw forbidden('Only owners/admins or attendance managers can do that.');
     if (scope === 'pending')
       filters.push(eq(attendanceRegularizations.status, 'pending'));
     const reqUser = (req.query.userId as string | undefined)?.trim();
@@ -162,7 +169,9 @@ const decideSchema = z.object({
 });
 
 regularizationsRouter.post('/:id/decide', async (req, res) => {
-  requirePrivileged(req);
+  if (!(await canApproveAttendance(req))) {
+    throw forbidden('Only owners/admins or attendance managers can decide.');
+  }
   const ctx = getAuth(req);
   const id = param(req, 'id');
   const body = decideSchema.parse(req.body);

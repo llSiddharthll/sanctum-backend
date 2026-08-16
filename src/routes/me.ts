@@ -1,8 +1,14 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, asc, eq, inArray, ne, or, sql } from 'drizzle-orm';
+import { and, asc, eq, gte, inArray, ne, or, sql, sum } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { clients, projects, projectTasks, taskAssignees } from '../db/schema.js';
+import {
+  clients,
+  projects,
+  projectTasks,
+  taskAssignees,
+  timeLogs,
+} from '../db/schema.js';
 import { ok, toIso } from '../lib/http.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireModule } from '../middleware/permissions.js';
@@ -112,4 +118,83 @@ meRouter.get('/tasks', async (req, res) => {
       clientName: r.clientName,
     })),
   );
+});
+
+// GET /me/overview — headline numbers for the "My day" (employee) dashboard:
+// my open/overdue/due-today task counts + minutes logged today + this week.
+meRouter.get('/overview', async (req, res) => {
+  const ctx = getAuth(req);
+  const now = new Date();
+  const startOfToday = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate(),
+  );
+  const startOfTomorrow = new Date(startOfToday);
+  startOfTomorrow.setDate(startOfToday.getDate() + 1);
+  const mondayOffset = (startOfToday.getDay() + 6) % 7; // Mon=0
+  const startOfWeek = new Date(startOfToday);
+  startOfWeek.setDate(startOfToday.getDate() - mondayOffset);
+
+  const assignedTaskIds = db
+    .select({ taskId: taskAssignees.taskId })
+    .from(taskAssignees)
+    .where(
+      and(
+        eq(taskAssignees.agencyId, ctx.agencyId),
+        eq(taskAssignees.userId, ctx.userId),
+      ),
+    );
+  const mine = or(
+    eq(projectTasks.assigneeId, ctx.userId),
+    inArray(projectTasks.id, assignedTaskIds),
+  )!;
+
+  const openRows = await db
+    .select({ id: projectTasks.id, dueDate: projectTasks.dueDate })
+    .from(projectTasks)
+    .where(
+      and(
+        eq(projectTasks.agencyId, ctx.agencyId),
+        mine,
+        ne(projectTasks.status, 'done'),
+      ),
+    );
+  let overdueTasks = 0;
+  let dueTodayTasks = 0;
+  for (const r of openRows) {
+    if (!r.dueDate) continue;
+    const d = r.dueDate.getTime();
+    if (d < startOfToday.getTime()) overdueTasks++;
+    else if (d < startOfTomorrow.getTime()) dueTodayTasks++;
+  }
+
+  const [wk] = await db
+    .select({ v: sum(timeLogs.minutes) })
+    .from(timeLogs)
+    .where(
+      and(
+        eq(timeLogs.agencyId, ctx.agencyId),
+        eq(timeLogs.userId, ctx.userId),
+        gte(timeLogs.workDate, startOfWeek),
+      ),
+    );
+  const [td] = await db
+    .select({ v: sum(timeLogs.minutes) })
+    .from(timeLogs)
+    .where(
+      and(
+        eq(timeLogs.agencyId, ctx.agencyId),
+        eq(timeLogs.userId, ctx.userId),
+        gte(timeLogs.workDate, startOfToday),
+      ),
+    );
+
+  ok(res, {
+    openTasks: openRows.length,
+    overdueTasks,
+    dueTodayTasks,
+    todayMinutes: Number(td?.v ?? 0),
+    weekMinutes: Number(wk?.v ?? 0),
+  });
 });

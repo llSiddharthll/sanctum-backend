@@ -1,5 +1,5 @@
 import type { NextFunction, Request, Response } from 'express';
-import { verifyAccessToken, type Role } from '../lib/jwt.js';
+import { verifyAccessToken, ROLE_RANK, type Role } from '../lib/jwt.js';
 import { AppError, forbidden, unauthenticated } from '../lib/errors.js';
 
 export const ACCESS_COOKIE = 'sanctum_at';
@@ -32,6 +32,7 @@ export async function requireAuth(
       userId: claims.sub,
       agencyId: claims.agencyId,
       role: claims.role,
+      clientId: claims.clientId ?? null,
     };
     next();
   } catch (err) {
@@ -52,4 +53,21 @@ export function requireRole(...roles: Role[]) {
     }
     next();
   };
+}
+
+/** Numeric rank of a role (owner=3 … client=0). */
+export function roleRank(role: Role): number {
+  return ROLE_RANK[role] ?? 0;
+}
+
+/**
+ * True when a caller of `callerRole` is allowed to assign/act on `targetRole`.
+ * Owner may act on anyone (incl. granting owner). A non-owner may only act on
+ * roles STRICTLY BELOW their own tier — so an admin can manage members but not
+ * other admins/owners, and can never grant admin/owner. `client` never manages.
+ */
+export function canManageRole(callerRole: Role, targetRole: Role): boolean {
+  if (callerRole === 'owner') return true;
+  if (callerRole === 'client') return false;
+  return roleRank(targetRole) < roleRank(callerRole);
 }

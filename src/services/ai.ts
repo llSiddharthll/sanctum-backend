@@ -1272,3 +1272,286 @@ export async function repurposeContent(
   }
   return fallbackRepurpose(input);
 }
+
+// ---------------------------------------------------------------------------
+//  AI Proposal Generation & Enhancement
+// ---------------------------------------------------------------------------
+
+export interface AiProposalInput {
+  prompt: string;
+  clientName?: string;
+  budgetRupees?: number;
+  deliverablesCount?: number;
+}
+
+export interface AiProposalResult {
+  title: string;
+  overview: string;
+  deliverables: Array<{
+    title: string;
+    description: string;
+    priceRupees?: number;
+  }>;
+  terms: string[];
+  estimatedDurationWeeks?: number;
+  source: 'gemini' | 'fallback';
+}
+
+function buildProposalPrompt(input: AiProposalInput): string {
+  const count = input.deliverablesCount ?? 4;
+  return [
+    'You are an executive creative director and agency strategist at a top-tier digital agency.',
+    'Create a comprehensive, compelling client proposal based on the prompt below.',
+    input.clientName ? `Client Name: ${input.clientName}` : '',
+    input.budgetRupees ? `Target Budget: ₹${input.budgetRupees.toLocaleString('en-IN')}` : '',
+    `User Brief / Requirements:\n${input.prompt}`,
+    '',
+    `Generate exactly ${count} distinct, high-value deliverables with clear milestone descriptions.`,
+    'Include 4 professional commercial terms (IP assignment, revisions, payment schedules, warranties).',
+    '',
+    'Respond with ONLY a raw JSON object with this exact shape:',
+    '{',
+    '  "title": string (e.g. "Brand Identity & Omnichannel Growth Strategy"),',
+    '  "overview": string (2-3 paragraphs executive summary highlighting client goals, approach, and strategic impact),',
+    '  "deliverables": [',
+    '    {',
+    '      "title": string,',
+    '      "description": string (detailed scope of work and key milestone outputs),',
+    '      "priceRupees": number (optional estimated price)',
+    '    }',
+    '  ],',
+    '  "terms": [string, string, string, string],',
+    '  "estimatedDurationWeeks": number',
+    '}',
+    'No code fences, no markdown formatting outside JSON, no prose before or after.',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+function fallbackProposal(input: AiProposalInput): AiProposalResult {
+  const client = input.clientName?.trim() || 'Valued Client';
+  const brief = input.prompt.trim() || 'Comprehensive agency engagement and deliverables';
+  const totalBudget = input.budgetRupees || 120000;
+  const count = input.deliverablesCount || 4;
+  const itemBudget = Math.round(totalBudget / count);
+
+  return {
+    title: `${brief.length > 50 ? brief.slice(0, 47) + '...' : brief} Scope & Strategy`,
+    overview: `This proposal outlines our strategic engagement for ${client}. Our agency will lead end-to-end execution, combining high-impact creative direction, measurable deliverables, and structured milestone reviews to ensure rapid delivery and exceptional ROI.\n\nOur team coordinates cross-functional design, engineering, and growth workflows with dedicated weekly standups and transparent stakeholder communication throughout the engagement.`,
+    deliverables: [
+      {
+        title: 'Phase 1: Discovery, Audit & Brand Positioning',
+        description: 'Comprehensive competitive landscape analysis, stakeholder interviews, core audience profiling, and creative benchmark architecture.',
+        priceRupees: itemBudget,
+      },
+      {
+        title: 'Phase 2: Core Creative & Asset Production',
+        description: 'Production of primary deliverables, interactive prototypes, design system components, and multimedia visual collateral.',
+        priceRupees: itemBudget,
+      },
+      {
+        title: 'Phase 3: Integration, Quality Assurance & Staging',
+        description: 'Cross-platform testing, client feedback integration, performance optimization, and staging deployment verification.',
+        priceRupees: itemBudget,
+      },
+      {
+        title: 'Phase 4: Launch Execution & Handover',
+        description: 'Production deployment, stakeholder training, comprehensive documentation, and 30-day post-launch optimization support.',
+        priceRupees: totalBudget - itemBudget * 3,
+      },
+    ],
+    terms: [
+      'Intellectual Property: Full ownership of final deliverables transfers to the client upon receipt of final milestone settlement.',
+      'Revisions: Scope includes up to 2 rounds of structured stakeholder revisions per deliverable milestone.',
+      'Payment Schedule: 40% initial mobilization advance, 30% upon Phase 2 completion, and 30% upon final sign-off.',
+      'Timeline & Dependencies: Timelines are contingent upon prompt client feedback within 3 business days of milestone submissions.',
+    ],
+    estimatedDurationWeeks: 6,
+    source: 'fallback',
+  };
+}
+
+export async function generateAiProposalDraft(
+  input: AiProposalInput,
+): Promise<AiProposalResult> {
+  const text = await callGeminiText({
+    contents: [{ role: 'user', text: buildProposalPrompt(input) }],
+  });
+
+  if (text && text.trim()) {
+    const cleaned = stripCodeFences(text);
+    const first = cleaned.indexOf('{');
+    const last = cleaned.lastIndexOf('}');
+    if (first !== -1 && last > first) {
+      try {
+        const parsed = JSON.parse(cleaned.slice(first, last + 1)) as any;
+        if (parsed.title && Array.isArray(parsed.deliverables) && parsed.deliverables.length) {
+          return {
+            title: String(parsed.title),
+            overview: String(parsed.overview || ''),
+            deliverables: parsed.deliverables.map((d: any) => ({
+              title: String(d.title || 'Deliverable'),
+              description: String(d.description || ''),
+              priceRupees: typeof d.priceRupees === 'number' ? d.priceRupees : undefined,
+            })),
+            terms: Array.isArray(parsed.terms) ? parsed.terms.map(String) : [],
+            estimatedDurationWeeks: typeof parsed.estimatedDurationWeeks === 'number' ? parsed.estimatedDurationWeeks : 6,
+            source: 'gemini',
+          };
+        }
+      } catch {
+        // Fall through to fallback
+      }
+    }
+  }
+
+  return fallbackProposal(input);
+}
+
+// ---------------------------------------------------------------------------
+//  AI Agreement & Contract Generation
+// ---------------------------------------------------------------------------
+
+export interface AiAgreementInput {
+  prompt: string;
+  clientName?: string;
+  agreementType?: string;
+  retainerRupees?: number;
+}
+
+export interface AiAgreementResult {
+  title: string;
+  scope: string;
+  clauses: string[];
+  retainerRupees?: number;
+  source: 'gemini' | 'fallback';
+}
+
+function buildAgreementPrompt(input: AiAgreementInput): string {
+  return [
+    'You are a legal counsel and contract specialist for professional creative and technology agencies.',
+    'Draft a clear, legally sound, enforceable commercial agreement / statement of work based on the prompt below.',
+    input.clientName ? `Client / Counterparty: ${input.clientName}` : '',
+    input.agreementType ? `Agreement Type: ${input.agreementType}` : 'Master Services Agreement (MSA)',
+    input.retainerRupees ? `Monthly Retainer: ₹${input.retainerRupees.toLocaleString('en-IN')}` : '',
+    `Specific Terms / Context:\n${input.prompt}`,
+    '',
+    'Generate:',
+    '1. Professional contract title',
+    '2. Executive scope of services summary',
+    '3. 5-7 robust clauses covering Intellectual Property, Confidentiality & NDA, Payment Terms & Invoicing, Term & Termination, Limitation of Liability, and Warranties.',
+    '',
+    'Respond with ONLY a raw JSON object with this exact shape:',
+    '{',
+    '  "title": string,',
+    '  "scope": string,',
+    '  "clauses": [string, string, string, string, string]',
+    '}',
+    'No code fences, no markdown formatting outside JSON.',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+function fallbackAgreement(input: AiAgreementInput): AiAgreementResult {
+  const client = input.clientName?.trim() || 'Client';
+  const type = input.agreementType || 'Master Services Agreement (MSA)';
+  const brief = input.prompt.trim() || 'Professional digital agency services and deliverables';
+
+  return {
+    title: `${type} — ${client}`,
+    scope: `The Agency agrees to provide comprehensive professional services to ${client} covering: ${brief}. All deliverables shall conform to industry-standard quality specifications and be executed in accordance with agreed project milestones.`,
+    clauses: [
+      '1. Scope of Services & Standard of Performance: The Agency shall perform all agreed services with professional diligence and standard industry care.',
+      '2. Intellectual Property Rights: All custom artwork, software code, and creative assets produced specifically for the Client shall be assigned to the Client upon receipt of full final payment.',
+      '3. Confidentiality & Non-Disclosure: Both parties agree to maintain strict confidentiality regarding proprietary business data, trade secrets, and internal operations.',
+      '4. Payment Terms & Invoicing: Invoices shall be issued in accordance with milestone schedules and settled within 15 business days of receipt.',
+      '5. Term & Termination: Either party may terminate this Agreement by providing 30 days written notice to the other party.',
+      '6. Limitation of Liability: Neither party shall be liable for indirect, incidental, or consequential damages arising under this Agreement.',
+    ],
+    retainerRupees: input.retainerRupees,
+    source: 'fallback',
+  };
+}
+
+export async function generateAiAgreementDraft(
+  input: AiAgreementInput,
+): Promise<AiAgreementResult> {
+  const text = await callGeminiText({
+    contents: [{ role: 'user', text: buildAgreementPrompt(input) }],
+  });
+
+  if (text && text.trim()) {
+    const cleaned = stripCodeFences(text);
+    const first = cleaned.indexOf('{');
+    const last = cleaned.lastIndexOf('}');
+    if (first !== -1 && last > first) {
+      try {
+        const parsed = JSON.parse(cleaned.slice(first, last + 1)) as any;
+        if (parsed.title && parsed.scope && Array.isArray(parsed.clauses)) {
+          return {
+            title: String(parsed.title),
+            scope: String(parsed.scope),
+            clauses: parsed.clauses.map(String),
+            retainerRupees: input.retainerRupees,
+            source: 'gemini',
+          };
+        }
+      } catch {
+        // Fall through
+      }
+    }
+  }
+
+  return fallbackAgreement(input);
+}
+
+// ---------------------------------------------------------------------------
+//  AI Text Polish & Enhancement
+// ---------------------------------------------------------------------------
+
+export interface EnhanceTextInput {
+  text: string;
+  context?: string;
+  instruction?: string;
+}
+
+export interface EnhanceTextResult {
+  enhancedText: string;
+  source: 'gemini' | 'fallback';
+}
+
+export async function enhanceTextWithAi(
+  input: EnhanceTextInput,
+): Promise<EnhanceTextResult> {
+  const prompt = [
+    'You are an expert agency copywriter and business strategist.',
+    'Enhance, polish, and elevate the following text into professional, persuasive agency copy.',
+    input.context ? `Context: ${input.context}` : '',
+    input.instruction ? `Instruction: ${input.instruction}` : 'Make it clearer, more compelling, and professionally structured.',
+    '',
+    `Original Text:\n${input.text}`,
+    '',
+    'Respond with ONLY the enhanced text — no preamble, no commentary, no markdown code fences.',
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const text = await callGeminiText({
+    contents: [{ role: 'user', text: prompt }],
+  });
+
+  if (text && text.trim()) {
+    return {
+      enhancedText: stripCodeFences(text),
+      source: 'gemini',
+    };
+  }
+
+  return {
+    enhancedText: input.text.trim(),
+    source: 'fallback',
+  };
+}
+

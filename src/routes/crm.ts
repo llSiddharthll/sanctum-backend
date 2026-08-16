@@ -408,6 +408,7 @@ function serializeDeal(
   d: typeof deals.$inferSelect,
   clientName?: string | null,
   ownerName?: string | null,
+  showFinance = false,
 ) {
   return {
     id: d.id,
@@ -415,7 +416,7 @@ function serializeDeal(
     clientName: clientName ?? null,
     title: d.title,
     stage: d.stage,
-    valuePaise: d.valuePaise,
+    valuePaise: showFinance ? d.valuePaise : null,
     currency: d.currency,
     probability: d.probability,
     expectedCloseAt: toIso(d.expectedCloseAt),
@@ -451,12 +452,14 @@ crmRouter.get('/deals', async (req, res) => {
     .where(and(...filters))
     .orderBy(desc(deals.createdAt))
     .limit(500);
-  ok(res, rows.map((r) => serializeDeal(r.d, r.clientName, r.ownerName)));
+  const isOwner = ctx.role === 'owner';
+  ok(res, rows.map((r) => serializeDeal(r.d, r.clientName, r.ownerName, isOwner)));
 });
 
 crmRouter.get('/clients/:clientId/deals', async (req, res) => {
   const ctx = getAuth(req);
   await requireClientAccess(ctx, param(req, 'clientId'));
+  const isOwner = ctx.role === 'owner';
   const rows = await db
     .select(dealSelect)
     .from(deals)
@@ -469,7 +472,7 @@ crmRouter.get('/clients/:clientId/deals', async (req, res) => {
       ),
     )
     .orderBy(desc(deals.createdAt));
-  ok(res, rows.map((r) => serializeDeal(r.d, r.clientName, r.ownerName)));
+  ok(res, rows.map((r) => serializeDeal(r.d, r.clientName, r.ownerName, isOwner)));
 });
 
 const STAGES = ['lead', 'qualified', 'proposal', 'negotiation', 'won', 'lost'] as const;
@@ -520,7 +523,7 @@ crmRouter.post('/clients/:clientId/deals', async (req, res) => {
     metadata: { clientId, stage },
     ip: req.ip,
   });
-  created(res, await loadDeal(ctx.agencyId, id));
+  created(res, await loadDeal(ctx.agencyId, id, ctx.role === 'owner'));
 });
 
 async function assertAgencyUser(agencyId: string, userId: string) {
@@ -532,7 +535,7 @@ async function assertAgencyUser(agencyId: string, userId: string) {
   if (!u) throw notFound('Owner user not found.');
 }
 
-async function loadDeal(agencyId: string, id: string) {
+async function loadDeal(agencyId: string, id: string, showFinance = false) {
   const [r] = await db
     .select(dealSelect)
     .from(deals)
@@ -541,7 +544,7 @@ async function loadDeal(agencyId: string, id: string) {
     .where(and(eq(deals.id, id), eq(deals.agencyId, agencyId)))
     .limit(1);
   if (!r) throw notFound('Deal not found.');
-  return serializeDeal(r.d, r.clientName, r.ownerName);
+  return serializeDeal(r.d, r.clientName, r.ownerName, showFinance);
 }
 
 async function dealWithAccess(req: Request) {
@@ -587,7 +590,7 @@ crmRouter.patch('/deals/:id', async (req, res) => {
     metadata: body.stage ? { stage: body.stage } : undefined,
     ip: req.ip,
   });
-  ok(res, await loadDeal(ctx.agencyId, existing.id));
+  ok(res, await loadDeal(ctx.agencyId, existing.id, ctx.role === 'owner'));
 });
 
 crmRouter.delete('/deals/:id', async (req, res) => {

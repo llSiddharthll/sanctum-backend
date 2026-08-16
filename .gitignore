@@ -19,3 +19,4 @@ Thumbs.db
 
 # Vitest isolated test database
 .test-data/
+.local-data/

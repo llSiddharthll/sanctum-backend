@@ -42,7 +42,7 @@ function serializeLead(l: typeof leads.$inferSelect, extra?: {
   convertedClientName?: string | null;
   openFollowUps?: number;
   nextFollowUpAt?: Date | null;
-}) {
+}, showFinance = false) {
   return {
     id: l.id,
     name: l.name,
@@ -51,10 +51,10 @@ function serializeLead(l: typeof leads.$inferSelect, extra?: {
     phone: l.phone,
     source: l.source,
     service: l.service,
-    budget: l.budget,
+    budget: showFinance ? l.budget : null,
     message: l.message,
     stage: l.stage,
-    estimatedValue: l.estimatedValue,
+    estimatedValue: showFinance ? l.estimatedValue : null,
     ownerId: l.ownerId,
     ownerName: extra?.ownerName ?? null,
     convertedClientId: l.convertedClientId,
@@ -189,17 +189,22 @@ leadsRouter.get('/', async (req, res) => {
     rows.map((r) => r.id),
   );
 
+  const isOwner = ctx.role === 'owner';
   ok(
     res,
     rows.map((l) =>
-      serializeLead(l, {
-        ownerName: l.ownerId ? ownerNames.get(l.ownerId) ?? null : null,
-        convertedClientName: l.convertedClientId
-          ? convNames.get(l.convertedClientId) ?? null
-          : null,
-        openFollowUps: rollups.get(l.id)?.count ?? 0,
-        nextFollowUpAt: rollups.get(l.id)?.next ?? null,
-      }),
+      serializeLead(
+        l,
+        {
+          ownerName: l.ownerId ? ownerNames.get(l.ownerId) ?? null : null,
+          convertedClientName: l.convertedClientId
+            ? convNames.get(l.convertedClientId) ?? null
+            : null,
+          openFollowUps: rollups.get(l.id)?.count ?? 0,
+          nextFollowUpAt: rollups.get(l.id)?.next ?? null,
+        },
+        isOwner,
+      ),
     ),
   );
 });
@@ -318,7 +323,7 @@ leadsRouter.post('/', async (req, res) => {
     lastActivityAt: new Date(),
   });
   const row = await getScopedLead(ctx, id);
-  created(res, serializeLead(row));
+  created(res, serializeLead(row, undefined, ctx.role === 'owner'));
 });
 
 // ============================================================
@@ -342,12 +347,16 @@ leadsRouter.get('/:id', async (req, res) => {
 
   const rollup = (await followUpRollups(ctx.agencyId, [lead.id])).get(lead.id);
   ok(res, {
-    ...serializeLead(lead, {
-      ownerName: owner?.name ?? null,
-      convertedClientName: conv?.name ?? null,
-      openFollowUps: rollup?.count ?? 0,
-      nextFollowUpAt: rollup?.next ?? null,
-    }),
+    ...serializeLead(
+      lead,
+      {
+        ownerName: owner?.name ?? null,
+        convertedClientName: conv?.name ?? null,
+        openFollowUps: rollup?.count ?? 0,
+        nextFollowUpAt: rollup?.next ?? null,
+      },
+      ctx.role === 'owner',
+    ),
     activities: acts.map((r) => serializeActivity(r.a, r.authorName)),
   });
 });
@@ -406,7 +415,7 @@ leadsRouter.patch('/:id', async (req, res) => {
   }
 
   const row = await getScopedLead(ctx, lead.id);
-  ok(res, serializeLead(row));
+  ok(res, serializeLead(row, undefined, ctx.role === 'owner'));
 });
 
 // ============================================================

@@ -116,6 +116,14 @@ export function fullAccess(): PermissionMap {
   }, {} as PermissionMap);
 }
 
+/** A permission map granting `none` on every module (clients / blocked users). */
+export function noAccess(): PermissionMap {
+  return MODULES.reduce((acc, m) => {
+    acc[m] = 'none';
+    return acc;
+  }, {} as PermissionMap);
+}
+
 /** `true` when `have` satisfies the `required` access level. */
 export function meetsLevel(have: AccessLevel, required: AccessLevel): boolean {
   return RANK[have] >= RANK[required];
@@ -167,6 +175,10 @@ export function resolvePermissions(
   customRolePermissions?: string | null | Partial<PermissionMap>,
 ): PermissionMap {
   if (role === 'owner') return fullAccess();
+  // A client is not agency staff — it can NEVER reach any agency module.
+  // (Critical: without this, the additive DEFAULT_LEVEL='manage' would grant a
+  // client full access to every module.)
+  if (role === 'client') return noAccess();
   const userOverrides =
     typeof overrides === 'string' || overrides == null
       ? parseOverrides(overrides as string | null | undefined)
@@ -178,10 +190,13 @@ export function resolvePermissions(
   const defaults = parseRoleDefaults(roleDefaults);
   const roleMap = defaults[role as ConfigurableRole] ?? {};
   // Precedence: per-user override > custom role > agency role default > built-in.
-  return MODULES.reduce((acc, m) => {
+  const res = MODULES.reduce((acc, m) => {
     acc[m] = userOverrides[m] ?? customMap[m] ?? roleMap[m] ?? DEFAULT_LEVEL;
     return acc;
   }, {} as PermissionMap);
+  // Hard backstop: Finance is strictly OWNER-ONLY. Non-owners (admin, member, etc.) can never access finance.
+  res.finance = 'none';
+  return res;
 }
 
 /** Serialize a sanitized overrides map for storage (or null when empty). */
@@ -239,15 +254,19 @@ export function resolveRolePermissions(
   raw: string | null | undefined | RoleDefaults,
 ): Record<Role, PermissionMap> {
   const defaults = parseRoleDefaults(raw);
-  const forRole = (role: ConfigurableRole): PermissionMap =>
-    MODULES.reduce((acc, m) => {
+  const forRole = (role: ConfigurableRole): PermissionMap => {
+    const map = MODULES.reduce((acc, m) => {
       acc[m] = defaults[role][m] ?? DEFAULT_LEVEL;
       return acc;
     }, {} as PermissionMap);
+    map.finance = 'none';
+    return map;
+  };
   return {
     owner: fullAccess(),
     admin: forRole('admin'),
     member: forRole('member'),
+    client: noAccess(),
   };
 }
 
@@ -307,22 +326,24 @@ export const ROLE_PRESETS: RolePreset[] = [
     key: 'manager',
     name: 'Manager',
     description:
-      'Runs delivery. Full access to clients, projects, content, calendar, attendance and messages; can view finance; cannot change agency settings.',
-    baseRole: 'admin',
+      'Runs delivery. Manages clients, projects, content, calendar, attendance and messages, and can VIEW the team — but cannot manage roles/members, see finance, or change agency settings. Sits below Admin.',
+    // Member-tier on purpose: a manager must NOT pass the owner/admin role gates
+    // (invite / role changes) — that is what prevents self-escalation to admin.
+    baseRole: 'member',
     colorToken: 'ocean',
     permissions: {
       dashboard: 'manage',
       clients: 'manage',
       projects: 'manage',
-      team: 'edit',
+      team: 'view',
       attendance: 'manage',
       calendar: 'manage',
       messages: 'manage',
       documents: 'manage',
       sheets: 'manage',
       ai: 'manage',
-      finance: 'view',
-      settings: 'view',
+      finance: 'none',
+      settings: 'none',
     },
   },
   {

@@ -15,6 +15,7 @@ import { agenciesRouter } from './routes/agencies.js';
 import { usersRouter } from './routes/users.js';
 import { clientsRouter } from './routes/clients.js';
 import { leadsRouter } from './routes/leads.js';
+import { clientPortalRouter } from './routes/client-portal.js';
 import { projectsRouter } from './routes/projects.js';
 import { timersRouter } from './routes/timers.js';
 import { expensesRouter } from './routes/expenses.js';
@@ -34,6 +35,9 @@ import { notificationsRouter } from './routes/notifications.js';
 import { crmRouter } from './routes/crm.js';
 import { meRouter } from './routes/me.js';
 import { pushRouter } from './routes/push.js';
+import { proposalsRouter } from './routes/proposals.js';
+import { agreementsRouter } from './routes/agreements.js';
+import { invoicesRouter } from './routes/invoices.js';
 import { intakeRouter } from './routes/intake.js';
 
 export function createApp() {
@@ -59,6 +63,11 @@ export function createApp() {
   api.use('/team', usersRouter);
   api.use('/clients', clientsRouter);
   api.use('/leads', leadsRouter);
+  api.use('/proposals', proposalsRouter);
+  api.use('/agreements', agreementsRouter);
+  api.use('/invoices', invoicesRouter);
+  // Logged-in client-portal (client role only; scoped to their brand + projects).
+  api.use('/client', clientPortalRouter);
   api.use('/projects', projectsRouter);
   api.use('/timers', timersRouter);
   api.use('/me', meRouter);

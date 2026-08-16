@@ -1,9 +1,10 @@
 import { Router } from 'express';
 import type { Request } from 'express';
 import { z } from 'zod';
-import { and, eq } from 'drizzle-orm';
+import { and, desc, eq } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
+  attendanceCheckoutRequests,
   attendancePolicy,
   attendanceRecords,
   holidays,
@@ -13,16 +14,21 @@ import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { conflict, forbidden, notFound, badRequest } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
-import { requireModuleRW } from '../middleware/permissions.js';
+import { loadPermissions, requireModuleRW } from '../middleware/permissions.js';
 import { getAuth, isPrivileged } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
+import {
+  notify,
+  notifyMany,
+  agencyApprovers,
+} from '../services/notifications.js';
 import { leavesRouter } from './leaves.js';
 import { regularizationsRouter } from './regularizations.js';
 import {
   dayKeyInTz,
   deriveDayStatus,
   checkFencing,
-  checkCheckoutRadius,
+  distanceMeters,
   isWorkingDayKey,
 } from '../lib/attendance.js';
 import {
@@ -48,6 +54,18 @@ function requirePrivileged(req: Request): void {
   if (!isPrivileged(ctx.role)) {
     throw forbidden('Only owners/admins can do that.');
   }
+}
+
+/**
+ * Who may approve attendance requests (checkout-approvals, regularizations) and
+ * see the team/approver views: owners/admins, OR an "attendance manager" — a
+ * member-tier user granted `manage` access to the Attendance module.
+ */
+async function canApproveAttendance(req: Request): Promise<boolean> {
+  const ctx = getAuth(req);
+  if (isPrivileged(ctx.role)) return true;
+  const perms = await loadPermissions(req);
+  return perms.attendance === 'manage';
 }
 
 /** Resolve ?userId (admins only for others). */
@@ -225,6 +243,12 @@ const punchSchema = z.object({
   location: z.string().max(200).optional(),
 });
 
+// Check-out also accepts an optional reason, attached to a checkout REQUEST when
+// the punch lands outside the office geofence (held for approval).
+const checkOutSchema = punchSchema.extend({
+  reason: z.string().trim().max(500).optional(),
+});
+
 attendanceRouter.post('/check-in', async (req, res) => {
   const ctx = getAuth(req);
   const body = punchSchema.parse(req.body ?? {});
@@ -315,7 +339,7 @@ attendanceRouter.post('/check-in', async (req, res) => {
 
 attendanceRouter.post('/check-out', async (req, res) => {
   const ctx = getAuth(req);
-  const body = punchSchema.parse(req.body ?? {});
+  const body = checkOutSchema.parse(req.body ?? {});
   const policy = await loadPolicy(ctx.agencyId);
 
   // Auto reset any stale unclosed punches from previous days (after 12 AM)
@@ -334,13 +358,113 @@ attendanceRouter.post('/check-out', async (req, res) => {
   if (!rec || !rec.checkInAt) throw conflict('You have not checked in today.');
   if (rec.checkOutAt) throw conflict('You have already checked out today.');
 
-  // Validate check-out is within 500m radius of check-in location
-  const radiusErr = checkCheckoutRadius(
-    { lat: rec.checkInLat, lng: rec.checkInLng },
-    { lat: body.lat ?? null, lng: body.lng ?? null },
-  );
-  if (radiusErr) throw forbidden(radiusErr);
+  // Out-of-office checkout → hold for approval. When geo is enforced and an
+  // office fence (centre + radius) is configured, a checkout from OUTSIDE that
+  // radius is NOT finalized immediately: it is captured as a pending request
+  // that an owner/admin (or attendance manager) approves to settle the day.
+  const officeConfigured =
+    policy.enforceGeo &&
+    policy.geoLat != null &&
+    policy.geoLng != null &&
+    policy.geoRadiusM != null;
 
+  if (officeConfigured) {
+    // Sharing location is mandatory to determine whether you're at the office.
+    if (body.lat == null || body.lng == null) {
+      throw forbidden(
+        'Location is required to check out. Please enable location access and try again.',
+      );
+    }
+    const distanceM = Math.round(
+      distanceMeters(body.lat, body.lng, policy.geoLat!, policy.geoLng!),
+    );
+    if (distanceM > policy.geoRadiusM!) {
+      // De-dupe: if a pending request already exists for today, echo it back
+      // instead of stacking duplicates.
+      const [dupe] = await db
+        .select({ id: attendanceCheckoutRequests.id })
+        .from(attendanceCheckoutRequests)
+        .where(
+          and(
+            eq(attendanceCheckoutRequests.agencyId, ctx.agencyId),
+            eq(attendanceCheckoutRequests.userId, ctx.userId),
+            eq(attendanceCheckoutRequests.day, day),
+            eq(attendanceCheckoutRequests.status, 'pending'),
+          ),
+        )
+        .limit(1);
+      if (dupe) {
+        ok(
+          res,
+          {
+            pending: true,
+            alreadyRequested: true,
+            distanceM,
+            requestId: dupe.id,
+            record: serializeRecord(rec),
+          },
+          202,
+        );
+        return;
+      }
+
+      const reqId = newId('cor');
+      await db.insert(attendanceCheckoutRequests).values({
+        id: reqId,
+        agencyId: ctx.agencyId,
+        userId: ctx.userId,
+        day,
+        requestedCheckOutAt: now,
+        checkOutLat: body.lat,
+        checkOutLng: body.lng,
+        checkOutLocation: body.location ?? null,
+        distanceM,
+        reason: body.reason ?? null,
+        status: 'pending',
+      });
+
+      await audit({
+        agencyId: ctx.agencyId,
+        actorType: ctx.role,
+        actorId: ctx.userId,
+        action: 'attendance.checkout_request.create',
+        entityType: 'attendance_checkout_request',
+        entityId: reqId,
+        metadata: { day, distanceM },
+        ip: req.ip,
+      });
+
+      const [me] = await db
+        .select({ name: users.fullName, email: users.email })
+        .from(users)
+        .where(eq(users.id, ctx.userId))
+        .limit(1);
+      const approvers = await agencyApprovers(ctx.agencyId, ctx.userId);
+      await notifyMany(approvers, {
+        agencyId: ctx.agencyId,
+        type: 'attendance.checkout.requested',
+        title: 'Out-of-office checkout',
+        body: `${me?.name ?? me?.email ?? 'A member'} checked out ${distanceM}m from the office and needs approval.`,
+        entityType: 'attendance_checkout_request',
+        entityId: reqId,
+        link: '/attendance',
+      });
+
+      ok(
+        res,
+        {
+          pending: true,
+          distanceM,
+          requestId: reqId,
+          record: serializeRecord(rec),
+        },
+        202,
+      );
+      return;
+    }
+  }
+
+  // Inside the office radius (or geo not enforced) → finalize the checkout now.
   const derived = deriveDayStatus(policy, {
     checkInAt: rec.checkInAt,
     checkOutAt: now,
@@ -596,7 +720,9 @@ attendanceRouter.post('/mark', async (req, res) => {
 //  TEAM — who's in today + monthly rollups (admin)
 // ============================================================
 attendanceRouter.get('/whos-in', async (req, res) => {
-  requirePrivileged(req);
+  if (!(await canApproveAttendance(req))) {
+    throw forbidden('Only owners/admins or attendance managers can view this.');
+  }
   const ctx = getAuth(req);
   const policy = await loadPolicy(ctx.agencyId);
   const today = dayKeyInTz(new Date(), policy.timezone);
@@ -649,7 +775,9 @@ attendanceRouter.get('/whos-in', async (req, res) => {
 });
 
 attendanceRouter.get('/team-summary', async (req, res) => {
-  requirePrivileged(req);
+  if (!(await canApproveAttendance(req))) {
+    throw forbidden('Only owners/admins or attendance managers can view this.');
+  }
   const ctx = getAuth(req);
   const month = (req.query.month as string | undefined) ?? '';
   const policy = await loadPolicy(ctx.agencyId);
@@ -672,4 +800,193 @@ attendanceRouter.get('/team-summary', async (req, res) => {
     throw badRequest('month must be YYYY-MM.');
   }
   ok(res, { month, members: rows });
+});
+
+// ============================================================
+//  CHECKOUT REQUESTS — out-of-office checkouts awaiting approval
+// ============================================================
+function serializeCheckoutRequest(
+  r: typeof attendanceCheckoutRequests.$inferSelect,
+  userName?: string | null,
+) {
+  return {
+    id: r.id,
+    userId: r.userId,
+    userName: userName ?? null,
+    day: r.day,
+    requestedCheckOutAt: toIso(r.requestedCheckOutAt),
+    checkOutLat: r.checkOutLat,
+    checkOutLng: r.checkOutLng,
+    checkOutLocation: r.checkOutLocation,
+    distanceM: r.distanceM,
+    reason: r.reason,
+    status: r.status,
+    decidedBy: r.decidedBy,
+    decidedAt: toIso(r.decidedAt),
+    decisionNote: r.decisionNote,
+    createdAt: toIso(r.createdAt),
+  };
+}
+
+// GET /checkout-requests — mine by default; ?scope=all|pending (approvers only).
+attendanceRouter.get('/checkout-requests', async (req, res) => {
+  const ctx = getAuth(req);
+  const scope = (req.query.scope as string | undefined) ?? 'me';
+  const filters = [eq(attendanceCheckoutRequests.agencyId, ctx.agencyId)];
+  if (scope === 'all' || scope === 'pending') {
+    if (!(await canApproveAttendance(req))) {
+      throw forbidden('Only owners/admins or attendance managers can do that.');
+    }
+    if (scope === 'pending')
+      filters.push(eq(attendanceCheckoutRequests.status, 'pending'));
+    const reqUser = (req.query.userId as string | undefined)?.trim();
+    if (reqUser) filters.push(eq(attendanceCheckoutRequests.userId, reqUser));
+  } else {
+    filters.push(eq(attendanceCheckoutRequests.userId, ctx.userId));
+  }
+  const rows = await db
+    .select({
+      r: attendanceCheckoutRequests,
+      userName: users.fullName,
+      userEmail: users.email,
+    })
+    .from(attendanceCheckoutRequests)
+    .leftJoin(users, eq(users.id, attendanceCheckoutRequests.userId))
+    .where(and(...filters))
+    .orderBy(desc(attendanceCheckoutRequests.createdAt))
+    .limit(200);
+  ok(res, rows.map((x) => serializeCheckoutRequest(x.r, x.userName ?? x.userEmail)));
+});
+
+const decideCheckoutSchema = z.object({
+  decision: z.enum(['approved', 'rejected']),
+  note: z.string().trim().max(500).optional(),
+});
+
+// POST /checkout-requests/:id/decide — approve (finalize the checkout) / reject.
+attendanceRouter.post('/checkout-requests/:id/decide', async (req, res) => {
+  if (!(await canApproveAttendance(req))) {
+    throw forbidden('Only owners/admins or attendance managers can decide.');
+  }
+  const ctx = getAuth(req);
+  const id = param(req, 'id');
+  const body = decideCheckoutSchema.parse(req.body);
+
+  const [reqRow] = await db
+    .select()
+    .from(attendanceCheckoutRequests)
+    .where(
+      and(
+        eq(attendanceCheckoutRequests.id, id),
+        eq(attendanceCheckoutRequests.agencyId, ctx.agencyId),
+      ),
+    )
+    .limit(1);
+  if (!reqRow) throw notFound('Request not found.');
+  if (reqRow.status !== 'pending')
+    throw conflict('This request was already decided.');
+
+  const now = new Date();
+
+  // On approval, finalize the checkout on the member's day record: stamp the
+  // requested checkout time + out-of-office coords and recompute worked time.
+  if (body.decision === 'approved') {
+    const policy = await loadPolicy(ctx.agencyId);
+    const [existing] = await db
+      .select()
+      .from(attendanceRecords)
+      .where(
+        and(
+          eq(attendanceRecords.userId, reqRow.userId),
+          eq(attendanceRecords.day, reqRow.day),
+        ),
+      )
+      .limit(1);
+
+    if (existing && existing.checkInAt && !existing.checkOutAt) {
+      const derived = deriveDayStatus(policy, {
+        checkInAt: existing.checkInAt,
+        checkOutAt: reqRow.requestedCheckOutAt,
+      });
+      await db
+        .update(attendanceRecords)
+        .set({
+          checkOutAt: reqRow.requestedCheckOutAt,
+          checkOutLat: reqRow.checkOutLat,
+          checkOutLng: reqRow.checkOutLng,
+          checkOutLocation: reqRow.checkOutLocation,
+          workedMinutes: derived.workedMinutes,
+          overtimeMinutes: derived.overtimeMinutes,
+          status: derived.status,
+          isLate: derived.isLate,
+          updatedAt: now,
+        })
+        .where(eq(attendanceRecords.id, existing.id));
+    }
+  }
+
+  await db
+    .update(attendanceCheckoutRequests)
+    .set({
+      status: body.decision,
+      decidedBy: ctx.userId,
+      decidedAt: now,
+      decisionNote: body.note ?? null,
+    })
+    .where(eq(attendanceCheckoutRequests.id, id));
+
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: `attendance.checkout_request.${body.decision}`,
+    entityType: 'attendance_checkout_request',
+    entityId: id,
+    ip: req.ip,
+  });
+
+  await notify({
+    agencyId: ctx.agencyId,
+    userId: reqRow.userId,
+    type: `attendance.checkout.${body.decision}`,
+    title: `Checkout ${body.decision}`,
+    body: `Your out-of-office checkout for ${reqRow.day} was ${body.decision}.${body.note ? ` ${body.note}` : ''}`,
+    entityType: 'attendance_checkout_request',
+    entityId: id,
+    link: '/attendance',
+  });
+
+  const [row] = await db
+    .select()
+    .from(attendanceCheckoutRequests)
+    .where(eq(attendanceCheckoutRequests.id, id));
+  ok(res, serializeCheckoutRequest(row!));
+});
+
+// POST /checkout-requests/:id/cancel — the requester withdraws a pending request.
+attendanceRouter.post('/checkout-requests/:id/cancel', async (req, res) => {
+  const ctx = getAuth(req);
+  const id = param(req, 'id');
+  const [reqRow] = await db
+    .select()
+    .from(attendanceCheckoutRequests)
+    .where(
+      and(
+        eq(attendanceCheckoutRequests.id, id),
+        eq(attendanceCheckoutRequests.agencyId, ctx.agencyId),
+      ),
+    )
+    .limit(1);
+  if (!reqRow) throw notFound('Request not found.');
+  if (reqRow.userId !== ctx.userId && !isPrivileged(ctx.role)) {
+    throw forbidden('You can only cancel your own requests.');
+  }
+  if (reqRow.status !== 'pending') {
+    throw conflict('Only pending requests can be cancelled.');
+  }
+  await db
+    .update(attendanceCheckoutRequests)
+    .set({ status: 'cancelled' })
+    .where(eq(attendanceCheckoutRequests.id, id));
+  ok(res, { cancelled: true });
 });

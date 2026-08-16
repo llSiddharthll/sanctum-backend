@@ -32,8 +32,9 @@ import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { AppError, notFound, conflict, forbidden } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
-import { requireModuleRW } from '../middleware/permissions.js';
-import { getAuth } from '../middleware/tenant.js';
+import { requireModuleRW, loadPermissions } from '../middleware/permissions.js';
+import { meetsLevel } from '../lib/permissions.js';
+import { getAuth, isPrivileged } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
 import { listProjectTimers } from './timers.js';
 
@@ -146,7 +147,79 @@ type ProjectRow = {
   memberCount: number;
 };
 
-function serializeProject(p: ProjectRow) {
+/**
+ * True when the caller may see project MONEY (contract value). Gated on the
+ * finance module (owner/admin have it; the Manager/Employee presets are
+ * finance:none) so rates never leak to delivery roles.
+ */
+async function canSeeProjectFinance(req: import('express').Request): Promise<boolean> {
+  const perms = await loadPermissions(req);
+  return meetsLevel(perms.finance, 'view');
+}
+
+/**
+ * True when the caller may see EVERY project in the agency. Owner/admin always
+ * can; a member needs the 'manage' tier on projects (the Manager preset). A
+ * plain member (Employee tier = projects:edit/view) is scoped to the projects
+ * they belong to or have a task assigned on.
+ */
+async function canSeeAllProjects(req: import('express').Request): Promise<boolean> {
+  const ctx = getAuth(req);
+  if (isPrivileged(ctx.role)) return true;
+  const perms = await loadPermissions(req);
+  return meetsLevel(perms.projects, 'manage');
+}
+
+/**
+ * The set of project ids a SCOPED member may see: projects they're a member of,
+ * plus projects that hold a task assigned to them (primary `assigneeId` or a
+ * `taskAssignees` row). Only call this for callers where canSeeAllProjects is
+ * false.
+ */
+async function visibleProjectIds(
+  ctx: ReturnType<typeof getAuth>,
+): Promise<string[]> {
+  const memberRows = await db
+    .select({ projectId: projectMembers.projectId })
+    .from(projectMembers)
+    .where(
+      and(
+        eq(projectMembers.agencyId, ctx.agencyId),
+        eq(projectMembers.userId, ctx.userId),
+      ),
+    );
+
+  const primaryTaskRows = await db
+    .select({ projectId: projectTasks.projectId })
+    .from(projectTasks)
+    .where(
+      and(
+        eq(projectTasks.agencyId, ctx.agencyId),
+        eq(projectTasks.assigneeId, ctx.userId),
+      ),
+    );
+
+  const assignedTaskRows = await db
+    .select({ projectId: projectTasks.projectId })
+    .from(taskAssignees)
+    .innerJoin(projectTasks, eq(projectTasks.id, taskAssignees.taskId))
+    .where(
+      and(
+        eq(taskAssignees.agencyId, ctx.agencyId),
+        eq(taskAssignees.userId, ctx.userId),
+      ),
+    );
+
+  return [
+    ...new Set([
+      ...memberRows.map((r) => r.projectId),
+      ...primaryTaskRows.map((r) => r.projectId),
+      ...assignedTaskRows.map((r) => r.projectId),
+    ]),
+  ];
+}
+
+function serializeProject(p: ProjectRow, showFinance = true) {
   return {
     id: p.id,
     clientId: p.clientId,
@@ -156,7 +229,8 @@ function serializeProject(p: ProjectRow) {
     type: p.type,
     status: p.status,
     health: p.health,
-    contractValue: p.contractValue ?? 0,
+    // Money is finance-gated: null for non-finance roles (managers/employees).
+    contractValue: showFinance ? (p.contractValue ?? 0) : null,
     currency: p.currency,
     startDate: toIso(p.startDate),
     deadline: toIso(p.deadline),
@@ -453,11 +527,17 @@ function serializeMilestone(m: typeof projectMilestones.$inferSelect) {
   };
 }
 
-/** Fetch a project (with computed counts) scoped to the caller's agency. */
+/**
+ * Fetch a project (with computed counts) scoped to the caller's agency AND to
+ * their visibility: owner/admin/managers reach every project; a plain member
+ * only reaches projects they belong to or have a task assigned on. A member who
+ * asks for a project outside their scope gets a 404 (existence is not leaked).
+ */
 async function getScopedProject(
-  ctx: ReturnType<typeof getAuth>,
+  req: import('express').Request,
   projectId: string,
 ): Promise<ProjectRow> {
+  const ctx = getAuth(req);
   const [row] = await db
     .select(projectSelection)
     .from(projects)
@@ -467,6 +547,11 @@ async function getScopedProject(
     )
     .limit(1);
   if (!row) throw notFound('Project not found.');
+
+  if (!(await canSeeAllProjects(req))) {
+    const allowed = await visibleProjectIds(ctx);
+    if (!allowed.includes(projectId)) throw notFound('Project not found.');
+  }
   return row as ProjectRow;
 }
 
@@ -520,6 +605,16 @@ projectsRouter.get('/', async (req, res) => {
     filters.push(like(projects.name, `%${q.search.trim()}%`));
   }
 
+  // Scoped members only see the projects they belong to / are assigned on.
+  if (!(await canSeeAllProjects(req))) {
+    const allowed = await visibleProjectIds(ctx);
+    if (allowed.length === 0) {
+      ok(res, []);
+      return;
+    }
+    filters.push(inArray(projects.id, allowed));
+  }
+
   const rows = await db
     .select(projectSelection)
     .from(projects)
@@ -527,7 +622,54 @@ projectsRouter.get('/', async (req, res) => {
     .where(and(...filters))
     .orderBy(asc(projects.createdAt));
 
-  ok(res, (rows as ProjectRow[]).map(serializeProject));
+  const showFinance = await canSeeProjectFinance(req);
+  ok(res, (rows as ProjectRow[]).map((p) => serializeProject(p, showFinance)));
+});
+
+// GET /projects/all-tasks — cross-project tasks list for the agency team
+projectsRouter.get('/all-tasks', async (req, res) => {
+  const ctx = getAuth(req);
+  const projectId = req.query.projectId as string | undefined;
+  const clientId = req.query.clientId as string | undefined;
+  const status = req.query.status as string | undefined;
+  const priority = req.query.priority as string | undefined;
+  const assigneeId = req.query.assigneeId as string | undefined;
+  const search = req.query.search as string | undefined;
+
+  const filters = [eq(projectTasks.agencyId, ctx.agencyId)];
+  if (projectId) filters.push(eq(projectTasks.projectId, projectId));
+  if (status) filters.push(eq(projectTasks.status, status as any));
+  if (priority) filters.push(eq(projectTasks.priority, priority as any));
+  if (assigneeId) filters.push(eq(projectTasks.assigneeId, assigneeId));
+  if (clientId) filters.push(eq(projects.clientId, clientId));
+  if (search && search.trim()) {
+    filters.push(like(projectTasks.title, `%${search.trim()}%`));
+  }
+
+  const rows = await db
+    .select({
+      t: projectTasks,
+      projectName: projects.name,
+      clientName: clients.name,
+      assigneeName: users.fullName,
+    })
+    .from(projectTasks)
+    .innerJoin(projects, eq(projects.id, projectTasks.projectId))
+    .leftJoin(clients, eq(clients.id, projects.clientId))
+    .leftJoin(users, eq(users.id, projectTasks.assigneeId))
+    .where(and(...filters))
+    .orderBy(desc(projectTasks.createdAt))
+    .limit(500);
+
+  ok(
+    res,
+    rows.map((r) => ({
+      ...serializeTask(r.t),
+      projectName: r.projectName,
+      clientName: r.clientName,
+      assigneeName: r.assigneeName,
+    })),
+  );
 });
 
 // POST /projects
@@ -588,15 +730,14 @@ projectsRouter.post('/', async (req, res) => {
     ip: req.ip,
   });
 
-  const row = await getScopedProject(ctx, id);
-  created(res, serializeProject(row));
+  const row = await getScopedProject(req, id);
+  created(res, serializeProject(row, await canSeeProjectFinance(req)));
 });
 
 // GET /projects/:id
 projectsRouter.get('/:id', async (req, res) => {
-  const ctx = getAuth(req);
-  const row = await getScopedProject(ctx, param(req, 'id'));
-  ok(res, serializeProject(row));
+  const row = await getScopedProject(req, param(req, 'id'));
+  ok(res, serializeProject(row, await canSeeProjectFinance(req)));
 });
 
 // PATCH /projects/:id
@@ -616,7 +757,7 @@ const updateSchema = z.object({
 projectsRouter.patch('/:id', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
   const body = updateSchema.parse(req.body);
 
   if (body.clientId !== undefined) {
@@ -657,15 +798,15 @@ projectsRouter.patch('/:id', async (req, res) => {
     ip: req.ip,
   });
 
-  const row = await getScopedProject(ctx, projectId);
-  ok(res, serializeProject(row));
+  const row = await getScopedProject(req, projectId);
+  ok(res, serializeProject(row, await canSeeProjectFinance(req)));
 });
 
 // DELETE /projects/:id (children cascade)
 projectsRouter.delete('/:id', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
 
   await db
     .delete(projects)
@@ -715,7 +856,7 @@ async function getScopedLabel(
 projectsRouter.get('/:id/labels', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
 
   const rows = await db
     .select()
@@ -740,7 +881,7 @@ const createLabelSchema = z.object({
 projectsRouter.post('/:id/labels', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
   const body = createLabelSchema.parse(req.body);
 
   // Enforce per-project unique name (case-sensitive, matches the unique index).
@@ -792,7 +933,7 @@ const updateLabelSchema = z.object({
 projectsRouter.patch('/:id/labels/:labelId', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
   const label = await getScopedLabel(ctx, projectId, param(req, 'labelId'));
   const body = updateLabelSchema.parse(req.body);
 
@@ -848,7 +989,7 @@ projectsRouter.patch('/:id/labels/:labelId', async (req, res) => {
 projectsRouter.delete('/:id/labels/:labelId', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
   const label = await getScopedLabel(ctx, projectId, param(req, 'labelId'));
 
   await db
@@ -912,7 +1053,7 @@ const listTasksQuery = z.object({
 projectsRouter.get('/:id/tasks', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
 
   const q = listTasksQuery.parse(req.query);
   const statusFilter = toArray(req.query['status[]'] ?? req.query.status).filter(
@@ -936,6 +1077,26 @@ projectsRouter.get('/:id/tasks', async (req, res) => {
     eq(projectTasks.agencyId, ctx.agencyId),
     eq(projectTasks.projectId, projectId),
   ];
+
+  // Scoped members (Employee tier) only see the tasks assigned to them within a
+  // project — either as the primary assignee or via the task-assignees join.
+  if (!(await canSeeAllProjects(req))) {
+    const myAssigned = db
+      .select({ taskId: taskAssignees.taskId })
+      .from(taskAssignees)
+      .where(
+        and(
+          eq(taskAssignees.agencyId, ctx.agencyId),
+          eq(taskAssignees.userId, ctx.userId),
+        ),
+      );
+    filters.push(
+      or(
+        eq(projectTasks.assigneeId, ctx.userId),
+        inArray(projectTasks.id, myAssigned),
+      )!,
+    );
+  }
 
   if (!q.includeSubtasks) filters.push(isNull(projectTasks.parentTaskId));
   if (statusFilter.length > 0)
@@ -1114,7 +1275,7 @@ const createTaskSchema = z.object({
 projectsRouter.post('/:id/tasks', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
   const body = createTaskSchema.parse(req.body);
 
   // Resolve the assignee set: explicit `assigneeIds` wins, else the legacy
@@ -1202,7 +1363,7 @@ const bulkCreateTaskSchema = z.object({
 projectsRouter.post('/:id/tasks/bulk', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
   const body = bulkCreateTaskSchema.parse(req.body);
 
   if (body.milestoneId) {
@@ -1306,7 +1467,7 @@ const updateTaskSchema = z.object({
 projectsRouter.patch('/:id/tasks/:taskId', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
   const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
   const body = updateTaskSchema.parse(req.body);
 
@@ -1439,7 +1600,7 @@ projectsRouter.patch('/:id/tasks/:taskId', async (req, res) => {
 projectsRouter.get('/:id/tasks/:taskId/subtasks', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
   const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
 
   const rows = await db
@@ -1461,7 +1622,7 @@ projectsRouter.get('/:id/tasks/:taskId/subtasks', async (req, res) => {
 projectsRouter.delete('/:id/tasks/:taskId', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
   const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
 
   await db
@@ -1498,7 +1659,7 @@ const putTaskLabelsSchema = z.object({
 projectsRouter.put('/:id/tasks/:taskId/labels', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
   const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
   const body = putTaskLabelsSchema.parse(req.body);
 
@@ -1632,7 +1793,7 @@ async function dependencyWouldCycle(
 projectsRouter.get('/:id/tasks/:taskId/dependencies', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
   const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
 
   const deps = await loadTaskDependencies(ctx.agencyId, task.id);
@@ -1700,7 +1861,7 @@ const createDependencySchema = z.object({
 projectsRouter.post('/:id/tasks/:taskId/dependencies', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
   const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
   const body = createDependencySchema.parse(req.body);
 
@@ -1775,7 +1936,7 @@ projectsRouter.delete(
   async (req, res) => {
     const ctx = getAuth(req);
     const projectId = param(req, 'id');
-    await getScopedProject(ctx, projectId);
+    await getScopedProject(req, projectId);
     const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
     const depId = param(req, 'depId');
 
@@ -1912,7 +2073,7 @@ async function resolveMentions(
 projectsRouter.get('/:id/tasks/:taskId/comments', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
   const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
 
   const rows = await db
@@ -1940,7 +2101,7 @@ const createCommentSchema = z.object({
 projectsRouter.post('/:id/tasks/:taskId/comments', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
   const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
   const body = createCommentSchema.parse(req.body);
 
@@ -2015,7 +2176,7 @@ projectsRouter.patch(
   async (req, res) => {
     const ctx = getAuth(req);
     const projectId = param(req, 'id');
-    await getScopedProject(ctx, projectId);
+    await getScopedProject(req, projectId);
     const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
     const comment = await getScopedComment(
       ctx,
@@ -2062,7 +2223,7 @@ projectsRouter.delete(
   async (req, res) => {
     const ctx = getAuth(req);
     const projectId = param(req, 'id');
-    await getScopedProject(ctx, projectId);
+    await getScopedProject(req, projectId);
     const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
     const comment = await getScopedComment(
       ctx,
@@ -2095,7 +2256,7 @@ projectsRouter.delete(
 projectsRouter.get('/:id/tasks/:taskId', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
   const taskRow = await getScopedTask(ctx, projectId, param(req, 'taskId'));
 
   const [enrichedTask] = await enrichTasks(ctx.agencyId, [taskRow]);
@@ -2195,7 +2356,7 @@ projectsRouter.get('/:id/tasks/:taskId', async (req, res) => {
 projectsRouter.get('/:id/milestones', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
 
   const rows = await db
     .select()
@@ -2226,7 +2387,7 @@ const createMilestoneSchema = z.object({
 projectsRouter.post('/:id/milestones', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
   const body = createMilestoneSchema.parse(req.body);
 
   const id = newId('pms');
@@ -2298,7 +2459,7 @@ const updateMilestoneSchema = z.object({
 projectsRouter.patch('/:id/milestones/:milestoneId', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
   const milestone = await getScopedMilestone(
     ctx,
     projectId,
@@ -2365,7 +2526,7 @@ projectsRouter.patch('/:id/milestones/:milestoneId', async (req, res) => {
 projectsRouter.delete('/:id/milestones/:milestoneId', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
   const milestone = await getScopedMilestone(
     ctx,
     projectId,
@@ -2402,7 +2563,7 @@ projectsRouter.delete('/:id/milestones/:milestoneId', async (req, res) => {
 projectsRouter.get('/:id/members', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
 
   const rows = await db
     .select({
@@ -2445,7 +2606,7 @@ const addMemberSchema = z.object({
 projectsRouter.post('/:id/members', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
   const body = addMemberSchema.parse(req.body);
   await requireAgencyUser(ctx, body.userId);
 
@@ -2511,7 +2672,7 @@ projectsRouter.post('/:id/members', async (req, res) => {
 projectsRouter.delete('/:id/members/:memberId', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
 
   const result = await db
     .delete(projectMembers)
@@ -2547,7 +2708,7 @@ projectsRouter.delete('/:id/members/:memberId', async (req, res) => {
 projectsRouter.get('/:id/timers', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
   ok(res, await listProjectTimers(ctx, projectId));
 });
 
@@ -2555,7 +2716,7 @@ projectsRouter.get('/:id/timers', async (req, res) => {
 projectsRouter.get('/:id/time-summary', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
 
   const [{ totalMinutes, logCount } = { totalMinutes: 0, logCount: 0 }] =
     await db
@@ -2633,7 +2794,7 @@ const projectLogsQuery = z.object({
 projectsRouter.get('/:id/time-logs', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
   const q = projectLogsQuery.parse(req.query);
 
   const rows = await db
@@ -2682,7 +2843,7 @@ projectsRouter.get('/:id/time-logs', async (req, res) => {
 projectsRouter.get('/:id/tasks/:taskId/time-logs', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
   const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
 
   const rows = await db
@@ -2817,7 +2978,7 @@ const activityQuery = z.object({
 projectsRouter.get('/:id/activity', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
   const q = activityQuery.parse(req.query);
   ok(res, await fetchProjectActivity(ctx, projectId, q.limit ?? 50));
 });
@@ -2829,7 +2990,7 @@ projectsRouter.get('/:id/activity', async (req, res) => {
 projectsRouter.get('/:id/overview', async (req, res) => {
   const ctx = getAuth(req);
   const projectId = param(req, 'id');
-  await getScopedProject(ctx, projectId);
+  await getScopedProject(req, projectId);
 
   // Tasks grouped by status.
   const taskStatusRows = await db

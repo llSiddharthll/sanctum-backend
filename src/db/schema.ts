@@ -104,7 +104,7 @@ export const users = sqliteTable(
     email: text('email').notNull(),
     passwordHash: text('password_hash').notNull(),
     fullName: text('full_name'),
-    role: text('role', { enum: ['owner', 'admin', 'member'] })
+    role: text('role', { enum: ['owner', 'admin', 'member', 'client'] })
       .notNull()
       .default('member'),
     // Module-level RBAC overrides: a JSON object of { moduleKey: accessLevel }.
@@ -113,6 +113,11 @@ export const users = sqliteTable(
     // Optional custom role (named permission preset). When set, the user's
     // `role` column holds the custom role's base tier. See custom_roles.
     customRoleId: text('custom_role_id'),
+    // For `client` role only: the brand this client login belongs to. NULL for
+    // agency staff. Project-level scope lives in `client_user_projects`.
+    // (Plain text — no drizzle `.references()` here on purpose: users↔clients
+    // would form a circular FK type and break inference. FK enforced in SQL.)
+    clientId: text('client_id'),
     status: text('status', { enum: ['active', 'disabled'] })
       .notNull()
       .default('active'),
@@ -147,9 +152,14 @@ export const invites = sqliteTable(
       .notNull()
       .references(() => agencies.id, { onDelete: 'cascade' }),
     email: text('email').notNull(),
-    role: text('role', { enum: ['admin', 'member'] })
+    role: text('role', { enum: ['admin', 'member', 'client'] })
       .notNull()
       .default('member'),
+    // For a `client` invite: the brand + (optional) project scope granted on
+    // accept. `projectScopeJson` = JSON array of projectIds; NULL/[] = all of
+    // the client's projects.
+    clientId: text('client_id'),
+    projectScopeJson: text('project_scope_json'),
     tokenHash: text('token_hash').notNull().unique(),
     invitedBy: text('invited_by').references(() => users.id, {
       onDelete: 'set null',
@@ -168,6 +178,33 @@ export const invites = sqliteTable(
     index('ix_invites_agency_status').on(tbl.agencyId, tbl.status),
   ],
 );
+
+// ============================================================
+//  CLIENT_USER_PROJECTS (per-project scope for a `client` login)
+//  A client user with NO rows here sees ALL of their client's projects;
+//  rows restrict them to exactly the listed projects.
+// ============================================================
+export const clientUserProjects = sqliteTable(
+  t('client_user_projects'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    projectId: text('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    createdAt: ts('created_at').notNull().default(now),
+  },
+  (tbl) => [
+    uniqueIndex('ux_client_user_projects').on(tbl.userId, tbl.projectId),
+    index('ix_client_user_projects_user').on(tbl.userId),
+  ],
+);
+export type ClientUserProject = typeof clientUserProjects.$inferSelect;
 
 // Single-use, short-lived password-reset tokens (sha256-hashed at rest).
 export const passwordResets = sqliteTable(
@@ -599,7 +636,7 @@ export const auditLog = sqliteTable(
       .notNull()
       .references(() => agencies.id, { onDelete: 'cascade' }),
     actorType: text('actor_type', {
-      enum: ['owner', 'admin', 'member', 'client_token', 'system'],
+      enum: ['owner', 'admin', 'member', 'client', 'client_token', 'system'],
     }).notNull(),
     actorId: text('actor_id'),
     action: text('action').notNull(),
@@ -1320,11 +1357,49 @@ export const documents = sqliteTable(
     uploadedBy: text('uploaded_by').references(() => users.id, {
       onDelete: 'set null',
     }),
+    // Optional folder this doc lives in (see document_folders). NULL = root.
+    // Plain text (no drizzle FK) to avoid documents↔folders circular inference.
+    folderId: text('folder_id'),
     createdAt: ts('created_at').notNull().default(now),
     updatedAt: ts('updated_at').notNull().default(now),
   },
   (tbl) => [index('ix_documents_agency_created').on(tbl.agencyId, tbl.createdAt)],
 );
+
+// ============================================================
+//  DOCUMENT FOLDERS (organize documents; nestable). client_visible mirrors the
+//  documents flag so a folder can be surfaced in the client portal.
+// ============================================================
+export const documentFolders = sqliteTable(
+  t('document_folders'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    // Self-referential parent (nestable). Plain text to avoid circular FK.
+    parentId: text('parent_id'),
+    clientId: text('client_id').references(() => clients.id, {
+      onDelete: 'cascade',
+    }),
+    projectId: text('project_id').references(() => projects.id, {
+      onDelete: 'cascade',
+    }),
+    clientVisible: integer('client_visible', { mode: 'boolean' })
+      .notNull()
+      .default(false),
+    createdBy: text('created_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [
+    index('ix_document_folders_agency_parent').on(tbl.agencyId, tbl.parentId),
+  ],
+);
+export type DocumentFolder = typeof documentFolders.$inferSelect;
 
 // ============================================================
 //  LEADS (inbound pipeline — a lead becomes a client on conversion)
@@ -1674,6 +1749,49 @@ export const attendanceRegularizations = sqliteTable(
 );
 
 // ============================================================
+//  ATTENDANCE CHECKOUT REQUESTS — when an employee checks out from OUTSIDE the
+//  office geofence, the checkout is held as a request that an owner/admin (or an
+//  attendance-manager) approves to finalize. Carries the intended checkout time
+//  + the out-of-range coordinates.
+// ============================================================
+export const attendanceCheckoutRequests = sqliteTable(
+  t('attendance_checkout_requests'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    day: text('day').notNull(), // YYYY-MM-DD (agency-tz day key)
+    requestedCheckOutAt: ts('requested_check_out_at').notNull(),
+    checkOutLat: real('check_out_lat'),
+    checkOutLng: real('check_out_lng'),
+    checkOutLocation: text('check_out_location'),
+    distanceM: integer('distance_m'), // metres from the office geofence centre
+    reason: text('reason'),
+    status: text('status', {
+      enum: ['pending', 'approved', 'rejected', 'cancelled'],
+    })
+      .notNull()
+      .default('pending'),
+    decidedBy: text('decided_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    decidedAt: ts('decided_at'),
+    decisionNote: text('decision_note'),
+    createdAt: ts('created_at').notNull().default(now),
+  },
+  (tbl) => [
+    index('ix_checkout_req_agency_status').on(tbl.agencyId, tbl.status),
+    index('ix_checkout_req_agency_user').on(tbl.agencyId, tbl.userId),
+  ],
+);
+export type AttendanceCheckoutRequest =
+  typeof attendanceCheckoutRequests.$inferSelect;
+
+// ============================================================
 //  NOTIFICATIONS (in-app alerts; realtime over Socket.IO)
 // ============================================================
 export const notifications = sqliteTable(
@@ -1895,6 +2013,179 @@ export const customRoles = sqliteTable(
   ],
 );
 
+// ============================================================
+//  PROPOSAL_TEMPLATES (reusable proposal structures)
+// ============================================================
+export const proposalTemplates = sqliteTable(
+  t('proposal_templates'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    category: text('category').notNull().default('general'),
+    description: text('description'),
+    contentJson: text('content_json').notNull(),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [
+    index('ix_proposal_templates_agency').on(tbl.agencyId),
+  ],
+);
+
+// ============================================================
+//  PROPOSALS (client/lead pitches & scope documents)
+// ============================================================
+export const proposals = sqliteTable(
+  t('proposals'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    clientId: text('client_id').references(() => clients.id, {
+      onDelete: 'set null',
+    }),
+    leadId: text('lead_id').references(() => leads.id, {
+      onDelete: 'set null',
+    }),
+    templateId: text('template_id').references(() => proposalTemplates.id, {
+      onDelete: 'set null',
+    }),
+    proposalNumber: text('proposal_number'),
+    title: text('title').notNull(),
+    status: text('status', {
+      enum: [
+        'draft',
+        'sent',
+        'viewed',
+        'accepted',
+        'rejected',
+        'expired',
+        'converted',
+      ],
+    })
+      .notNull()
+      .default('draft'),
+    currency: text('currency').notNull().default('INR'),
+    subtotalPaise: integer('subtotal_paise').notNull().default(0),
+    taxPaise: integer('tax_paise').notNull().default(0),
+    totalPaise: integer('total_paise').notNull().default(0),
+    validUntil: ts('valid_until'),
+    contentJson: text('content_json').notNull(),
+    token: text('token'),
+    sentAt: ts('sent_at'),
+    viewedAt: ts('viewed_at'),
+    acceptedAt: ts('accepted_at'),
+    acceptedBy: text('accepted_by'),
+    rejectedAt: ts('rejected_at'),
+    rejectionReason: text('rejection_reason'),
+    convertedAgreementId: text('converted_agreement_id'),
+    createdBy: text('created_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [
+    uniqueIndex('ux_proposals_agency_number').on(
+      tbl.agencyId,
+      tbl.proposalNumber,
+    ),
+    index('ix_proposals_agency').on(tbl.agencyId),
+    index('ix_proposals_agency_client').on(tbl.agencyId, tbl.clientId),
+    index('ix_proposals_agency_lead').on(tbl.agencyId, tbl.leadId),
+    index('ix_proposals_token').on(tbl.token),
+  ],
+);
+
+// ============================================================
+//  AGREEMENT_TEMPLATES (legal contract clauses & structures)
+// ============================================================
+export const agreementTemplates = sqliteTable(
+  t('agreement_templates'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    type: text('type', {
+      enum: ['msa', 'retainer', 'sow', 'nda', 'custom'],
+    })
+      .notNull()
+      .default('msa'),
+    description: text('description'),
+    termsJson: text('terms_json').notNull(),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [
+    index('ix_agreement_templates_agency').on(tbl.agencyId),
+  ],
+);
+
+// ============================================================
+//  AGREEMENTS (signed client contracts & legally binding terms)
+// ============================================================
+export const agreements = sqliteTable(
+  t('agreements'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    clientId: text('client_id')
+      .notNull()
+      .references(() => clients.id, { onDelete: 'cascade' }),
+    proposalId: text('proposal_id').references(() => proposals.id, {
+      onDelete: 'set null',
+    }),
+    projectId: text('project_id').references(() => projects.id, {
+      onDelete: 'set null',
+    }),
+    templateId: text('template_id').references(() => agreementTemplates.id, {
+      onDelete: 'set null',
+    }),
+    agreementNumber: text('agreement_number'),
+    title: text('title').notNull(),
+    status: text('status', {
+      enum: ['draft', 'sent', 'signed', 'active', 'terminated', 'expired'],
+    })
+      .notNull()
+      .default('draft'),
+    effectiveDate: ts('effective_date'),
+    expirationDate: ts('expiration_date'),
+    retainerPaise: integer('retainer_paise').default(0),
+    totalValuePaise: integer('total_value_paise').default(0),
+    currency: text('currency').notNull().default('INR'),
+    termsJson: text('terms_json').notNull(),
+    token: text('token'),
+    sentAt: ts('sent_at'),
+    signedAt: ts('signed_at'),
+    signerName: text('signer_name'),
+    signerEmail: text('signer_email'),
+    signerIp: text('signer_ip'),
+    signatureDataUrl: text('signature_data_url'),
+    createdBy: text('created_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [
+    uniqueIndex('ux_agreements_agency_number').on(
+      tbl.agencyId,
+      tbl.agreementNumber,
+    ),
+    index('ix_agreements_agency').on(tbl.agencyId),
+    index('ix_agreements_agency_client').on(tbl.agencyId, tbl.clientId),
+    index('ix_agreements_token').on(tbl.token),
+  ],
+);
+
 // ---- Inferred row types (handy across the app) ----
 export type Agency = typeof agencies.$inferSelect;
 export type User = typeof users.$inferSelect;
@@ -1932,3 +2223,7 @@ export type ClientNote = typeof clientNotes.$inferSelect;
 export type Deal = typeof deals.$inferSelect;
 export type ClientTag = typeof clientTags.$inferSelect;
 export type CustomRole = typeof customRoles.$inferSelect;
+export type ProposalTemplate = typeof proposalTemplates.$inferSelect;
+export type Proposal = typeof proposals.$inferSelect;
+export type AgreementTemplate = typeof agreementTemplates.$inferSelect;
+export type Agreement = typeof agreements.$inferSelect;

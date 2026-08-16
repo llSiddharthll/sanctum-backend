@@ -162,6 +162,27 @@
       "when": 1783209769797,
       "tag": "0022_outstanding_valeria_richards",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "6",
+      "when": 1786657600491,
+      "tag": "0023_curly_shinko_yamashiro",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "6",
+      "when": 1786728060624,
+      "tag": "0024_silly_jamie_braddock",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "6",
+      "when": 1786910718964,
+      "tag": "0025_cynical_alice",
+      "breakpoints": true
     }
   ]
 }

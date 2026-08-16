@@ -2,7 +2,13 @@ import { db } from '../db/client.js';
 import { auditLog } from '../db/schema.js';
 import { newId } from '../lib/ids.js';
 
-type ActorType = 'owner' | 'admin' | 'member' | 'client_token' | 'system';
+type ActorType =
+  | 'owner'
+  | 'admin'
+  | 'member'
+  | 'client'
+  | 'client_token'
+  | 'system';
 
 /** Append a security-relevant event. Best-effort; never throws to the caller. */
 export async function audit(input: {

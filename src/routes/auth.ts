@@ -17,6 +17,7 @@ import {
   signAccessToken,
   signRefreshToken,
   verifyRefreshToken,
+  type Role,
 } from '../lib/jwt.js';
 import { setAuthCookies, clearAuthCookies } from '../lib/cookies.js';
 import { ok, created } from '../lib/http.js';
@@ -51,12 +52,18 @@ function slugify(name: string): string {
 
 async function issueSession(
   res: import('express').Response,
-  user: { id: string; agencyId: string; role: 'owner' | 'admin' | 'member' },
+  user: {
+    id: string;
+    agencyId: string;
+    role: Role;
+    clientId?: string | null;
+  },
 ): Promise<{ access: string; refresh: string }> {
   const access = await signAccessToken({
     userId: user.id,
     agencyId: user.agencyId,
     role: user.role,
+    clientId: user.clientId ?? null,
   });
   const refresh = await signRefreshToken({
     userId: user.id,
@@ -198,6 +205,7 @@ authRouter.post('/login', authLimiter, async (req, res) => {
     id: user.id,
     agencyId: user.agencyId,
     role: user.role,
+    clientId: user.clientId,
   });
   await audit({
     agencyId: user.agencyId,
@@ -315,6 +323,7 @@ authRouter.post('/accept-invite', authLimiter, async (req, res) => {
     id: member.id,
     agencyId: member.agencyId,
     role: member.role,
+    clientId: member.clientId,
   });
   await audit({
     agencyId: member.agencyId,
@@ -603,7 +612,31 @@ authRouter.get('/me', requireAuth, async (req, res) => {
     customRole = cr ?? null;
   }
   const builtinLabel =
-    user.role === 'owner' ? 'Owner' : user.role === 'admin' ? 'Admin' : 'Member';
+    user.role === 'owner'
+      ? 'Owner'
+      : user.role === 'admin'
+        ? 'Admin'
+        : user.role === 'client'
+          ? 'Client'
+          : 'Member';
+
+  // Effective module permissions for sidebar/route gating on the client
+  // (user override > custom role > agency role default > built-in default).
+  const permissions = resolvePermissions(
+    user.role,
+    user.permissionsJson,
+    agency?.rolePermissionsJson ?? null,
+    customRole?.permissionsJson ?? null,
+  );
+
+  // Persona drives the role-specific dashboards + client redirect. Manager vs
+  // employee is a member-tier split: a manager can manage projects (the Manager
+  // preset grants projects:manage), an employee cannot.
+  let persona: 'owner' | 'admin' | 'manager' | 'employee' | 'client';
+  if (user.role === 'owner') persona = 'owner';
+  else if (user.role === 'admin') persona = 'admin';
+  else if (user.role === 'client') persona = 'client';
+  else persona = permissions.projects === 'manage' ? 'manager' : 'employee';
 
   ok(res, {
     user: {
@@ -613,7 +646,10 @@ authRouter.get('/me', requireAuth, async (req, res) => {
       role: user.role,
       customRoleId: user.customRoleId,
       roleName: customRole?.name ?? builtinLabel,
+      clientId: user.clientId ?? null,
+      persona,
     },
+    persona,
     agency: agency
       ? {
           id: agency.id,
@@ -630,13 +666,6 @@ authRouter.get('/me', requireAuth, async (req, res) => {
           maxAiGenerations: plan.maxAiGenerations,
         }
       : null,
-    // Effective module permissions for sidebar/route gating on the client
-    // (user override > custom role > agency role default > built-in default).
-    permissions: resolvePermissions(
-      user.role,
-      user.permissionsJson,
-      agency?.rolePermissionsJson ?? null,
-      customRole?.permissionsJson ?? null,
-    ),
+    permissions,
   });
 });

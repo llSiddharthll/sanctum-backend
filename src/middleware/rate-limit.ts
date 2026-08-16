@@ -4,8 +4,11 @@ function envelope(code: string, message: string) {
   return { error: { code, message } };
 }
 
-/** Skip rate limiting under the automated test runner (NODE_ENV=test). */
-const skipInTest = () => process.env.NODE_ENV === 'test';
+/**
+ * Skip rate limiting outside production — i.e. under the automated test runner
+ * AND in local development. Production (NODE_ENV=production) keeps every limit.
+ */
+const skipInTest = () => process.env.NODE_ENV !== 'production';
 
 /**
  * Numeric rate-limit configuration — the single source of truth for both the

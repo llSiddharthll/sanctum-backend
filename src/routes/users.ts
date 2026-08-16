@@ -7,6 +7,8 @@ import {
   attendanceRecords,
   auditLog,
   clientAssignments,
+  clients,
+  clientUserProjects,
   customRoles,
   invites,
   projectMembers,
@@ -19,11 +21,11 @@ import { dayKeyInTz } from '../lib/attendance.js';
 import { loadPolicy } from '../services/attendance.js';
 import { ok, created, toIso, param } from '../lib/http.js';
 import { newId, newOpaqueToken } from '../lib/ids.js';
-import { conflict, forbidden, notFound } from '../lib/errors.js';
+import { badRequest, conflict, forbidden, notFound } from '../lib/errors.js';
 import { hashPassword } from '../lib/password.js';
-import { requireAuth, requireRole } from '../middleware/auth.js';
+import { requireAuth, requireRole, canManageRole } from '../middleware/auth.js';
 import { getAuth, isPrivileged, requireClientAccess } from '../middleware/tenant.js';
-import { requireModuleRW } from '../middleware/permissions.js';
+import { requireModuleRW, loadPermissions } from '../middleware/permissions.js';
 import { audit } from '../services/audit.js';
 import { sendTeamInvite } from '../services/email.js';
 import { createPasswordReset } from '../services/password-reset.js';
@@ -32,7 +34,31 @@ import {
   serializeOverrides,
   sanitizeOverrides,
   parseOverrides,
+  meetsLevel,
+  type ModuleKey,
+  type AccessLevel,
 } from '../lib/permissions.js';
+
+/**
+ * A non-owner caller may not grant a module level above their OWN effective
+ * access for that module (prevents privilege escalation via the permission map).
+ * Throws 403 on the first violation.
+ */
+async function assertPermissionCeiling(
+  req: import('express').Request,
+  callerRole: string,
+  permissions: Record<string, string> | undefined,
+): Promise<void> {
+  if (!permissions || callerRole === 'owner') return;
+  const callerPerms = await loadPermissions(req);
+  for (const [mod, lvl] of Object.entries(sanitizeOverrides(permissions))) {
+    if (!meetsLevel(callerPerms[mod as ModuleKey], lvl as AccessLevel)) {
+      throw forbidden(
+        `You cannot grant more access to ${mod} than you have yourself.`,
+      );
+    }
+  }
+}
 import crypto from 'node:crypto';
 
 import { getFrontendOrigin } from '../lib/frontend-url.js';
@@ -103,7 +129,7 @@ type MemberBaseRow = {
   id: string;
   email: string;
   fullName: string | null;
-  role: 'owner' | 'admin' | 'member';
+  role: 'owner' | 'admin' | 'member' | 'client';
   status: 'active' | 'disabled';
   lastLoginAt: Date | null;
   designation: string | null;
@@ -117,8 +143,11 @@ type MemberBaseRow = {
   createdAt: Date | null;
 };
 
-function builtinRoleLabel(role: 'owner' | 'admin' | 'member'): string {
-  return role === 'owner' ? 'Owner' : role === 'admin' ? 'Admin' : 'Member';
+function builtinRoleLabel(role: MemberBaseRow['role']): string {
+  if (role === 'owner') return 'Owner';
+  if (role === 'admin') return 'Admin';
+  if (role === 'client') return 'Client';
+  return 'Member';
 }
 
 /** Common profile fields shared by list rows and the detail view. */
@@ -127,6 +156,7 @@ function profileFields(
   roleDefaults?: string | null,
   customRolePermsJson?: string | null,
   customRoleName?: string | null,
+  showFinance = true,
 ) {
   return {
     id: u.id,
@@ -140,7 +170,8 @@ function profileFields(
     designation: u.designation,
     department: u.department,
     phone: u.phone,
-    hourlyRate: u.hourlyRate,
+    // Pay rate is money — hidden from non-finance roles (managers/employees).
+    hourlyRate: showFinance ? u.hourlyRate : null,
     weeklyCapacityHrs: u.weeklyCapacityHrs ?? 0,
     skills: parseSkills(u.skills),
     // Effective: user override > custom role > agency role default > built-in.
@@ -180,7 +211,9 @@ usersRouter.get('/', async (req, res) => {
   const q = listQuery.parse(req.query);
   const weekStart = startOfWeek();
 
-  const filters = [eq(users.agencyId, ctx.agencyId)];
+  // Staff only — client-login users are NOT agency team members; they're listed
+  // separately (GET /team/client-users) and live under the Clients module.
+  const filters = [eq(users.agencyId, ctx.agencyId), ne(users.role, 'client')];
   if (q.role) filters.push(eq(users.role, q.role));
   if (q.activeOnly === true || q.activeOnly === 'true') {
     filters.push(eq(users.status, 'active'));
@@ -302,6 +335,7 @@ usersRouter.get('/', async (req, res) => {
     }
   }
 
+  const showFinance = meetsLevel((await loadPermissions(req)).finance, 'view');
   ok(
     res,
     baseRows.map((u) => {
@@ -313,6 +347,7 @@ usersRouter.get('/', async (req, res) => {
           roleDefaults,
           u.customRolePermsJson,
           u.customRoleName,
+          showFinance,
         ),
         activeTaskCount: taskCount.get(u.id) ?? 0,
         projectCount: projectIds.get(u.id)?.size ?? 0,
@@ -336,26 +371,134 @@ usersRouter.get('/', async (req, res) => {
 });
 
 // ============================================================
+//  GET /team/client-users — client-login accounts (role='client'), listed
+//  SEPARATELY from staff. These are portal logins for a brand, not team members.
+// ============================================================
+usersRouter.get(
+  '/client-users',
+  requireRole('owner', 'admin'),
+  async (req, res) => {
+    const ctx = getAuth(req);
+    const rows = await db
+      .select({
+        id: users.id,
+        fullName: users.fullName,
+        email: users.email,
+        status: users.status,
+        lastLoginAt: users.lastLoginAt,
+        clientId: users.clientId,
+        clientName: clients.name,
+        createdAt: users.createdAt,
+      })
+      .from(users)
+      .leftJoin(clients, eq(clients.id, users.clientId))
+      .where(and(eq(users.agencyId, ctx.agencyId), eq(users.role, 'client')))
+      .orderBy(desc(users.createdAt));
+
+    const ids = rows.map((r) => r.id);
+    const scopeCount = new Map<string, number>();
+    if (ids.length) {
+      const sc = await db
+        .select({
+          userId: clientUserProjects.userId,
+          n: sql<number>`count(*)`,
+        })
+        .from(clientUserProjects)
+        .where(
+          and(
+            eq(clientUserProjects.agencyId, ctx.agencyId),
+            inArray(clientUserProjects.userId, ids),
+          ),
+        )
+        .groupBy(clientUserProjects.userId);
+      for (const r of sc) scopeCount.set(r.userId, Number(r.n));
+    }
+
+    ok(
+      res,
+      rows.map((r) => ({
+        id: r.id,
+        fullName: r.fullName,
+        email: r.email,
+        status: r.status,
+        lastLoginAt: toIso(r.lastLoginAt),
+        clientId: r.clientId,
+        clientName: r.clientName,
+        // 0 = scoped to ALL of the brand's projects; N = restricted to N projects.
+        projectScope: scopeCount.get(r.id) ?? 0,
+        joinedAt: toIso(r.createdAt),
+      })),
+    );
+  },
+);
+
+// ============================================================
 //  POST /team/invite — create a real (active) member + an invite token
 // ============================================================
-const inviteSchema = z.object({
-  fullName: z.string().trim().min(1).max(120),
-  email: z.string().email(),
-  role: z.enum(['admin', 'member']).default('member'),
-  phone: z.string().trim().max(40).optional(),
-  designation: z.string().trim().max(120).optional(),
-  department: z.string().trim().max(120).optional(),
-  hourlyRate: z.number().int().min(0).optional(),
-  weeklyCapacityHrs: z.number().int().min(0).max(168).optional(),
-  skills: z.union([z.string(), z.array(z.string())]).optional(),
-  // Optional module permission overrides ({ moduleKey: 'none'|'view'|'manage' }).
-  permissions: z.record(z.string(), z.string()).optional(),
-});
+const inviteSchema = z
+  .object({
+    fullName: z.string().trim().min(1).max(120),
+    email: z.string().email(),
+    role: z.enum(['admin', 'member', 'client']).default('member'),
+    // Client invites: the brand + optional project scope (empty = all the
+    // client's projects). Ignored for staff invites.
+    clientId: z.string().min(1).optional(),
+    projectIds: z.array(z.string().min(1)).max(200).optional(),
+    phone: z.string().trim().max(40).optional(),
+    designation: z.string().trim().max(120).optional(),
+    department: z.string().trim().max(120).optional(),
+    hourlyRate: z.number().int().min(0).optional(),
+    weeklyCapacityHrs: z.number().int().min(0).max(168).optional(),
+    skills: z.union([z.string(), z.array(z.string())]).optional(),
+    // Optional module permission overrides ({ moduleKey: 'none'|'view'|'manage' }).
+    permissions: z.record(z.string(), z.string()).optional(),
+  })
+  .refine((d) => d.role !== 'client' || !!d.clientId, {
+    message: 'A client invite requires a clientId.',
+    path: ['clientId'],
+  });
 
 usersRouter.post('/invite', requireRole('owner', 'admin'), async (req, res) => {
   const ctx = getAuth(req);
   const body = inviteSchema.parse(req.body);
   const email = body.email.toLowerCase();
+
+  // A non-owner may only invite roles strictly below their own tier (an admin
+  // can invite managers/employees, but not another admin or an owner).
+  if (ctx.role !== 'owner' && !canManageRole(ctx.role, body.role)) {
+    throw forbidden('You cannot invite a member at or above your own role.');
+  }
+  await assertPermissionCeiling(req, ctx.role, body.permissions);
+
+  // Client-invite validation: the brand must belong to this agency, and any
+  // project scope must belong to that brand. Empty scope = all of its projects.
+  let clientScopeProjectIds: string[] = [];
+  if (body.role === 'client') {
+    const [brand] = await db
+      .select({ id: clients.id })
+      .from(clients)
+      .where(
+        and(eq(clients.id, body.clientId!), eq(clients.agencyId, ctx.agencyId)),
+      )
+      .limit(1);
+    if (!brand) throw notFound('Client not found.');
+    if (body.projectIds && body.projectIds.length) {
+      const rows = await db
+        .select({ id: projects.id })
+        .from(projects)
+        .where(
+          and(
+            eq(projects.agencyId, ctx.agencyId),
+            eq(projects.clientId, body.clientId!),
+            inArray(projects.id, body.projectIds),
+          ),
+        );
+      clientScopeProjectIds = rows.map((r) => r.id);
+      if (clientScopeProjectIds.length !== body.projectIds.length) {
+        throw badRequest('One or more projects do not belong to this client.');
+      }
+    }
+  }
 
   // Enforce the unique (agencyId, lower(email)) up front for a clean 409.
   const [existing] = await db
@@ -378,6 +521,7 @@ usersRouter.post('/invite', requireRole('owner', 'admin'), async (req, res) => {
     ? serializeOverrides(body.permissions)
     : null;
 
+  const isClient = body.role === 'client';
   await db.insert(users).values({
     id: userId,
     agencyId: ctx.agencyId,
@@ -386,6 +530,7 @@ usersRouter.post('/invite', requireRole('owner', 'admin'), async (req, res) => {
     fullName: body.fullName,
     role: body.role,
     status: 'active',
+    clientId: isClient ? body.clientId! : null,
     phone: body.phone ?? null,
     designation: body.designation ?? null,
     department: body.department ?? null,
@@ -394,8 +539,21 @@ usersRouter.post('/invite', requireRole('owner', 'admin'), async (req, res) => {
       ? { weeklyCapacityHrs: body.weeklyCapacityHrs }
       : {}),
     skills: skillsToCsv(body.skills) ?? null,
-    permissionsJson,
+    // Clients have no module permissions (resolvePermissions returns noAccess).
+    permissionsJson: isClient ? null : permissionsJson,
   });
+
+  // Per-project scope for a client login (empty = all the brand's projects).
+  if (isClient && clientScopeProjectIds.length) {
+    await db.insert(clientUserProjects).values(
+      clientScopeProjectIds.map((projectId) => ({
+        id: newId('cup'),
+        agencyId: ctx.agencyId,
+        userId,
+        projectId,
+      })),
+    );
+  }
 
   // Pending invite row (token) — best-effort accept flow.
   const { raw, hash } = newOpaqueToken();
@@ -405,6 +563,11 @@ usersRouter.post('/invite', requireRole('owner', 'admin'), async (req, res) => {
     agencyId: ctx.agencyId,
     email,
     role: body.role,
+    clientId: isClient ? body.clientId! : null,
+    projectScopeJson:
+      isClient && clientScopeProjectIds.length
+        ? JSON.stringify(clientScopeProjectIds)
+        : null,
     tokenHash: hash,
     invitedBy: ctx.userId,
     status: 'pending',
@@ -620,12 +783,14 @@ usersRouter.get('/:userId', async (req, res) => {
   const checkInAt = todayRec ? toIso(todayRec.checkInAt) : null;
   const checkOutAt = todayRec ? toIso(todayRec.checkOutAt) : null;
 
+  const showFinance = meetsLevel((await loadPermissions(req)).finance, 'view');
   ok(res, {
     ...profileFields(
       u as MemberBaseRow,
       roleDefaults,
       u.customRolePermsJson,
       u.customRoleName,
+      showFinance,
     ),
     checkedInToday,
     checkInAt,
@@ -689,7 +854,8 @@ async function loggedMinutesThisWeekForUser(
 //  PATCH /team/:userId — role/status + profile (owner/admin)
 // ============================================================
 const patchSchema = z.object({
-  role: z.enum(['admin', 'member']).optional(),
+  // 'owner' is accepted but runtime-guarded: only an owner may grant it.
+  role: z.enum(['owner', 'admin', 'member']).optional(),
   // Assign a custom role (sets the user's tier to the role's baseRole); null
   // clears it back to the built-in role.
   customRoleId: z.string().nullable().optional(),
@@ -722,16 +888,44 @@ usersRouter.patch(
       )
       .limit(1);
     if (!target) throw notFound('User not found.');
-    // The owner's role/status/permissions can never be changed (always full).
-    if (
-      target.role === 'owner' &&
-      (body.role !== undefined ||
-        body.customRoleId !== undefined ||
-        body.status !== undefined ||
-        body.permissions !== undefined)
-    ) {
+
+    const isSelf = target.id === ctx.userId;
+    const touchesPrivilege =
+      body.role !== undefined ||
+      body.customRoleId !== undefined ||
+      body.status !== undefined ||
+      body.permissions !== undefined;
+
+    // (1) No one may change their OWN role/permissions/status — the exact hole
+    // that let a manager self-promote to admin. Profile edits on self are fine.
+    if (isSelf && touchesPrivilege) {
+      throw forbidden(
+        'You cannot change your own role, permissions, or status.',
+      );
+    }
+    // (2) The owner is immutable (never demoted/edited by anyone).
+    if (target.role === 'owner' && touchesPrivilege) {
       throw conflict('Cannot modify the owner.');
     }
+    // (3) Rank ceiling: a non-owner may only manage users STRICTLY below their
+    // own tier (admins cannot touch other admins; nobody but owner touches owner).
+    if (touchesPrivilege && ctx.role !== 'owner' && !canManageRole(ctx.role, target.role)) {
+      throw forbidden('You cannot modify a member at or above your own role.');
+    }
+    // (4) Only the owner may grant the owner role.
+    if (body.role === 'owner' && ctx.role !== 'owner') {
+      throw forbidden('Only the owner can grant the owner role.');
+    }
+    // (5) A non-owner may not assign a built-in role at/above their own tier.
+    if (
+      ctx.role !== 'owner' &&
+      body.role !== undefined &&
+      !canManageRole(ctx.role, body.role)
+    ) {
+      throw forbidden('You cannot assign a role at or above your own.');
+    }
+    // (6) Permission-map ceiling.
+    await assertPermissionCeiling(req, ctx.role, body.permissions);
 
     const patch: Partial<typeof users.$inferInsert> = { updatedAt: new Date() };
     // Role assignment: a custom role sets the tier from its baseRole; a built-in
@@ -749,6 +943,13 @@ usersRouter.patch(
           )
           .limit(1);
         if (!cr) throw notFound('Custom role not found.');
+        // A non-owner cannot assign a custom role whose base tier is at/above
+        // their own (an admin can't mint an admin-tier role).
+        if (ctx.role !== 'owner' && !canManageRole(ctx.role, cr.baseRole)) {
+          throw forbidden(
+            'You cannot assign a role at or above your own tier.',
+          );
+        }
         patch.customRoleId = cr.id;
         patch.role = cr.baseRole;
         // The role's preset now drives — clear any personal overrides.
@@ -809,8 +1010,15 @@ usersRouter.delete(
       .where(and(eq(users.id, userId), eq(users.agencyId, ctx.agencyId)))
       .limit(1);
     if (!target) throw notFound('Member not found.');
+    if (target.id === ctx.userId) {
+      throw forbidden('You cannot delete your own account.');
+    }
     if (target.role === 'owner') {
       throw conflict('Cannot delete the owner.');
+    }
+    // A non-owner may only delete members strictly below their tier.
+    if (ctx.role !== 'owner' && !canManageRole(ctx.role, target.role)) {
+      throw forbidden('You cannot delete a member at or above your own role.');
     }
 
     // FK behavior handles the rest: project_members/client_assignments/
@@ -848,11 +1056,17 @@ usersRouter.post(
         email: users.email,
         fullName: users.fullName,
         status: users.status,
+        role: users.role,
       })
       .from(users)
       .where(and(eq(users.id, userId), eq(users.agencyId, ctx.agencyId)))
       .limit(1);
     if (!member) throw notFound('Member not found.');
+    // Only the owner can reset another owner; a non-owner can only reset members
+    // strictly below their tier (or themselves).
+    if (member.id !== ctx.userId && ctx.role !== 'owner' && !canManageRole(ctx.role, member.role)) {
+      throw forbidden('You cannot reset this member’s password.');
+    }
     if (member.status !== 'active') {
       throw conflict('This member is not active.');
     }

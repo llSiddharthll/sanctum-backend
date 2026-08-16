@@ -1,16 +1,25 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, desc, eq, gte, lte, sum } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, lte, ne, sum } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { expenses } from '../db/schema.js';
-import { ok } from '../lib/http.js';
-import { requireAuth } from '../middleware/auth.js';
+import {
+  clients,
+  deals,
+  expenses,
+  invoicePayments,
+  invoices,
+} from '../db/schema.js';
+import { ok, param } from '../lib/http.js';
+import { notFound } from '../lib/errors.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
 import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth } from '../middleware/tenant.js';
 
 export const financeRouter = Router();
 financeRouter.use(requireAuth);
 financeRouter.use(requireModuleRW('finance'));
+// Money is owner ONLY — hard role backstop so nobody except the owner can reach financial data.
+financeRouter.use(requireRole('owner'));
 
 /**
  * GET /finance/overview?from&to
@@ -81,5 +90,71 @@ financeRouter.get('/overview', async (req, res) => {
     expenses: expensesTotal, // paise
     netProfit, // paise
     expensesByCategory,
+  });
+});
+
+/**
+ * GET /finance/clients/:clientId — a single client's financial rollup (owner/
+ * admin only, inherited from the router gates). All money = INTEGER PAISE.
+ * Surfaced on the client detail page's Financials section.
+ */
+financeRouter.get('/clients/:clientId', async (req, res) => {
+  const ctx = getAuth(req);
+  const clientId = param(req, 'clientId');
+
+  const [client] = await db
+    .select({ id: clients.id, name: clients.name })
+    .from(clients)
+    .where(and(eq(clients.id, clientId), eq(clients.agencyId, ctx.agencyId)))
+    .limit(1);
+  if (!client) throw notFound('Client not found.');
+
+  // Invoices for this client (exclude cancelled from billed).
+  const inv = await db
+    .select({ id: invoices.id, total: invoices.total, status: invoices.status })
+    .from(invoices)
+    .where(
+      and(
+        eq(invoices.agencyId, ctx.agencyId),
+        eq(invoices.clientId, clientId),
+        ne(invoices.status, 'cancelled'),
+      ),
+    );
+  const billed = inv.reduce((a, r) => a + Number(r.total ?? 0), 0);
+  const invoiceIds = inv.map((r) => r.id);
+  let paid = 0;
+  if (invoiceIds.length) {
+    const [payRow] = await db
+      .select({ v: sum(invoicePayments.amount) })
+      .from(invoicePayments)
+      .where(inArray(invoicePayments.invoiceId, invoiceIds));
+    paid = Number(payRow?.v ?? 0);
+  }
+
+  const [expRow] = await db
+    .select({ v: sum(expenses.amount) })
+    .from(expenses)
+    .where(
+      and(eq(expenses.agencyId, ctx.agencyId), eq(expenses.clientId, clientId)),
+    );
+  const expensesTotal = Number(expRow?.v ?? 0);
+
+  const [dealRow] = await db
+    .select({ v: sum(deals.valuePaise) })
+    .from(deals)
+    .where(
+      and(eq(deals.agencyId, ctx.agencyId), eq(deals.clientId, clientId)),
+    );
+  const dealPipelineValue = Number(dealRow?.v ?? 0);
+
+  ok(res, {
+    clientId: client.id,
+    clientName: client.name,
+    invoiceCount: inv.length,
+    billed, // paise
+    paid, // paise
+    outstanding: Math.max(0, billed - paid), // paise
+    expenses: expensesTotal, // paise
+    dealPipelineValue, // paise
   });
 });

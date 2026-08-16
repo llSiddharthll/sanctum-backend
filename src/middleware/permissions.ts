@@ -8,6 +8,7 @@ import {
   resolvePermissions,
   meetsLevel,
   fullAccess,
+  noAccess,
   MODULE_LABELS,
   type AccessLevel,
   type ModuleKey,
@@ -51,6 +52,9 @@ export async function loadPermissions(req: Request): Promise<PermissionMap> {
   let perms: PermissionMap;
   if (ctx.role === 'owner') {
     perms = fullAccess();
+  } else if (ctx.role === 'client') {
+    // Clients are not agency staff — zero access to every agency module.
+    perms = noAccess();
   } else {
     // One indexed lookup: the user's overrides + agency role defaults + the
     // user's custom role permissions (if any).

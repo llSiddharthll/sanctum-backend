@@ -21,8 +21,18 @@ import { ok, created, toIso, param } from '../lib/http.js';
 import { newId, newOpaqueToken } from '../lib/ids.js';
 import { conflict, notFound, quotaExceeded } from '../lib/errors.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
-import { requireModuleRW } from '../middleware/permissions.js';
-import { getAuth, requireClientAccess } from '../middleware/tenant.js';
+import {
+  requireModuleRW,
+  requireModule,
+  loadPermissions,
+} from '../middleware/permissions.js';
+import { meetsLevel } from '../lib/permissions.js';
+import {
+  getAuth,
+  requireClientAccess,
+  isPrivileged,
+  assignedClientIds,
+} from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
 import { sendPortalWelcome } from '../services/email.js';
 import { getFrontendOrigin } from '../lib/frontend-url.js';
@@ -71,15 +81,35 @@ function safeJson(s: string): unknown {
   }
 }
 
-// GET /clients — list (owner/admin: all; member: assigned).
+// GET /clients — list. Owner/admin and clients-managers (attendance-style
+// "manage" level) see every client; a plain member (Employee tier) sees only
+// the clients they're assigned to.
 clientsRouter.get('/', async (req, res) => {
   const ctx = getAuth(req);
-  // Access is governed by the 'clients' module permission (the router gate);
-  // every teammate who can view the module sees all of the agency's clients.
+  const perms = await loadPermissions(req);
+  const seeAll = isPrivileged(ctx.role) || meetsLevel(perms.clients, 'manage');
+
+  if (seeAll) {
+    const rows = await db
+      .select()
+      .from(clients)
+      .where(eq(clients.agencyId, ctx.agencyId));
+    ok(res, rows.map(serializeClient));
+    return;
+  }
+
+  // Scoped members: only their assigned clients.
+  const ids = await assignedClientIds(ctx);
+  if (ids.length === 0) {
+    ok(res, []);
+    return;
+  }
   const rows = await db
     .select()
     .from(clients)
-    .where(eq(clients.agencyId, ctx.agencyId));
+    .where(
+      and(eq(clients.agencyId, ctx.agencyId), inArray(clients.id, ids)),
+    );
   ok(res, rows.map(serializeClient));
 });
 
@@ -133,7 +163,9 @@ const createSchema = z.object({
   isActive: z.boolean().optional(),
 });
 
-clientsRouter.post('/', requireRole('owner', 'admin'), async (req, res) => {
+// Create is governed by the 'clients' module (edit tier via the router gate),
+// so managers with clients access can add clients — not just owner/admin.
+clientsRouter.post('/', async (req, res) => {
   const ctx = getAuth(req);
   const body = createSchema.parse(req.body);
 
@@ -297,14 +329,16 @@ clientsRouter.get('/:clientId', async (req, res) => {
       ),
     );
 
+  const isOwner = ctx.role === 'owner';
+
   ok(res, {
     ...serializeClient(client),
     ownerName,
     tags,
     projectCount: pc?.value ?? 0,
-    invoiceCount: ic?.value ?? 0,
+    invoiceCount: isOwner ? (ic?.value ?? 0) : 0,
     documentCount: dc?.value ?? 0,
-    outstanding: Number(out?.value ?? 0), // paise
+    outstanding: isOwner ? Number(out?.value ?? 0) : null, // paise (owner-only)
   });
 });
 
@@ -316,7 +350,6 @@ const updateSchema = createSchema.partial().extend({
 
 clientsRouter.patch(
   '/:clientId',
-  requireRole('owner', 'admin'),
   async (req, res) => {
   const ctx = getAuth(req);
   const client = await requireClientAccess(ctx, param(req, 'clientId'));
@@ -368,10 +401,10 @@ clientsRouter.patch(
   ok(res, serializeClient(row!));
 });
 
-// POST /clients/:clientId/archive
+// POST /clients/:clientId/archive — needs full 'manage' on clients.
 clientsRouter.post(
   '/:clientId/archive',
-  requireRole('owner', 'admin'),
+  requireModule('clients', 'manage'),
   async (req, res) => {
     const ctx = getAuth(req);
     const client = await requireClientAccess(ctx, param(req, 'clientId'));
