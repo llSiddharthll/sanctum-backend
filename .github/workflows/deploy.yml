@@ -1,0 +1,32 @@
+name: Deploy backend (GCP VM)
+
+# Push to main = production deploy. The VM holds a restricted (forced-command)
+# SSH key that can ONLY run ~/deploy-sanctum.sh, which does:
+#   git fetch + reset --hard origin/main -> npm install -> tsc build -> pm2 restart
+# So main is always exactly what runs at api.creativemonk.in.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: gcp-backend-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Deploy over SSH (forced command on the VM)
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # The trailing word is ignored — the server forces ~/deploy-sanctum.sh.
+          ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 \
+              -i ~/.ssh/deploy_key "$SSH_USER@$SSH_HOST" deploy
