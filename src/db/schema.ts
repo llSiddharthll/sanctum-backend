@@ -1333,6 +1333,7 @@ export const documents = sqliteTable(
         'contract',
         'nda',
         'proposal',
+        'agreement',
         'deliverable',
         'invoice',
         'report',
@@ -1360,6 +1361,12 @@ export const documents = sqliteTable(
     mimeType: text('mime_type'),
     sizeBytes: integer('size_bytes').notNull().default(0),
     clientVisible: integer('client_visible', { mode: 'boolean' })
+      .notNull()
+      .default(false),
+    // Owner-only visibility: hidden from all non-owner staff. Auto-set for
+    // business/legal categories (proposal/agreement/contract/nda/invoice) and
+    // togglable manually by the owner on upload.
+    hideFromTeam: integer('hide_from_team', { mode: 'boolean' })
       .notNull()
       .default(false),
     uploadedBy: text('uploaded_by').references(() => users.id, {
@@ -2097,6 +2104,8 @@ export const proposals = sqliteTable(
     rejectedAt: ts('rejected_at'),
     rejectionReason: text('rejection_reason'),
     convertedAgreementId: text('converted_agreement_id'),
+    // When this proposal was created from an uploaded document, the file URL.
+    fileUrl: text('file_url'),
     createdBy: text('created_by').references(() => users.id, {
       onDelete: 'set null',
     }),
@@ -2183,6 +2192,8 @@ export const agreements = sqliteTable(
     signerEmail: text('signer_email'),
     signerIp: text('signer_ip'),
     signatureDataUrl: text('signature_data_url'),
+    // When this agreement was created from an uploaded document, the file URL.
+    fileUrl: text('file_url'),
     createdBy: text('created_by').references(() => users.id, {
       onDelete: 'set null',
     }),

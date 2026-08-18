@@ -179,6 +179,7 @@ function serializeProposal(
     rejectedAt: toIso(p.rejectedAt),
     rejectionReason: p.rejectionReason,
     convertedAgreementId: p.convertedAgreementId,
+    fileUrl: p.fileUrl,
     createdBy: p.createdBy,
     createdByName: extra?.createdByName ?? null,
     createdAt: toIso(p.createdAt),

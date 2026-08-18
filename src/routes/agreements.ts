@@ -146,6 +146,7 @@ function serializeAgreement(
     signerEmail: a.signerEmail,
     signerIp: a.signerIp,
     signatureDataUrl: a.signatureDataUrl,
+    fileUrl: a.fileUrl,
     createdBy: a.createdBy,
     createdByName: extra?.createdByName ?? null,
     createdAt: toIso(a.createdAt),

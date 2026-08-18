@@ -8,6 +8,8 @@ import {
   documents,
   documentFolders,
   users,
+  proposals,
+  agreements,
 } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
@@ -25,6 +27,7 @@ const DOCUMENT_CATEGORIES = [
   'contract',
   'nda',
   'proposal',
+  'agreement',
   'deliverable',
   'invoice',
   'report',
@@ -32,6 +35,22 @@ const DOCUMENT_CATEGORIES = [
   'ai_generated',
   'misc',
 ] as const;
+
+/**
+ * Business/legal categories are OWNER-ONLY: any document tagged with one of
+ * these auto-hides from the team, regardless of the manual toggle.
+ */
+const OWNER_ONLY_CATEGORIES = new Set([
+  'proposal',
+  'agreement',
+  'contract',
+  'nda',
+  'invoice',
+]);
+/** Categories that spawn a Proposal record on upload. */
+const PROPOSAL_CATEGORIES = new Set(['proposal']);
+/** Categories that spawn an Agreement record on upload (needs a client). */
+const AGREEMENT_CATEGORIES = new Set(['agreement', 'contract', 'nda']);
 const RESOURCE_TYPES = ['image', 'raw', 'video'] as const;
 
 const documentSelection = {
@@ -47,6 +66,7 @@ const documentSelection = {
   mimeType: documents.mimeType,
   sizeBytes: documents.sizeBytes,
   clientVisible: documents.clientVisible,
+  hideFromTeam: documents.hideFromTeam,
   folderId: documents.folderId,
   uploadedBy: documents.uploadedBy,
   createdAt: documents.createdAt,
@@ -69,6 +89,7 @@ type DocumentRow = {
   mimeType: string | null;
   sizeBytes: number;
   clientVisible: boolean;
+  hideFromTeam: boolean;
   folderId: string | null;
   uploadedBy: string | null;
   createdAt: Date | null;
@@ -94,6 +115,7 @@ function serializeDocument(d: DocumentRow) {
     mimeType: d.mimeType,
     sizeBytes: d.sizeBytes,
     clientVisible: d.clientVisible,
+    hideFromTeam: d.hideFromTeam,
     folderId: d.folderId,
     uploadedBy: d.uploadedBy,
     uploadedByName: d.uploadedByName,
@@ -193,6 +215,7 @@ async function wouldCreateCycle(
 async function getScopedDocument(
   ctx: ReturnType<typeof getAuth>,
   documentId: string,
+  opts?: { allowHidden?: boolean },
 ): Promise<DocumentRow> {
   const [row] = await db
     .select(documentSelection)
@@ -205,7 +228,12 @@ async function getScopedDocument(
     )
     .limit(1);
   if (!row) throw notFound('Document not found.');
-  return row as DocumentRow;
+  const r = row as DocumentRow;
+  // Owner-only docs are invisible to staff on read/edit/delete too.
+  if (!opts?.allowHidden && r.hideFromTeam && ctx.role !== 'owner') {
+    throw notFound('Document not found.');
+  }
+  return r;
 }
 
 // ============================================================
@@ -231,6 +259,8 @@ documentsRouter.get('/', async (req, res) => {
   const q = listQuery.parse(req.query);
 
   const filters = [eq(documents.agencyId, ctx.agencyId)];
+  // Owner-only docs (business/legal or manually hidden) are invisible to staff.
+  if (ctx.role !== 'owner') filters.push(eq(documents.hideFromTeam, false));
   if (q.category) filters.push(eq(documents.category, q.category));
   if (q.clientId) filters.push(eq(documents.clientId, q.clientId));
   if (q.projectId) filters.push(eq(documents.projectId, q.projectId));
@@ -456,6 +486,10 @@ const createSchema = z.object({
     .union([z.boolean(), z.literal(0), z.literal(1)])
     .transform((v) => Boolean(v))
     .optional(),
+  hideFromTeam: z
+    .union([z.boolean(), z.literal(0), z.literal(1)])
+    .transform((v) => Boolean(v))
+    .optional(),
 });
 
 documentsRouter.post('/', async (req, res) => {
@@ -466,6 +500,13 @@ documentsRouter.post('/', async (req, res) => {
   if (body.projectId !== undefined)
     await requireAgencyProject(ctx, body.projectId);
   if (body.folderId) await requireAgencyFolder(ctx, body.folderId);
+
+  const category = body.category ?? 'misc';
+  // Owner-only visibility: business/legal categories always hide from the team;
+  // otherwise only the OWNER may manually hide (staff uploads stay visible).
+  const hideFromTeam =
+    OWNER_ONLY_CATEGORIES.has(category) ||
+    (ctx.role === 'owner' && body.hideFromTeam === true);
 
   const id = newId('doc');
   await db.insert(documents).values({
@@ -487,12 +528,63 @@ documentsRouter.post('/', async (req, res) => {
     ...(body.clientVisible !== undefined
       ? { clientVisible: body.clientVisible }
       : {}),
+    hideFromTeam,
     uploadedBy: ctx.userId,
   });
 
-  const row = await getScopedDocument(ctx, id);
-  created(res, serializeDocument(row));
+  // Convert proposal/agreement uploads into their respective Business records so
+  // they surface in the Proposals / Agreements tabs. Best-effort — a failed
+  // conversion must never fail the upload itself.
+  const conversion = await maybeConvertDocument(ctx, category, body).catch(
+    () => null,
+  );
+
+  const row = await getScopedDocument(ctx, id, { allowHidden: true });
+  created(res, { ...serializeDocument(row), converted: conversion });
 });
+
+/**
+ * When a document is uploaded as a proposal/agreement, spawn the matching
+ * Business record carrying the file. Agreements require a client, so if none is
+ * given we skip (the doc still exists, owner-only). Returns a small descriptor
+ * or null when nothing was created.
+ */
+async function maybeConvertDocument(
+  ctx: ReturnType<typeof getAuth>,
+  category: string,
+  body: z.infer<typeof createSchema>,
+): Promise<{ type: 'proposal' | 'agreement'; id: string } | null> {
+  if (PROPOSAL_CATEGORIES.has(category)) {
+    const propId = newId('prop');
+    await db.insert(proposals).values({
+      id: propId,
+      agencyId: ctx.agencyId,
+      clientId: body.clientId ?? null,
+      title: body.name,
+      status: 'draft',
+      contentJson: JSON.stringify({ source: 'document', fileUrl: body.fileUrl }),
+      fileUrl: body.fileUrl,
+      createdBy: ctx.userId,
+    });
+    return { type: 'proposal', id: propId };
+  }
+  if (AGREEMENT_CATEGORIES.has(category)) {
+    if (!body.clientId) return null; // agreements need a client
+    const agrId = newId('agr');
+    await db.insert(agreements).values({
+      id: agrId,
+      agencyId: ctx.agencyId,
+      clientId: body.clientId,
+      title: body.name,
+      status: 'draft',
+      termsJson: JSON.stringify({ source: 'document', fileUrl: body.fileUrl }),
+      fileUrl: body.fileUrl,
+      createdBy: ctx.userId,
+    });
+    return { type: 'agreement', id: agrId };
+  }
+  return null;
+}
 
 // ============================================================
 //  PATCH /documents/:id
