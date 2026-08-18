@@ -861,6 +861,10 @@ attendanceRouter.get('/checkout-requests', async (req, res) => {
 const decideCheckoutSchema = z.object({
   decision: z.enum(['approved', 'rejected']),
   note: z.string().trim().max(500).optional(),
+  // When approving, credit the whole shift regardless of the actual punch-out
+  // time (e.g. a shoot that wrapped off-site). Defaults ON per the agency
+  // policy that an approved out-of-office day counts as full-time work.
+  creditFullDay: z.boolean().optional().default(true),
 });
 
 // POST /checkout-requests/:id/decide — approve (finalize the checkout) / reject.
@@ -908,6 +912,16 @@ attendanceRouter.post('/checkout-requests/:id/decide', async (req, res) => {
         checkInAt: existing.checkInAt,
         checkOutAt: reqRow.requestedCheckOutAt,
       });
+      // Full-time credit: count the whole shift even if the off-site punch-out
+      // landed early (the field work still happened). Lateness is preserved.
+      const workedMinutes = body.creditFullDay
+        ? policy.fullDayMinutes
+        : derived.workedMinutes;
+      const status = body.creditFullDay
+        ? derived.isLate
+          ? 'late'
+          : 'present'
+        : derived.status;
       await db
         .update(attendanceRecords)
         .set({
@@ -915,9 +929,9 @@ attendanceRouter.post('/checkout-requests/:id/decide', async (req, res) => {
           checkOutLat: reqRow.checkOutLat,
           checkOutLng: reqRow.checkOutLng,
           checkOutLocation: reqRow.checkOutLocation,
-          workedMinutes: derived.workedMinutes,
-          overtimeMinutes: derived.overtimeMinutes,
-          status: derived.status,
+          workedMinutes,
+          overtimeMinutes: body.creditFullDay ? 0 : derived.overtimeMinutes,
+          status,
           isLate: derived.isLate,
           updatedAt: now,
         })
@@ -950,7 +964,11 @@ attendanceRouter.post('/checkout-requests/:id/decide', async (req, res) => {
     userId: reqRow.userId,
     type: `attendance.checkout.${body.decision}`,
     title: `Checkout ${body.decision}`,
-    body: `Your out-of-office checkout for ${reqRow.day} was ${body.decision}.${body.note ? ` ${body.note}` : ''}`,
+    body: `Your out-of-office checkout for ${reqRow.day} was ${body.decision}.${
+      body.decision === 'approved' && body.creditFullDay
+        ? ' Credited as a full day.'
+        : ''
+    }${body.note ? ` ${body.note}` : ''}`,
     entityType: 'attendance_checkout_request',
     entityId: id,
     link: '/attendance',
