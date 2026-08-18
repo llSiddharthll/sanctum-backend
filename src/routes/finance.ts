@@ -289,16 +289,29 @@ financeRouter.get('/owner-snapshot', async (req, res) => {
   const monthStart = new Date(
     Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1),
   );
-  const [monthExpRow] = await db
+  // Monthly cost = one-time expenses dated this month + EVERY monthly-recurring
+  // expense (subscriptions etc. recur each month, like recurring salaries).
+  const [oneTimeExpRow] = await db
     .select({ v: sum(expenses.amount) })
     .from(expenses)
     .where(
       and(
         eq(expenses.agencyId, ctx.agencyId),
+        eq(expenses.expenseType, 'one_time'),
         gte(expenses.expenseDate, monthStart),
       ),
     );
-  const monthlyExpenses = Number(monthExpRow?.v ?? 0);
+  const [recurringExpRow] = await db
+    .select({ v: sum(expenses.amount) })
+    .from(expenses)
+    .where(
+      and(
+        eq(expenses.agencyId, ctx.agencyId),
+        eq(expenses.expenseType, 'monthly_recurring'),
+      ),
+    );
+  const monthlyExpenses =
+    Number(oneTimeExpRow?.v ?? 0) + Number(recurringExpRow?.v ?? 0);
 
   const clientRows = await db
     .select({ id: clients.id, name: clients.name })
@@ -332,6 +345,7 @@ financeRouter.get('/owner-snapshot', async (req, res) => {
   const recentExpenses = recentExpenseRows.map((e) => ({
     id: e.id,
     category: e.category,
+    expenseType: e.expenseType,
     amount: Number(e.amount ?? 0),
     description: e.description,
     date: toIso(e.expenseDate),

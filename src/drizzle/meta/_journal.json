@@ -190,6 +190,13 @@
       "when": 1787079521203,
       "tag": "0026_business_docs_hide_and_fileurl",
       "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "6",
+      "when": 1787085999368,
+      "tag": "0027_expense_type",
+      "breakpoints": true
     }
   ]
 }

@@ -1,0 +1,1 @@
+ALTER TABLE `sanctum_expenses` ADD `expense_type` text DEFAULT 'one_time' NOT NULL;

@@ -1204,6 +1204,12 @@ export const expenses = sqliteTable(
     })
       .notNull()
       .default('other'),
+    // One-time cost vs an ongoing monthly-recurring cost (subscriptions etc.).
+    expenseType: text('expense_type', {
+      enum: ['one_time', 'monthly_recurring'],
+    })
+      .notNull()
+      .default('one_time'),
     amount: integer('amount').notNull(), // paise
     description: text('description'),
     expenseDate: ts('expense_date'),

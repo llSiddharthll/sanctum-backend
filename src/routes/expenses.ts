@@ -72,6 +72,7 @@ function serializeExpense(r: ExpenseJoinRow) {
   return {
     id: e.id,
     category: e.category,
+    expenseType: e.expenseType,
     amount: e.amount, // paise
     description: e.description,
     projectId: e.projectId,
@@ -153,8 +154,11 @@ expensesRouter.get('/', async (req, res) => {
 // ============================================================
 //  CREATE
 // ============================================================
+const EXPENSE_TYPES = ['one_time', 'monthly_recurring'] as const;
+
 const createSchema = z.object({
   category: z.enum(EXPENSE_CATEGORIES).optional(),
+  expenseType: z.enum(EXPENSE_TYPES).optional(),
   amount: z.number().int().min(0), // paise (required)
   description: z.string().max(2000).optional(),
   projectId: z.string().min(1).optional(),
@@ -177,6 +181,9 @@ expensesRouter.post('/', async (req, res) => {
     id,
     agencyId: ctx.agencyId,
     ...(body.category !== undefined ? { category: body.category } : {}),
+    ...(body.expenseType !== undefined
+      ? { expenseType: body.expenseType }
+      : {}),
     amount: body.amount,
     description: body.description ?? null,
     projectId: body.projectId ?? null,
@@ -216,6 +223,7 @@ expensesRouter.get('/:id', async (req, res) => {
 // ============================================================
 const updateSchema = z.object({
   category: z.enum(EXPENSE_CATEGORIES).optional(),
+  expenseType: z.enum(EXPENSE_TYPES).optional(),
   amount: z.number().int().min(0).optional(),
   description: z.string().max(2000).nullable().optional(),
   projectId: z.string().min(1).nullable().optional(),
@@ -239,6 +247,7 @@ expensesRouter.patch('/:id', async (req, res) => {
     updatedAt: new Date(),
   };
   if (body.category !== undefined) patch.category = body.category;
+  if (body.expenseType !== undefined) patch.expenseType = body.expenseType;
   if (body.amount !== undefined) patch.amount = body.amount;
   if (body.description !== undefined) patch.description = body.description;
   if (body.projectId !== undefined) patch.projectId = body.projectId;
