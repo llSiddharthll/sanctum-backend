@@ -20,8 +20,8 @@ import { getAuth } from '../middleware/tenant.js';
 
 export const leadsRouter = Router();
 leadsRouter.use(requireAuth);
-// Leads are CRM data — gated on the `clients` module (read/write).
-leadsRouter.use(requireModuleRW('clients'));
+// Leads live in the owner-only Business module (deal-to-cash pipeline).
+leadsRouter.use(requireModuleRW('business'));
 
 // Stage buckets shown as tabs in the UI.
 const OPEN_STAGES = ['new', 'contacted', 'qualified'] as const;

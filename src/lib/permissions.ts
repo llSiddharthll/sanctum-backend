@@ -33,6 +33,7 @@ export const MODULES = [
   'sheets',
   'ai',
   'finance',
+  'business',
   'settings',
 ] as const;
 
@@ -105,6 +106,7 @@ export const MODULE_LABELS: Record<ModuleKey, string> = {
   sheets: 'Sheets',
   ai: 'AI Assistant',
   finance: 'Finance',
+  business: 'Business',
   settings: 'Settings',
 };
 
@@ -194,8 +196,10 @@ export function resolvePermissions(
     acc[m] = userOverrides[m] ?? customMap[m] ?? roleMap[m] ?? DEFAULT_LEVEL;
     return acc;
   }, {} as PermissionMap);
-  // Hard backstop: Finance is strictly OWNER-ONLY. Non-owners (admin, member, etc.) can never access finance.
+  // Hard backstop: Finance and Business are strictly OWNER-ONLY. Non-owners
+  // (admin, member, etc.) can never access them, regardless of overrides.
   res.finance = 'none';
+  res.business = 'none';
   return res;
 }
 
@@ -260,6 +264,7 @@ export function resolveRolePermissions(
       return acc;
     }, {} as PermissionMap);
     map.finance = 'none';
+    map.business = 'none';
     return map;
   };
   return {
@@ -283,6 +288,7 @@ export const MODULE_DESCRIPTIONS: Record<ModuleKey, string> = {
   sheets: 'Spreadsheets',
   ai: 'AI document & content generation',
   finance: 'Invoices, expenses, and reports',
+  business: 'Leads, proposals, agreements, invoices & expenses (owner-only)',
   settings: 'Agency branding and settings',
 };
 
@@ -343,6 +349,7 @@ export const ROLE_PRESETS: RolePreset[] = [
       sheets: 'manage',
       ai: 'manage',
       finance: 'none',
+      business: 'none',
       settings: 'none',
     },
   },

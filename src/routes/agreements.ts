@@ -115,7 +115,8 @@ agreementsRouter.post('/public/:token/sign', async (req, res) => {
 // ============================================================
 const authRouter = Router();
 authRouter.use(requireAuth);
-authRouter.use(requireModuleRW('documents'));
+// Owner-only Business module (public sign routes are mounted above).
+authRouter.use(requireModuleRW('business'));
 
 function serializeAgreement(
   a: typeof agreements.$inferSelect,

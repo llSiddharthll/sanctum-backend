@@ -5,7 +5,7 @@ import { db } from '../db/client.js';
 import { leads, users } from '../db/schema.js';
 import { newId } from '../lib/ids.js';
 import { ok } from '../lib/http.js';
-import { notifyMany, agencyApprovers } from '../services/notifications.js';
+import { notifyMany, agencyOwners } from '../services/notifications.js';
 
 /**
  * Public lead intake — used by the Creative Monk marketing website to push a
@@ -63,9 +63,9 @@ intakeRouter.post('/lead', async (req, res) => {
     lastActivityAt: new Date(),
   });
 
-  // Notify owners/admins (in-app + push).
+  // Leads are owner-only (Business module) — notify OWNERS only (in-app + push).
   try {
-    const recipients = await agencyApprovers(agencyId);
+    const recipients = await agencyOwners(agencyId);
     await notifyMany(recipients, {
       agencyId,
       type: 'lead.created',
@@ -75,7 +75,7 @@ intakeRouter.post('/lead', async (req, res) => {
       }`,
       entityType: 'lead',
       entityId: leadId,
-      link: `/clients?tab=leads&lead=${leadId}`,
+      link: `/leads`,
     });
   } catch {}
 

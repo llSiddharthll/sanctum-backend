@@ -104,4 +104,23 @@ export async function agencyApprovers(
   return rows.map((r) => r.id);
 }
 
+/**
+ * Active OWNERS of an agency. Recipients for Business-module notices (leads,
+ * proposals, agreements, invoices, expenses) — those are owner-only, so admins
+ * must not receive them.
+ */
+export async function agencyOwners(agencyId: string): Promise<string[]> {
+  const rows = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(
+      and(
+        eq(users.agencyId, agencyId),
+        eq(users.role, 'owner'),
+        eq(users.status, 'active'),
+      ),
+    );
+  return rows.map((r) => r.id);
+}
+
 export { serialize as serializeNotification };

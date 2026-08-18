@@ -137,7 +137,8 @@ proposalsRouter.post('/public/:token/reject', async (req, res) => {
 // ============================================================
 const authRouter = Router();
 authRouter.use(requireAuth);
-authRouter.use(requireModuleRW('clients'));
+// Owner-only Business module (public accept/reject routes are mounted above).
+authRouter.use(requireModuleRW('business'));
 
 function safeJson(s: string): unknown {
   try {
