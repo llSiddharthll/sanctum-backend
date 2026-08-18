@@ -210,6 +210,27 @@ async function stopTimerRow(
 }
 
 /**
+ * Stop EVERY running timer attached to a task (across all users) — used when a
+ * task is marked complete, so nobody keeps logging time against finished work.
+ * Each timer is committed to a time_log for its own owner. Returns how many
+ * were stopped.
+ */
+export async function stopTimersForTask(
+  ctx: Ctx,
+  taskId: string,
+  taskTitle: string | null,
+): Promise<number> {
+  const running = await db
+    .select()
+    .from(timers)
+    .where(and(eq(timers.agencyId, ctx.agencyId), eq(timers.taskId, taskId)));
+  for (const timer of running) {
+    await stopTimerRow(ctx, timer, taskTitle);
+  }
+  return running.length;
+}
+
+/**
  * List ALL running timers for a project (who's working now). Exported so the
  * project-scoped routes + overview can reuse it.
  */

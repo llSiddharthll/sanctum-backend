@@ -36,7 +36,7 @@ import { requireModuleRW, loadPermissions } from '../middleware/permissions.js';
 import { meetsLevel } from '../lib/permissions.js';
 import { getAuth, isPrivileged } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
-import { listProjectTimers } from './timers.js';
+import { listProjectTimers, stopTimersForTask } from './timers.js';
 
 // mergeParams keeps any parent params available (none today, but consistent
 // with the other nested routers).
@@ -1565,6 +1565,14 @@ projectsRouter.patch('/:id/tasks/:taskId', async (req, res) => {
   // Replace the M:N join set when assignees were touched (either field).
   if (nextAssigneeIds !== undefined) {
     await syncTaskAssignees(ctx.agencyId, task.id, nextAssigneeIds);
+  }
+
+  // Completing a task auto-stops any running timers on it (across all users),
+  // so time stops accruing against finished work. Best-effort.
+  if (body.status === 'done' && task.status !== 'done') {
+    await stopTimersForTask(ctx, task.id, patch.title ?? task.title).catch(
+      () => undefined,
+    );
   }
 
   // Audit: a status change is its own action for the activity feed; otherwise
