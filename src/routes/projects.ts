@@ -110,6 +110,8 @@ const projectSelection = {
   status: projects.status,
   health: projects.health,
   contractValue: projects.contractValue,
+  billingType: projects.billingType,
+  recurringPaise: projects.recurringPaise,
   currency: projects.currency,
   startDate: projects.startDate,
   deadline: projects.deadline,
@@ -133,6 +135,8 @@ type ProjectRow = {
   status: string;
   health: string;
   contractValue: number | null;
+  billingType: 'one_time' | 'retainer';
+  recurringPaise: number;
   currency: string;
   startDate: Date | null;
   deadline: Date | null;
@@ -231,6 +235,8 @@ function serializeProject(p: ProjectRow, showFinance = true) {
     health: p.health,
     // Money is finance-gated: null for non-finance roles (managers/employees).
     contractValue: showFinance ? (p.contractValue ?? 0) : null,
+    billingType: p.billingType,
+    recurringPaise: showFinance ? (p.recurringPaise ?? 0) : null,
     currency: p.currency,
     startDate: toIso(p.startDate),
     deadline: toIso(p.deadline),
@@ -681,6 +687,8 @@ const createSchema = z.object({
   status: z.enum(PROJECT_STATUSES).optional(),
   health: z.enum(PROJECT_HEALTH).optional(),
   contractValue: z.number().int().min(0).optional(),
+  billingType: z.enum(['one_time', 'retainer']).optional(),
+  recurringPaise: z.number().int().min(0).optional(),
   currency: z.string().trim().max(8).optional(),
   startDate: z.coerce.date().optional(),
   deadline: z.coerce.date().optional(),
@@ -703,6 +711,10 @@ projectsRouter.post('/', async (req, res) => {
     ...(body.health !== undefined ? { health: body.health } : {}),
     ...(body.contractValue !== undefined
       ? { contractValue: body.contractValue }
+      : {}),
+    ...(body.billingType !== undefined ? { billingType: body.billingType } : {}),
+    ...(body.recurringPaise !== undefined
+      ? { recurringPaise: body.recurringPaise }
       : {}),
     ...(body.currency !== undefined ? { currency: body.currency } : {}),
     startDate: body.startDate ?? null,
@@ -749,6 +761,8 @@ const updateSchema = z.object({
   status: z.enum(PROJECT_STATUSES).optional(),
   health: z.enum(PROJECT_HEALTH).optional(),
   contractValue: z.number().int().min(0).optional(),
+  billingType: z.enum(['one_time', 'retainer']).optional(),
+  recurringPaise: z.number().int().min(0).optional(),
   currency: z.string().trim().max(8).optional(),
   startDate: z.coerce.date().nullable().optional(),
   deadline: z.coerce.date().nullable().optional(),
@@ -773,6 +787,9 @@ projectsRouter.patch('/:id', async (req, res) => {
   if (body.health !== undefined) patch.health = body.health;
   if (body.contractValue !== undefined)
     patch.contractValue = body.contractValue;
+  if (body.billingType !== undefined) patch.billingType = body.billingType;
+  if (body.recurringPaise !== undefined)
+    patch.recurringPaise = body.recurringPaise;
   if (body.currency !== undefined) patch.currency = body.currency;
   if (body.startDate !== undefined) patch.startDate = body.startDate;
   if (body.deadline !== undefined) patch.deadline = body.deadline;

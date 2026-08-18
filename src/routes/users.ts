@@ -118,6 +118,7 @@ const memberBaseSelection = {
   department: users.department,
   phone: users.phone,
   hourlyRate: users.hourlyRate,
+  monthlySalaryPaise: users.monthlySalaryPaise,
   weeklyCapacityHrs: users.weeklyCapacityHrs,
   skills: users.skills,
   permissionsJson: users.permissionsJson,
@@ -136,6 +137,7 @@ type MemberBaseRow = {
   department: string | null;
   phone: string | null;
   hourlyRate: number | null;
+  monthlySalaryPaise: number | null;
   weeklyCapacityHrs: number;
   skills: string | null;
   permissionsJson: string | null;
@@ -172,6 +174,7 @@ function profileFields(
     phone: u.phone,
     // Pay rate is money — hidden from non-finance roles (managers/employees).
     hourlyRate: showFinance ? u.hourlyRate : null,
+    monthlySalaryPaise: showFinance ? u.monthlySalaryPaise : null,
     weeklyCapacityHrs: u.weeklyCapacityHrs ?? 0,
     skills: parseSkills(u.skills),
     // Effective: user override > custom role > agency role default > built-in.
@@ -432,6 +435,171 @@ usersRouter.get(
   },
 );
 
+/** Re-fetch a single client-login account in the list's serialized shape. */
+async function serializeClientUser(agencyId: string, id: string) {
+  const [r] = await db
+    .select({
+      id: users.id,
+      fullName: users.fullName,
+      email: users.email,
+      status: users.status,
+      lastLoginAt: users.lastLoginAt,
+      clientId: users.clientId,
+      clientName: clients.name,
+      createdAt: users.createdAt,
+    })
+    .from(users)
+    .leftJoin(clients, eq(clients.id, users.clientId))
+    .where(and(eq(users.id, id), eq(users.agencyId, agencyId)))
+    .limit(1);
+  if (!r) return null;
+  const [{ n } = { n: 0 }] = await db
+    .select({ n: sql<number>`count(*)` })
+    .from(clientUserProjects)
+    .where(
+      and(
+        eq(clientUserProjects.agencyId, agencyId),
+        eq(clientUserProjects.userId, id),
+      ),
+    );
+  return {
+    id: r.id,
+    fullName: r.fullName,
+    email: r.email,
+    status: r.status,
+    lastLoginAt: toIso(r.lastLoginAt),
+    clientId: r.clientId,
+    clientName: r.clientName,
+    projectScope: Number(n) || 0,
+    joinedAt: toIso(r.createdAt),
+  };
+}
+
+// ============================================================
+//  PATCH /team/client-users/:id — edit a client-login account. Changing the
+//  email sends a fresh access link to the NEW address so they can sign in there.
+// ============================================================
+const updateClientUserSchema = z.object({
+  fullName: z.string().trim().min(1).max(120).optional(),
+  email: z.string().trim().email().optional(),
+  status: z.enum(['active', 'disabled']).optional(),
+});
+
+usersRouter.patch(
+  '/client-users/:id',
+  requireRole('owner', 'admin'),
+  async (req, res) => {
+    const ctx = getAuth(req);
+    const id = param(req, 'id');
+    const body = updateClientUserSchema.parse(req.body);
+
+    const [cu] = await db
+      .select()
+      .from(users)
+      .where(
+        and(
+          eq(users.id, id),
+          eq(users.agencyId, ctx.agencyId),
+          eq(users.role, 'client'),
+        ),
+      )
+      .limit(1);
+    if (!cu) throw notFound('Client account not found.');
+
+    const patch: Partial<typeof users.$inferInsert> = { updatedAt: new Date() };
+    if (body.fullName !== undefined) patch.fullName = body.fullName;
+    if (body.status !== undefined) patch.status = body.status;
+
+    const nextEmail = body.email?.trim().toLowerCase();
+    const emailChanged = !!nextEmail && nextEmail !== cu.email.toLowerCase();
+    if (emailChanged) {
+      const [dupe] = await db
+        .select({ id: users.id })
+        .from(users)
+        .where(eq(users.email, nextEmail!))
+        .limit(1);
+      if (dupe) throw conflict('That email is already in use.');
+      patch.email = nextEmail!;
+    }
+
+    await db.update(users).set(patch).where(eq(users.id, cu.id));
+
+    // On email change, email a fresh access link to the NEW address.
+    let resetUrl: string | undefined;
+    if (emailChanged) {
+      const r = await createPasswordReset(
+        {
+          id: cu.id,
+          agencyId: cu.agencyId,
+          email: nextEmail!,
+          fullName: patch.fullName ?? cu.fullName,
+        },
+        { byAdmin: true },
+      );
+      resetUrl = r.resetUrl;
+    }
+
+    await audit({
+      agencyId: ctx.agencyId,
+      actorType: ctx.role,
+      actorId: ctx.userId,
+      action: 'team.client_user.update',
+      entityType: 'user',
+      entityId: cu.id,
+      metadata: { emailChanged },
+      ip: req.ip,
+    });
+
+    const updated = await serializeClientUser(ctx.agencyId, cu.id);
+    ok(res, { ...updated, emailChanged, resetUrl });
+  },
+);
+
+// ============================================================
+//  DELETE /team/client-users/:id — remove a client-login account.
+// ============================================================
+usersRouter.delete(
+  '/client-users/:id',
+  requireRole('owner', 'admin'),
+  async (req, res) => {
+    const ctx = getAuth(req);
+    const id = param(req, 'id');
+    const [cu] = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(
+        and(
+          eq(users.id, id),
+          eq(users.agencyId, ctx.agencyId),
+          eq(users.role, 'client'),
+        ),
+      )
+      .limit(1);
+    if (!cu) throw notFound('Client account not found.');
+
+    await db
+      .delete(clientUserProjects)
+      .where(
+        and(
+          eq(clientUserProjects.agencyId, ctx.agencyId),
+          eq(clientUserProjects.userId, id),
+        ),
+      );
+    await db.delete(users).where(eq(users.id, id));
+
+    await audit({
+      agencyId: ctx.agencyId,
+      actorType: ctx.role,
+      actorId: ctx.userId,
+      action: 'team.client_user.delete',
+      entityType: 'user',
+      entityId: id,
+      ip: req.ip,
+    });
+    ok(res, { deleted: true });
+  },
+);
+
 // ============================================================
 //  POST /team/invite — create a real (active) member + an invite token
 // ============================================================
@@ -448,6 +616,7 @@ const inviteSchema = z
     designation: z.string().trim().max(120).optional(),
     department: z.string().trim().max(120).optional(),
     hourlyRate: z.number().int().min(0).optional(),
+    monthlySalaryPaise: z.number().int().min(0).optional(),
     weeklyCapacityHrs: z.number().int().min(0).max(168).optional(),
     skills: z.union([z.string(), z.array(z.string())]).optional(),
     // Optional module permission overrides ({ moduleKey: 'none'|'view'|'manage' }).
@@ -535,6 +704,7 @@ usersRouter.post('/invite', requireRole('owner', 'admin'), async (req, res) => {
     designation: body.designation ?? null,
     department: body.department ?? null,
     hourlyRate: body.hourlyRate ?? null,
+    monthlySalaryPaise: body.monthlySalaryPaise ?? null,
     ...(body.weeklyCapacityHrs !== undefined
       ? { weeklyCapacityHrs: body.weeklyCapacityHrs }
       : {}),
@@ -599,6 +769,7 @@ usersRouter.post('/invite', requireRole('owner', 'admin'), async (req, res) => {
         department: body.department ?? null,
         phone: body.phone ?? null,
         hourlyRate: body.hourlyRate ?? null,
+    monthlySalaryPaise: body.monthlySalaryPaise ?? null,
         weeklyCapacityHrs: body.weeklyCapacityHrs ?? 40,
         skills: skillsToCsv(body.skills) ?? null,
         permissionsJson,
@@ -865,6 +1036,7 @@ const patchSchema = z.object({
   department: z.string().trim().max(120).nullable().optional(),
   phone: z.string().trim().max(40).nullable().optional(),
   hourlyRate: z.number().int().min(0).nullable().optional(),
+  monthlySalaryPaise: z.number().int().min(0).nullable().optional(),
   weeklyCapacityHrs: z.number().int().min(0).max(168).optional(),
   skills: z.union([z.string(), z.array(z.string())]).optional(),
   // Full or partial module permission map ({ moduleKey: 'none'|'view'|'manage' }).
@@ -968,6 +1140,8 @@ usersRouter.patch(
     if (body.department !== undefined) patch.department = body.department;
     if (body.phone !== undefined) patch.phone = body.phone;
     if (body.hourlyRate !== undefined) patch.hourlyRate = body.hourlyRate;
+    if (body.monthlySalaryPaise !== undefined)
+      patch.monthlySalaryPaise = body.monthlySalaryPaise;
     if (body.weeklyCapacityHrs !== undefined)
       patch.weeklyCapacityHrs = body.weeklyCapacityHrs;
     if (body.skills !== undefined) patch.skills = skillsToCsv(body.skills) ?? null;

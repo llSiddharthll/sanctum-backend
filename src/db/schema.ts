@@ -126,6 +126,7 @@ export const users = sqliteTable(
     department: text('department'),
     phone: text('phone'),
     hourlyRate: integer('hourly_rate'), // paise, nullable
+    monthlySalaryPaise: integer('monthly_salary_paise'), // recurring monthly payroll, paise, nullable
     weeklyCapacityHrs: integer('weekly_capacity_hrs').notNull().default(40),
     skills: text('skills'), // comma-separated
     lastLoginAt: ts('last_login_at'),
@@ -687,6 +688,13 @@ export const projects = sqliteTable(
       .notNull()
       .default('on_track'),
     contractValue: integer('contract_value').default(0),
+    // Billing: one_time (contractValue amortized over startDate→deadline) or
+    // retainer (recurringPaise per month). Drives monthly revenue on the
+    // owner dashboard.
+    billingType: text('billing_type', { enum: ['one_time', 'retainer'] })
+      .notNull()
+      .default('one_time'),
+    recurringPaise: integer('recurring_paise').notNull().default(0),
     currency: text('currency').notNull().default('INR'),
     startDate: ts('start_date'),
     deadline: ts('deadline'),
@@ -2073,6 +2081,12 @@ export const proposals = sqliteTable(
     subtotalPaise: integer('subtotal_paise').notNull().default(0),
     taxPaise: integer('tax_paise').notNull().default(0),
     totalPaise: integer('total_paise').notNull().default(0),
+    // Billing: one_time (totalPaise is the fixed price) or retainer (recurring
+    // monthly fee held in recurringPaise; totalPaise = first/setup amount).
+    billingType: text('billing_type', { enum: ['one_time', 'retainer'] })
+      .notNull()
+      .default('one_time'),
+    recurringPaise: integer('recurring_paise').notNull().default(0),
     validUntil: ts('valid_until'),
     contentJson: text('content_json').notNull(),
     token: text('token'),

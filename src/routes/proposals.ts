@@ -166,6 +166,8 @@ function serializeProposal(
     subtotalPaise: showFinance ? p.subtotalPaise : null,
     taxPaise: showFinance ? p.taxPaise : null,
     totalPaise: showFinance ? p.totalPaise : null,
+    billingType: p.billingType,
+    recurringPaise: showFinance ? p.recurringPaise : null,
     validUntil: toIso(p.validUntil),
     content: safeJson(p.contentJson),
     token: p.token,
@@ -284,6 +286,8 @@ const proposalSchema = z.object({
   subtotalPaise: z.number().int().min(0).optional(),
   taxPaise: z.number().int().min(0).optional(),
   totalPaise: z.number().int().min(0).optional(),
+  billingType: z.enum(['one_time', 'retainer']).optional(),
+  recurringPaise: z.number().int().min(0).optional(),
   validUntil: z.coerce.date().optional(),
   content: z.record(z.string(), z.any()),
 });
@@ -311,6 +315,8 @@ authRouter.post('/', async (req, res) => {
     subtotalPaise: body.subtotalPaise ?? 0,
     taxPaise: body.taxPaise ?? 0,
     totalPaise: body.totalPaise ?? body.subtotalPaise ?? 0,
+    billingType: body.billingType ?? 'one_time',
+    recurringPaise: body.recurringPaise ?? 0,
     validUntil: body.validUntil ?? null,
     contentJson: JSON.stringify(body.content),
     token,
@@ -532,6 +538,8 @@ const updateProposalSchema = z.object({
   subtotalPaise: z.number().int().min(0).optional(),
   taxPaise: z.number().int().min(0).optional(),
   totalPaise: z.number().int().min(0).optional(),
+  billingType: z.enum(['one_time', 'retainer']).optional(),
+  recurringPaise: z.number().int().min(0).optional(),
   validUntil: z.coerce.date().optional().nullable(),
   content: z.record(z.string(), z.any()).optional(),
 });
@@ -561,8 +569,18 @@ authRouter.put('/:id', async (req, res) => {
   if (body.subtotalPaise !== undefined) patch.subtotalPaise = body.subtotalPaise;
   if (body.taxPaise !== undefined) patch.taxPaise = body.taxPaise;
   if (body.totalPaise !== undefined) patch.totalPaise = body.totalPaise;
+  if (body.billingType !== undefined) patch.billingType = body.billingType;
+  if (body.recurringPaise !== undefined) patch.recurringPaise = body.recurringPaise;
   if (body.validUntil !== undefined) patch.validUntil = body.validUntil;
   if (body.content !== undefined) patch.contentJson = JSON.stringify(body.content);
+
+  // Editing a declined proposal revives it as a draft so it can be revised and
+  // re-sent (clears the prior rejection).
+  if (p.status === 'rejected') {
+    patch.status = 'draft';
+    patch.rejectedAt = null;
+    patch.rejectionReason = null;
+  }
 
   await db.update(proposals).set(patch).where(eq(proposals.id, p.id));
 
