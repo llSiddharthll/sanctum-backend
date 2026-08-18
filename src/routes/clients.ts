@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, eq, inArray, count, sql } from 'drizzle-orm';
+import { and, eq, inArray, count, desc, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   agencies,
@@ -16,6 +16,7 @@ import {
   invoicePayments,
   documents,
   users,
+  auditLog,
 } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
 import { newId, newOpaqueToken } from '../lib/ids.js';
@@ -475,6 +476,78 @@ clientsRouter.post(
     label: body.label ?? null,
     expiresAt: toIso(expiresAt),
   });
+});
+
+// GET /clients/:clientId/activity — audit feed across ALL the client's projects
+// (project create/update, task status changes, timers, milestones, etc.).
+clientsRouter.get('/:clientId/activity', async (req, res) => {
+  const ctx = getAuth(req);
+  const client = await requireClientAccess(ctx, param(req, 'clientId'));
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 60));
+
+  const projs = await db
+    .select({ id: projects.id, name: projects.name })
+    .from(projects)
+    .where(
+      and(eq(projects.agencyId, ctx.agencyId), eq(projects.clientId, client.id)),
+    );
+  if (projs.length === 0) {
+    ok(res, []);
+    return;
+  }
+  const projectName = new Map(projs.map((p) => [p.id, p.name]));
+
+  const rows = await db
+    .select({
+      id: auditLog.id,
+      action: auditLog.action,
+      actorId: auditLog.actorId,
+      actorName: users.fullName,
+      entityType: auditLog.entityType,
+      entityId: auditLog.entityId,
+      metadataJson: auditLog.metadataJson,
+      createdAt: auditLog.createdAt,
+    })
+    .from(auditLog)
+    .leftJoin(users, eq(users.id, auditLog.actorId))
+    .where(
+      and(
+        eq(auditLog.agencyId, ctx.agencyId),
+        inArray(
+          sql`json_extract(${auditLog.metadataJson}, '$.projectId')`,
+          projs.map((p) => p.id),
+        ),
+      ),
+    )
+    .orderBy(desc(auditLog.createdAt))
+    .limit(limit);
+
+  ok(
+    res,
+    rows.map((r) => {
+      let metadata: Record<string, unknown> | null = null;
+      if (r.metadataJson) {
+        try {
+          metadata = JSON.parse(r.metadataJson);
+        } catch {
+          metadata = null;
+        }
+      }
+      const pid = metadata?.projectId as string | undefined;
+      return {
+        id: r.id,
+        action: r.action,
+        actorId: r.actorId,
+        actorName: r.actorName,
+        entityType: r.entityType,
+        entityId: r.entityId,
+        projectId: pid ?? null,
+        projectName: pid ? projectName.get(pid) ?? null : null,
+        metadata,
+        createdAt: toIso(r.createdAt),
+      };
+    }),
+  );
 });
 
 // GET /clients/:clientId/portal-tokens — list (no hashes).
