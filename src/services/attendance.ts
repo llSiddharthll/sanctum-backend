@@ -152,6 +152,135 @@ export interface CalendarDay {
   holidayName?: string | null;
 }
 
+/** Roll a list of CalendarDays into attendance counts + worked/overtime totals. */
+export function summarizeDays(days: CalendarDay[]) {
+  const s = {
+    present: 0,
+    late: 0,
+    halfDay: 0,
+    absent: 0,
+    onLeave: 0,
+    holiday: 0,
+    weeklyOff: 0,
+    workingDays: 0,
+    workedMinutes: 0,
+    overtimeMinutes: 0,
+  };
+  for (const d of days) {
+    if (d.isWorkday && d.status !== 'none') s.workingDays++;
+    s.workedMinutes += d.workedMinutes ?? 0;
+    s.overtimeMinutes += d.overtimeMinutes ?? 0;
+    switch (d.status) {
+      case 'present':
+        s.present++;
+        break;
+      case 'late':
+        s.present++;
+        s.late++;
+        break;
+      case 'half_day':
+        s.halfDay++;
+        break;
+      case 'absent':
+        s.absent++;
+        break;
+      case 'on_leave':
+        s.onLeave++;
+        break;
+      case 'holiday':
+        s.holiday++;
+        break;
+      case 'weekly_off':
+        s.weeklyOff++;
+        break;
+    }
+  }
+  return s;
+}
+
+/** Shared day-assembler: overlays records + holiday/leave onto a list of keys. */
+function assembleDays(
+  userId: string,
+  policy: ResolvedPolicy,
+  dayKeys: string[],
+  byDay: Map<string, typeof attendanceRecords.$inferSelect>,
+  holidayMap: Map<string, string>,
+  leaveMap: Map<string, string>,
+): CalendarDay[] {
+  const todayKey = dayKeyInTz(new Date(), policy.timezone);
+  return dayKeys.map((day): CalendarDay => {
+    const weekday = weekdayForDayKey(day);
+    const workday = isWorkingDayKey(policy, day);
+    const holidayName = holidayMap.get(day) ?? null;
+    const rec = byDay.get(day);
+
+    if (rec && rec.checkInAt) {
+      return { ...serializeRecord(rec), weekday, isWorkday: workday, holidayName };
+    }
+
+    let status: string;
+    if (holidayName) status = 'holiday';
+    else if (leaveMap.has(day)) status = 'on_leave';
+    else if (!workday) status = 'weekly_off';
+    else if (day >= todayKey) status = 'none';
+    else status = 'absent';
+
+    return {
+      id: rec?.id ?? null,
+      userId,
+      day,
+      weekday,
+      isWorkday: workday,
+      checkInAt: rec ? toIso(rec.checkInAt) : null,
+      checkOutAt: rec ? toIso(rec.checkOutAt) : null,
+      workedMinutes: rec?.workedMinutes ?? 0,
+      overtimeMinutes: rec?.overtimeMinutes ?? 0,
+      status,
+      isLate: rec?.isLate ?? false,
+      source: rec?.source ?? null,
+      note: rec?.note ?? null,
+      holidayName,
+    };
+  });
+}
+
+/**
+ * Build a day-by-day view for one user over an arbitrary inclusive [from,to]
+ * range of 'YYYY-MM-DD' keys (records + holiday/leave overlay).
+ */
+export async function buildRange(
+  agencyId: string,
+  userId: string,
+  policy: ResolvedPolicy,
+  fromKey: string,
+  toKey: string,
+): Promise<CalendarDay[]> {
+  const [rows, holidayMap, leaveMap] = await Promise.all([
+    db
+      .select()
+      .from(attendanceRecords)
+      .where(
+        and(
+          eq(attendanceRecords.agencyId, agencyId),
+          eq(attendanceRecords.userId, userId),
+          gte(attendanceRecords.day, fromKey),
+          lte(attendanceRecords.day, toKey),
+        ),
+      ),
+    loadHolidayMap(agencyId, fromKey, toKey),
+    loadLeaveDayMap(agencyId, userId, fromKey, toKey),
+  ]);
+  const byDay = new Map(rows.map((r) => [r.day, r]));
+  return assembleDays(
+    userId,
+    policy,
+    daysInRange(fromKey, toKey),
+    byDay,
+    holidayMap,
+    leaveMap,
+  );
+}
+
 /** Build a day-by-day month view for one user (records + holiday/leave overlay). */
 export async function buildMonth(
   agencyId: string,

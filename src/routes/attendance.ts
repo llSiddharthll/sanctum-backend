@@ -18,6 +18,10 @@ import { loadPermissions, requireModuleRW } from '../middleware/permissions.js';
 import { getAuth, isPrivileged } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
 import {
+  buildAgencyReports,
+  emailEmployeeReports,
+} from '../services/reports.js';
+import {
   notify,
   notifyMany,
   agencyApprovers,
@@ -800,6 +804,59 @@ attendanceRouter.get('/team-summary', async (req, res) => {
     throw badRequest('month must be YYYY-MM.');
   }
   ok(res, { month, members: rows });
+});
+
+// ============================================================
+//  RANGE REPORT — per-employee attendance + time + tasks + utilization over a
+//  [from,to] range. Defaults to 1st-of-current-month → today.
+// ============================================================
+function resolveRange(fromRaw: unknown, toRaw: unknown): {
+  from: string;
+  to: string;
+} {
+  const DAY = /^\d{4}-\d{2}-\d{2}$/;
+  const okDay = (v: unknown) =>
+    typeof v === 'string' && DAY.test(v) ? v : null;
+  const now = new Date();
+  const today = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(
+    2,
+    '0',
+  )}-${String(now.getUTCDate()).padStart(2, '0')}`;
+  const monthStart = `${today.slice(0, 7)}-01`;
+  return { from: okDay(fromRaw) ?? monthStart, to: okDay(toRaw) ?? today };
+}
+
+attendanceRouter.get('/team-report', async (req, res) => {
+  if (!(await canApproveAttendance(req))) {
+    throw forbidden('Only owners/admins or attendance managers can view this.');
+  }
+  const ctx = getAuth(req);
+  const { from, to } = resolveRange(req.query.from, req.query.to);
+  const members = await buildAgencyReports(ctx.agencyId, from, to);
+  ok(res, { from, to, members });
+});
+
+// POST /attendance/email-reports {from?,to?} — email each employee their report
+// + the owner a combined overview.
+attendanceRouter.post('/email-reports', async (req, res) => {
+  if (!(await canApproveAttendance(req))) {
+    throw forbidden('Only owners/admins or attendance managers can send reports.');
+  }
+  const ctx = getAuth(req);
+  const body = (req.body ?? {}) as { from?: unknown; to?: unknown };
+  const { from, to } = resolveRange(body.from, body.to);
+  const result = await emailEmployeeReports(ctx.agencyId, from, to);
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'attendance.reports.emailed',
+    entityType: 'agency',
+    entityId: ctx.agencyId,
+    metadata: { from, to, ...result },
+    ip: req.ip,
+  });
+  ok(res, { from, to, ...result });
 });
 
 // ============================================================

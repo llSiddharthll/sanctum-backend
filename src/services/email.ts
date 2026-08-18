@@ -369,3 +369,103 @@ export async function sendPasswordReset(input: {
     }),
   });
 }
+
+/** Minutes → "8h 30m" (or "8h"). */
+function fmtMins(minutes: number): string {
+  const m = Math.max(0, Math.round(minutes || 0));
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return mm ? `${h}h ${mm}m` : `${h}h`;
+}
+
+interface ReportData {
+  name: string;
+  email: string;
+  timeMinutes: number;
+  tasks: { open: number; overdue: number; completed: number };
+  attendance: {
+    present: number;
+    late: number;
+    halfDay: number;
+    absent: number;
+    onLeave: number;
+    workedMinutes: number;
+    overtimeMinutes: number;
+    workingDays: number;
+  };
+  utilizationPct: number;
+}
+
+/** Personal work summary emailed to one employee. */
+export async function sendEmployeeReport(input: {
+  periodLabel: string;
+  report: ReportData;
+}): Promise<{ ok: boolean }> {
+  const r = input.report;
+  const a = r.attendance;
+  const body = [
+    `Hi ${r.name},`,
+    ``,
+    `Here's your work summary for ${input.periodLabel}.`,
+    ``,
+    `TIME & UTILIZATION`,
+    `  Time logged: ${fmtMins(r.timeMinutes)}`,
+    `  Utilization: ${r.utilizationPct}%`,
+    ``,
+    `TASKS`,
+    `  Completed: ${r.tasks.completed}`,
+    `  Open: ${r.tasks.open} (${r.tasks.overdue} overdue)`,
+    ``,
+    `ATTENDANCE`,
+    `  Present: ${a.present}   Late: ${a.late}   Half-days: ${a.halfDay}`,
+    `  Absent: ${a.absent}   On leave: ${a.onLeave}`,
+    `  Hours worked: ${fmtMins(a.workedMinutes)}`,
+  ].join('\n');
+
+  return sendEmail({
+    to: r.email,
+    subject: `Your work summary · ${input.periodLabel}`,
+    text: body,
+    html: basicHtml({
+      heading: 'Your work summary',
+      body,
+      preheader: `Tasks, time, attendance & utilization for ${input.periodLabel}.`,
+    }),
+  });
+}
+
+/** Combined team overview emailed to the owner. */
+export async function sendTeamReport(input: {
+  to: string;
+  name: string;
+  periodLabel: string;
+  members: ReportData[];
+}): Promise<{ ok: boolean }> {
+  const lines = input.members.map((m) => {
+    const a = m.attendance;
+    return [
+      m.name,
+      `  Utilization ${m.utilizationPct}% · Logged ${fmtMins(m.timeMinutes)}`,
+      `  Tasks: ${m.tasks.completed} done, ${m.tasks.open} open (${m.tasks.overdue} overdue)`,
+      `  Attendance: ${a.present} present, ${a.absent} absent, ${a.late} late, ${a.halfDay} half-day`,
+    ].join('\n');
+  });
+  const body = [
+    `Hi ${input.name},`,
+    ``,
+    `Team work summary for ${input.periodLabel} (${input.members.length} staff):`,
+    ``,
+    lines.join('\n\n') || '  No staff to report.',
+  ].join('\n');
+
+  return sendEmail({
+    to: input.to,
+    subject: `Team work summary · ${input.periodLabel}`,
+    text: body,
+    html: basicHtml({
+      heading: 'Team work summary',
+      body,
+      preheader: `Per-employee tasks, time & attendance for ${input.periodLabel}.`,
+    }),
+  });
+}

@@ -3,6 +3,7 @@ import { createApp } from './app.js';
 import { env } from './env.js';
 import { ensurePragmas } from './db/client.js';
 import { initSocket } from './realtime/socket.js';
+import { startScheduler } from './services/scheduler.js';
 
 async function main() {
   // Enable SQLite FK enforcement before serving traffic (best-effort).
@@ -21,6 +22,9 @@ async function main() {
       `[sanctum] listening on http://0.0.0.0:${port} (${env.NODE_ENV}) — REST + Socket.IO`,
     );
   });
+
+  // Background schedules (monthly employee reports).
+  startScheduler();
 }
 
 main().catch((err) => {
