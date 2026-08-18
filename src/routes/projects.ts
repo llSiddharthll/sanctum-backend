@@ -105,7 +105,9 @@ const projectSelection = {
   id: projects.id,
   clientId: projects.clientId,
   name: projects.name,
+  scopeOfWork: projects.scopeOfWork,
   description: projects.description,
+  services: projects.services,
   type: projects.type,
   status: projects.status,
   health: projects.health,
@@ -130,7 +132,9 @@ type ProjectRow = {
   id: string;
   clientId: string;
   name: string;
+  scopeOfWork: string | null;
   description: string | null;
+  services: string;
   type: string;
   status: string;
   health: string;
@@ -223,13 +227,28 @@ async function visibleProjectIds(
   ];
 }
 
+/** Parse a stored JSON string array (services), tolerating bad data. */
+function safeStringArray(s: string | null): string[] {
+  if (!s) return [];
+  try {
+    const v = JSON.parse(s);
+    return Array.isArray(v)
+      ? v.filter((x): x is string => typeof x === 'string')
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 function serializeProject(p: ProjectRow, showFinance = true) {
   return {
     id: p.id,
     clientId: p.clientId,
     clientName: p.clientName,
     name: p.name,
+    scopeOfWork: p.scopeOfWork,
     description: p.description,
+    services: safeStringArray(p.services),
     type: p.type,
     status: p.status,
     health: p.health,
@@ -682,7 +701,9 @@ projectsRouter.get('/all-tasks', async (req, res) => {
 const createSchema = z.object({
   name: z.string().min(1).max(160),
   clientId: z.string().min(1),
+  scopeOfWork: z.string().max(5000).optional(),
   description: z.string().max(5000).optional(),
+  services: z.array(z.string().max(60)).max(30).optional(),
   type: z.enum(PROJECT_TYPES).optional(),
   status: z.enum(PROJECT_STATUSES).optional(),
   health: z.enum(PROJECT_HEALTH).optional(),
@@ -705,7 +726,11 @@ projectsRouter.post('/', async (req, res) => {
     agencyId: ctx.agencyId,
     clientId: body.clientId,
     name: body.name,
+    scopeOfWork: body.scopeOfWork ?? null,
     description: body.description ?? null,
+    ...(body.services !== undefined
+      ? { services: JSON.stringify(body.services) }
+      : {}),
     ...(body.type !== undefined ? { type: body.type } : {}),
     ...(body.status !== undefined ? { status: body.status } : {}),
     ...(body.health !== undefined ? { health: body.health } : {}),
@@ -756,7 +781,9 @@ projectsRouter.get('/:id', async (req, res) => {
 const updateSchema = z.object({
   name: z.string().min(1).max(160).optional(),
   clientId: z.string().min(1).optional(),
+  scopeOfWork: z.string().max(5000).nullable().optional(),
   description: z.string().max(5000).nullable().optional(),
+  services: z.array(z.string().max(60)).max(30).optional(),
   type: z.enum(PROJECT_TYPES).optional(),
   status: z.enum(PROJECT_STATUSES).optional(),
   health: z.enum(PROJECT_HEALTH).optional(),
@@ -781,7 +808,9 @@ projectsRouter.patch('/:id', async (req, res) => {
   const patch: Partial<typeof projects.$inferInsert> = { updatedAt: new Date() };
   if (body.name !== undefined) patch.name = body.name;
   if (body.clientId !== undefined) patch.clientId = body.clientId;
+  if (body.scopeOfWork !== undefined) patch.scopeOfWork = body.scopeOfWork;
   if (body.description !== undefined) patch.description = body.description;
+  if (body.services !== undefined) patch.services = JSON.stringify(body.services);
   if (body.type !== undefined) patch.type = body.type;
   if (body.status !== undefined) patch.status = body.status;
   if (body.health !== undefined) patch.health = body.health;

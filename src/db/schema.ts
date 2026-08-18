@@ -671,7 +671,11 @@ export const projects = sqliteTable(
       .notNull()
       .references(() => clients.id, { onDelete: 'cascade' }),
     name: text('name').notNull(),
+    // Scope of work (shown before the description in the form).
+    scopeOfWork: text('scope_of_work'),
     description: text('description'),
+    // Services this project covers (JSON string array, e.g. ["social_media"]).
+    services: text('services').notNull().default('[]'),
     type: text('type', {
       enum: ['fixed_price', 'retainer', 'hourly', 'milestone_based'],
     })
