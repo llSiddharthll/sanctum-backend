@@ -1325,10 +1325,11 @@ projectsRouter.post('/:id/tasks', async (req, res) => {
   const body = createTaskSchema.parse(req.body);
 
   // Resolve the assignee set: explicit `assigneeIds` wins, else the legacy
-  // single `assigneeId` (if any). Deduped; the first becomes the primary.
-  const assigneeIds = [
-    ...new Set(body.assigneeIds ?? (body.assigneeId ? [body.assigneeId] : [])),
-  ];
+  // single `assigneeId`. When NONE is given, auto-assign to the CREATOR so
+  // members can self-create tasks (e.g. when a manager isn't around to assign).
+  const requested =
+    body.assigneeIds ?? (body.assigneeId ? [body.assigneeId] : []);
+  const assigneeIds = [...new Set(requested.length ? requested : [ctx.userId])];
   for (const uid of assigneeIds) {
     await requireAgencyUser(ctx, uid);
   }
