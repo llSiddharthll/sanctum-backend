@@ -16,6 +16,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
+import { notifyMany, agencyOwners } from '../services/notifications.js';
 import { sendEmail } from '../services/email.js';
 import { getFrontendOrigin } from '../lib/frontend-url.js';
 import { generateAiAgreementDraft, enhanceTextWithAi } from '../services/ai.js';
@@ -105,6 +106,18 @@ agreementsRouter.post('/public/:token/sign', async (req, res) => {
     entityId: a.id,
     metadata: { signerName: body.signerName, signerIp: req.ip },
     ip: req.ip,
+  });
+
+  // Notify the owner(s) in real time (bell + socket + push). Agreements are an
+  // owner-only Business module, so only owners are alerted.
+  await notifyMany(await agencyOwners(a.agencyId), {
+    agencyId: a.agencyId,
+    type: 'agreement.signed',
+    title: `Agreement signed — ${a.title}`,
+    body: `${body.signerName} e-signed this agreement.`,
+    entityType: 'agreement',
+    entityId: a.id,
+    link: '/agreements',
   });
 
   ok(res, { signed: true, signedAt: new Date().toISOString() });

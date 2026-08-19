@@ -18,6 +18,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
+import { notifyMany, agencyOwners } from '../services/notifications.js';
 import { sendEmail } from '../services/email.js';
 import { getFrontendOrigin } from '../lib/frontend-url.js';
 import { generateAiProposalDraft, enhanceTextWithAi } from '../services/ai.js';
@@ -105,6 +106,18 @@ proposalsRouter.post('/public/:token/accept', async (req, res) => {
     ip: req.ip,
   });
 
+  // Notify the owner(s) in real time (bell + socket + push). Proposals are an
+  // owner-only Business module, so only owners are alerted.
+  await notifyMany(await agencyOwners(p.agencyId), {
+    agencyId: p.agencyId,
+    type: 'proposal.accepted',
+    title: `Proposal accepted — ${p.title}`,
+    body: `${body.acceptedBy} accepted this proposal.`,
+    entityType: 'proposal',
+    entityId: p.id,
+    link: '/proposals',
+  });
+
   ok(res, { accepted: true, acceptedAt: new Date().toISOString() });
 });
 
@@ -128,6 +141,29 @@ proposalsRouter.post('/public/:token/reject', async (req, res) => {
       updatedAt: new Date(),
     })
     .where(eq(proposals.id, p.id));
+
+  await audit({
+    agencyId: p.agencyId,
+    actorType: 'client',
+    actorId: 'client',
+    action: 'proposal.changes_requested',
+    entityType: 'proposal',
+    entityId: p.id,
+    ip: req.ip,
+  });
+
+  // Alert the owner(s) in real time that the client wants changes.
+  await notifyMany(await agencyOwners(p.agencyId), {
+    agencyId: p.agencyId,
+    type: 'proposal.changes_requested',
+    title: `Changes requested — ${p.title}`,
+    body: body.reason
+      ? `Client feedback: "${body.reason}"`
+      : 'The client requested changes to this proposal.',
+    entityType: 'proposal',
+    entityId: p.id,
+    link: '/proposals',
+  });
 
   ok(res, { rejected: true });
 });
@@ -289,7 +325,7 @@ const proposalSchema = z.object({
   taxPaise: z.number().int().min(0).optional(),
   totalPaise: z.number().int().min(0).optional(),
   billingType: z.enum(['one_time', 'retainer']).optional(),
-  recurringPaise: z.number().int().min(0).optional(),
+  recurringPaise: z.number().int().min(0).nullable().optional(),
   validUntil: z.coerce.date().optional(),
   content: z.record(z.string(), z.any()),
 });
@@ -450,6 +486,40 @@ authRouter.post('/:id/convert-to-agreement', async (req, res) => {
 
   const proposalContent = safeJson(p.contentJson) as Record<string, any>;
 
+  // Map the proposal into the agreement's { scope: string, clauses: string[] }
+  // shape (same as a form-authored agreement). The proposal's scope field is
+  // `scopeOverview`; its `terms` array becomes the contract clauses.
+  const overview =
+    typeof proposalContent.scopeOverview === 'string' &&
+    proposalContent.scopeOverview.trim()
+      ? proposalContent.scopeOverview.trim()
+      : typeof proposalContent.scope === 'string' && proposalContent.scope.trim()
+        ? proposalContent.scope.trim()
+        : `Agency services as described in "${p.title}".`;
+
+  // Fold the deliverable titles into the scope so nothing is lost in conversion.
+  const deliverableTitles = Array.isArray(proposalContent.deliverables)
+    ? proposalContent.deliverables
+        .map((d: any) => (typeof d?.title === 'string' ? d.title.trim() : ''))
+        .filter((s: string) => s.length > 0)
+    : [];
+  const scope = deliverableTitles.length
+    ? `${overview}\n\nDeliverables: ${deliverableTitles.join('; ')}.`
+    : overview;
+
+  const clauses: string[] = Array.isArray(proposalContent.terms)
+    ? proposalContent.terms.filter(
+        (c: unknown): c is string => typeof c === 'string' && c.trim().length > 0,
+      )
+    : [];
+  if (clauses.length === 0) {
+    clauses.push(
+      'Services will be delivered per the accepted proposal.',
+      'Intellectual property transfers to the client upon full payment.',
+      'Either party may terminate with 30 days written notice.',
+    );
+  }
+
   await db.insert(agreements).values({
     id: agreementId,
     agencyId: ctx.agencyId,
@@ -459,14 +529,9 @@ authRouter.post('/:id/convert-to-agreement', async (req, res) => {
     title: `Agreement for ${p.title}`,
     status: 'draft',
     totalValuePaise: p.totalPaise,
+    retainerPaise: p.billingType === 'retainer' ? p.recurringPaise : 0,
     currency: p.currency,
-    termsJson: JSON.stringify({
-      scopeOfWork: proposalContent.scope ?? proposalContent.deliverables ?? p.title,
-      paymentTerms: proposalContent.paymentTerms ?? 'Standard 30-day net terms',
-      milestones: proposalContent.milestones ?? [],
-      confidentiality: true,
-      intellectualProperty: 'Transferred upon full payment',
-    }),
+    termsJson: JSON.stringify({ scope, clauses }),
     token,
     createdBy: ctx.userId,
   });
@@ -541,7 +606,7 @@ const updateProposalSchema = z.object({
   taxPaise: z.number().int().min(0).optional(),
   totalPaise: z.number().int().min(0).optional(),
   billingType: z.enum(['one_time', 'retainer']).optional(),
-  recurringPaise: z.number().int().min(0).optional(),
+  recurringPaise: z.number().int().min(0).nullable().optional(),
   validUntil: z.coerce.date().optional().nullable(),
   content: z.record(z.string(), z.any()).optional(),
 });
@@ -572,7 +637,8 @@ authRouter.put('/:id', async (req, res) => {
   if (body.taxPaise !== undefined) patch.taxPaise = body.taxPaise;
   if (body.totalPaise !== undefined) patch.totalPaise = body.totalPaise;
   if (body.billingType !== undefined) patch.billingType = body.billingType;
-  if (body.recurringPaise !== undefined) patch.recurringPaise = body.recurringPaise;
+  if (body.recurringPaise !== undefined)
+    patch.recurringPaise = body.recurringPaise ?? 0;
   if (body.validUntil !== undefined) patch.validUntil = body.validUntil;
   if (body.content !== undefined) patch.contentJson = JSON.stringify(body.content);
 

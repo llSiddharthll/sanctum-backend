@@ -446,6 +446,8 @@ authRouter.post('/reset-password', authLimiter, async (req, res) => {
     id: user.id,
     agencyId: user.agencyId,
     role: user.role,
+    // Preserve the client's brand across a password reset too.
+    clientId: user.clientId,
   });
   await audit({
     agencyId: user.agencyId,
@@ -545,6 +547,9 @@ authRouter.post('/refresh', authLimiter, async (req, res) => {
     id: user.id,
     agencyId: user.agencyId,
     role: user.role,
+    // Carry the brand through a refresh — without it a client's rotated access
+    // token loses `clientId` and requireClientAuth 403s the whole portal.
+    clientId: user.clientId,
   });
   ok(res, { refreshed: true, tokens });
 });

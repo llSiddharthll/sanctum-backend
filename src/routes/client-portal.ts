@@ -906,6 +906,7 @@ clientPortalRouter.get('/proposals', async (req, res) => {
       sentAt: toIso(p.sentAt),
       viewedAt: toIso(p.viewedAt),
       acceptedAt: toIso(p.acceptedAt),
+      rejectionReason: p.rejectionReason,
       createdAt: toIso(p.createdAt),
     })),
   );
