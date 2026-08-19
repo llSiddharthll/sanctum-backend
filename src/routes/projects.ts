@@ -671,6 +671,15 @@ projectsRouter.get('/all-tasks', async (req, res) => {
     filters.push(like(projectTasks.title, `%${search.trim()}%`));
   }
 
+  // Scope guard: only owner/admin/Manager (projects:manage) see every task.
+  // A plain employee is limited to tasks in the projects they belong to or have
+  // a task assigned on — they can't fetch the whole agency's board here.
+  if (!(await canSeeAllProjects(req))) {
+    const allowed = await visibleProjectIds(ctx);
+    if (allowed.length === 0) return ok(res, []);
+    filters.push(inArray(projectTasks.projectId, allowed));
+  }
+
   const rows = await db
     .select({
       t: projectTasks,
@@ -717,6 +726,17 @@ const createSchema = z.object({
 
 projectsRouter.post('/', async (req, res) => {
   const ctx = getAuth(req);
+  // Creating a project needs the 'manage' tier (owner/admin/Manager preset).
+  // Plain employees (projects:edit) work on tasks but can't spin up projects.
+  if (!isPrivileged(ctx.role)) {
+    const perms = await loadPermissions(req);
+    if (!meetsLevel(perms.projects, 'manage')) {
+      res
+        .status(403)
+        .json({ error: 'You need manage access on projects to create one.' });
+      return;
+    }
+  }
   const body = createSchema.parse(req.body);
   await requireAgencyClient(ctx, body.clientId);
 
