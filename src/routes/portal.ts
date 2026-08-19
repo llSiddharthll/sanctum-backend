@@ -11,7 +11,10 @@ import {
   postComments,
   postMedia,
   projects,
+  users,
 } from '../db/schema.js';
+import { signAccessToken, signRefreshToken } from '../lib/jwt.js';
+import { hashPassword } from '../lib/password.js';
 import { ok, created, toIso } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { invalidState, notFound, forbidden } from '../lib/errors.js';
@@ -20,6 +23,7 @@ import { requirePortalToken } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
 import { agencyApprovers, notifyMany } from '../services/notifications.js';
 import { notifyClientApproval } from '../services/client-notify.js';
+import { mirrorClientPostComment } from '../services/client-discussion.js';
 import { broadcastPortalRefresh } from '../realtime/io.js';
 import type { PortalContext } from '../types/index.js';
 
@@ -31,6 +35,81 @@ function getPortal(req: import('express').Request): PortalContext {
   if (!req.portal) throw notFound('Invalid link.');
   return req.portal;
 }
+
+/**
+ * Find (or lazily create) the dedicated "portal" client user a share-link signs
+ * in as. It's a real `role: 'client'` user scoped to the brand (so /auth/me,
+ * token refresh and every /client route work unchanged) but has no usable
+ * password — access is only ever via the share link. One per client, keyed by a
+ * synthetic email so we never expose a specific person's login.
+ */
+async function ensurePortalUser(
+  agencyId: string,
+  clientId: string,
+): Promise<string> {
+  const email = `portal.${clientId}@portal.sanctum`.toLowerCase();
+  const [existing] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(and(eq(users.agencyId, agencyId), eq(users.email, email)))
+    .limit(1);
+  if (existing) return existing.id;
+
+  const [brand] = await db
+    .select({ name: clients.name })
+    .from(clients)
+    .where(eq(clients.id, clientId))
+    .limit(1);
+  const id = newId('usr');
+  await db.insert(users).values({
+    id,
+    agencyId,
+    clientId,
+    email,
+    // Random, never-usable password — the portal user only ever authenticates
+    // through the opaque share-link token, never a password.
+    passwordHash: await hashPassword(newId('ptl') + newId('ptl')),
+    fullName: `${brand?.name ?? 'Client'} (portal link)`,
+    role: 'client',
+    status: 'active',
+  });
+  return id;
+}
+
+/**
+ * POST /portal/session — exchange a valid share-link token (sent as the Bearer,
+ * validated by requirePortalToken) for a real client session. This turns the
+ * "review link" into full portal access: the returned tokens log the visitor
+ * into the logged-in client portal (/client) as their brand's portal user.
+ */
+portalRouter.post('/session', async (req, res) => {
+  const { agencyId, clientId } = getPortal(req);
+  const userId = await ensurePortalUser(agencyId, clientId);
+  const access = await signAccessToken({
+    userId,
+    agencyId,
+    role: 'client',
+    clientId,
+  });
+  const refresh = await signRefreshToken({ userId, agencyId });
+
+  const [brand] = await db
+    .select({ name: clients.name })
+    .from(clients)
+    .where(eq(clients.id, clientId))
+    .limit(1);
+  const [agency] = await db
+    .select({ name: agencies.name })
+    .from(agencies)
+    .where(eq(agencies.id, agencyId))
+    .limit(1);
+
+  ok(res, {
+    tokens: { access, refresh },
+    client: { name: brand?.name ?? 'Your brand' },
+    agency: { name: agency?.name ?? 'Client Portal' },
+  });
+});
 
 function safeArr(s: string): string[] {
   try {
@@ -424,6 +503,16 @@ portalRouter.post('/posts/:postId/comments', async (req, res) => {
     title: `${who} commented`,
     body: body.body.trim().slice(0, 120),
     postId: post.id,
+  });
+
+  // Mirror the client's comment into the team's internal Messages group so
+  // everyone working on this client sees it and can discuss it there.
+  await mirrorClientPostComment({
+    agencyId: p.agencyId,
+    clientId: p.clientId,
+    postId: post.id,
+    authorName: who,
+    body: body.body,
   });
 
   broadcastPortalRefresh(p.clientId);

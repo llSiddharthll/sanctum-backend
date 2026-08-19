@@ -8,6 +8,7 @@ import {
   timeLogs,
   timers,
   users,
+  attendancePolicy,
 } from '../db/schema.js';
 import { ok, created, toIso } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
@@ -16,6 +17,12 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
+import {
+  resolvePolicy,
+  dayKeyInTz,
+  minutesIntoDayInTz,
+  type ResolvedPolicy,
+} from '../lib/attendance.js';
 
 export const timersRouter = Router();
 timersRouter.use(requireAuth);
@@ -175,8 +182,17 @@ async function stopTimerRow(
   timer: typeof timers.$inferSelect,
   taskTitle: string | null,
   ip?: string,
+  /** Cap the billed time at this instant (e.g. checkout / shift end) instead of
+   * "now" — used to auto-close forgotten timers without runaway hours. */
+  endAt?: Date,
 ): Promise<{ minutes: number; timeLogId: string }> {
-  const minutes = billedMinutes(timer.startedAt);
+  const minutes =
+    endAt && timer.startedAt
+      ? Math.max(
+          1,
+          Math.round((endAt.getTime() - timer.startedAt.getTime()) / 60000),
+        )
+      : billedMinutes(timer.startedAt);
   const timeLogId = newId('tlg');
   await db.insert(timeLogs).values({
     id: timeLogId,
@@ -228,6 +244,91 @@ export async function stopTimersForTask(
     await stopTimerRow(ctx, timer, taskTitle);
   }
   return running.length;
+}
+
+/**
+ * Stop every running timer for a user, billing each only up to `endAt` (their
+ * checkout instant). Called on check-out so a timer left running doesn't keep
+ * accruing after the person has gone home.
+ */
+export async function stopTimersForUser(
+  ctx: Ctx,
+  userId: string,
+  endAt: Date,
+): Promise<number> {
+  const running = await db
+    .select()
+    .from(timers)
+    .where(and(eq(timers.agencyId, ctx.agencyId), eq(timers.userId, userId)));
+  for (const timer of running) {
+    await stopTimerRow(ctx, timer, null, undefined, endAt);
+  }
+  return running.length;
+}
+
+/**
+ * Shift-end safety sweep (cron): auto-close any timer still running past its
+ * start-day's shift end — for people who forgot to stop it AND to check out.
+ * Each timer is billed only up to the shift end, so an overnight / runaway
+ * timer can never corrupt the totals. Best-effort per timer.
+ */
+export async function sweepStaleTimers(): Promise<number> {
+  const running = await db.select().from(timers);
+  if (running.length === 0) return 0;
+
+  const policyCache = new Map<string, ResolvedPolicy>();
+  const now = new Date();
+  let closed = 0;
+
+  for (const timer of running) {
+    try {
+      if (!timer.startedAt) continue;
+      let policy = policyCache.get(timer.agencyId);
+      if (!policy) {
+        const [row] = await db
+          .select()
+          .from(attendancePolicy)
+          .where(eq(attendancePolicy.agencyId, timer.agencyId))
+          .limit(1);
+        policy = resolvePolicy(row ?? null);
+        policyCache.set(timer.agencyId, policy);
+      }
+
+      const startDay = dayKeyInTz(timer.startedAt, policy.timezone);
+      const nowDay = dayKeyInTz(now, policy.timezone);
+      const startLocalMin = minutesIntoDayInTz(timer.startedAt, policy.timezone);
+      const nowLocalMin = minutesIntoDayInTz(now, policy.timezone);
+
+      // Past the start-day's shift end? (any later day always is.)
+      const pastShiftEnd =
+        startDay < nowDay ||
+        (startDay === nowDay && nowLocalMin >= policy.shiftEndMin);
+      if (!pastShiftEnd) continue;
+
+      const elapsed = Math.max(
+        1,
+        Math.round((now.getTime() - timer.startedAt.getTime()) / 60000),
+      );
+      const untilShiftEnd = policy.shiftEndMin - startLocalMin;
+      const capMinutes =
+        untilShiftEnd > 0
+          ? Math.min(elapsed, untilShiftEnd)
+          : Math.min(elapsed, policy.fullDayMinutes); // started after hours
+      const endAt = new Date(timer.startedAt.getTime() + capMinutes * 60000);
+
+      // Attribute the auto-close to the timer's own owner.
+      const ctx = {
+        agencyId: timer.agencyId,
+        userId: timer.userId,
+        role: 'member',
+      } as unknown as Ctx;
+      await stopTimerRow(ctx, timer, null, undefined, endAt);
+      closed += 1;
+    } catch {
+      /* keep sweeping the rest */
+    }
+  }
+  return closed;
 }
 
 /**

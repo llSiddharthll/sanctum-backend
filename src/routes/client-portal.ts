@@ -26,6 +26,7 @@ import { ok, created, toIso, param } from '../lib/http.js';
 import { badRequest, forbidden, notFound } from '../lib/errors.js';
 import { newId } from '../lib/ids.js';
 import { audit } from '../services/audit.js';
+import { mirrorClientPostComment } from '../services/client-discussion.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireClientAuth, getClientCtx } from '../middleware/client.js';
 import { signDocumentUpload } from '../services/cloudinary.js';
@@ -792,6 +793,17 @@ clientPortalRouter.post('/posts/:postId/comments', async (req, res) => {
     authorLabel: name,
     body: body.body,
   });
+
+  // Mirror into the team's internal Messages group + notify everyone working
+  // on this client (same bridge the token portal uses).
+  await mirrorClientPostComment({
+    agencyId: ctx.agencyId,
+    clientId: ctx.clientId,
+    postId: post.id,
+    authorName: name,
+    body: body.body,
+  });
+
   created(res, {
     id,
     authorType: 'client',

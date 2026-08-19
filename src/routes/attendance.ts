@@ -28,6 +28,7 @@ import {
 } from '../services/notifications.js';
 import { leavesRouter } from './leaves.js';
 import { regularizationsRouter } from './regularizations.js';
+import { stopTimersForUser } from './timers.js';
 import {
   dayKeyInTz,
   deriveDayStatus,
@@ -500,6 +501,11 @@ attendanceRouter.post('/check-out', async (req, res) => {
     metadata: { day, workedMinutes: derived.workedMinutes },
     ip: req.ip,
   });
+
+  // Auto-close any task timer left running — bill it only up to checkout so a
+  // forgotten timer never over-counts.
+  await stopTimersForUser(ctx, ctx.userId, now).catch(() => undefined);
+
   ok(res, serializeRecord(row!));
 });
 

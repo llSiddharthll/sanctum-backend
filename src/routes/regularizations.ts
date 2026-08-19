@@ -210,7 +210,16 @@ regularizationsRouter.post('/:id/decide', async (req, res) => {
       checkOutAt,
       onLeave: reg.requestedStatus === 'on_leave',
     });
-    const status = reg.requestedStatus ?? derived.status;
+    const rawStatus = reg.requestedStatus ?? derived.status;
+    // Approving a regularization credits a FULL working day — present, full-day
+    // minutes, on-time — unless it's explicitly a leave/absence request.
+    const isWorkingDay = rawStatus !== 'on_leave' && rawStatus !== 'absent';
+    const status = isWorkingDay ? 'present' : rawStatus;
+    const workedMinutes = isWorkingDay
+      ? policy.fullDayMinutes
+      : derived.workedMinutes;
+    const isLate = isWorkingDay ? false : derived.isLate;
+    const overtimeMinutes = isWorkingDay ? 0 : derived.overtimeMinutes;
     const now = new Date();
 
     if (existing) {
@@ -220,9 +229,9 @@ regularizationsRouter.post('/:id/decide', async (req, res) => {
           checkInAt,
           checkOutAt,
           status,
-          isLate: derived.isLate,
-          workedMinutes: derived.workedMinutes,
-          overtimeMinutes: derived.overtimeMinutes,
+          isLate,
+          workedMinutes,
+          overtimeMinutes,
           source: 'regularized',
           note: reg.reason,
           updatedAt: now,
@@ -237,9 +246,9 @@ regularizationsRouter.post('/:id/decide', async (req, res) => {
         checkInAt,
         checkOutAt,
         status,
-        isLate: derived.isLate,
-        workedMinutes: derived.workedMinutes,
-        overtimeMinutes: derived.overtimeMinutes,
+        isLate,
+        workedMinutes,
+        overtimeMinutes,
         source: 'regularized',
         note: reg.reason,
       });

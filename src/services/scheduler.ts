@@ -2,6 +2,7 @@ import cron from 'node-cron';
 import { db } from '../db/client.js';
 import { agencies } from '../db/schema.js';
 import { emailEmployeeReports } from './reports.js';
+import { sweepStaleTimers } from '../routes/timers.js';
 
 /** Previous calendar month as {from:'YYYY-MM-01', to:'YYYY-MM-<last>'} (UTC). */
 export function previousMonthRange(now: Date): { from: string; to: string } {
@@ -43,4 +44,15 @@ export function startScheduler(): void {
     void runMonthlyReports();
   });
   console.log('[scheduler] monthly employee reports scheduled (0 9 1 * *)');
+
+  // Every 15 min: auto-close timers left running past their shift end (for
+  // people who forgot to stop the timer AND to check out).
+  cron.schedule('*/15 * * * *', () => {
+    void sweepStaleTimers()
+      .then((n) => {
+        if (n > 0) console.log(`[timers] shift-end sweep closed ${n} stale timer(s)`);
+      })
+      .catch((e) => console.error('[timers] shift-end sweep failed', e));
+  });
+  console.log('[scheduler] timer shift-end sweep scheduled (*/15 * * * *)');
 }

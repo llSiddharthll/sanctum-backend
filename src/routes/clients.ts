@@ -19,8 +19,8 @@ import {
   auditLog,
 } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
-import { newId, newOpaqueToken } from '../lib/ids.js';
-import { conflict, notFound, quotaExceeded } from '../lib/errors.js';
+import { newId, newOpaqueToken, hashToken } from '../lib/ids.js';
+import { conflict, notFound, quotaExceeded, badRequest } from '../lib/errors.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import {
   requireModuleRW,
@@ -35,7 +35,7 @@ import {
   assignedClientIds,
 } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
-import { sendPortalWelcome } from '../services/email.js';
+import { sendPortalWelcome, sendEmail, basicHtml } from '../services/email.js';
 import { getFrontendOrigin } from '../lib/frontend-url.js';
 
 export const clientsRouter = Router();
@@ -477,6 +477,75 @@ clientsRouter.post(
     expiresAt: toIso(expiresAt),
   });
 });
+
+// POST /clients/:clientId/portal-share-email — email the client a branded link
+// that opens their full portal (no password). Reuses a token minted just now on
+// the client; the raw token is passed in so copy/share/email all share one link.
+const shareEmailSchema = z.object({
+  token: z.string().min(10),
+  email: z.string().email().optional(),
+});
+clientsRouter.post(
+  '/:clientId/portal-share-email',
+  requireRole('owner', 'admin'),
+  async (req, res) => {
+    const ctx = getAuth(req);
+    const client = await requireClientAccess(ctx, param(req, 'clientId'));
+    const body = shareEmailSchema.parse(req.body);
+
+    // The token must be a live portal token for THIS client (never email a link
+    // for someone else's brand).
+    const [tok] = await db
+      .select()
+      .from(portalTokens)
+      .where(eq(portalTokens.tokenHash, hashToken(body.token)))
+      .limit(1);
+    if (!tok || tok.clientId !== client.id || tok.revoked) {
+      throw notFound('That portal link is not valid for this client.');
+    }
+
+    const to = body.email?.trim() || client.contactEmail;
+    if (!to) {
+      throw badRequest(
+        'No email on file for this client — add a contact email or enter one to send to.',
+      );
+    }
+
+    const [agency] = await db
+      .select({ name: agencies.name })
+      .from(agencies)
+      .where(eq(agencies.id, ctx.agencyId))
+      .limit(1);
+    const agencyName = agency?.name ?? 'Your agency';
+    const link = `${getFrontendOrigin(req)}/access/${body.token}`;
+
+    await sendEmail({
+      to,
+      subject: `Your ${agencyName} client portal is ready`,
+      html: basicHtml({
+        heading: `Welcome to your portal`,
+        body: `Hi ${client.name}, ${agencyName} has set up your private client portal. In one place you can follow your projects, view the content calendar, review proposals & agreements, see invoices, and download shared files.<br><br>No password needed — just tap below to open it. Keep this link private; anyone with it can view your portal.`,
+        buttonLabel: 'Open my portal',
+        buttonUrl: link,
+        preheader: `${agencyName} shared your client portal — open it in one tap.`,
+      }),
+      text: `${agencyName} shared your client portal. Open it here (no password needed): ${link}`,
+    });
+
+    await audit({
+      agencyId: ctx.agencyId,
+      actorType: ctx.role,
+      actorId: ctx.userId,
+      action: 'portal_token.email',
+      entityType: 'client',
+      entityId: client.id,
+      metadata: { to },
+      ip: req.ip,
+    });
+
+    ok(res, { sent: true, to });
+  },
+);
 
 // GET /clients/:clientId/activity — audit feed across ALL the client's projects
 // (project create/update, task status changes, timers, milestones, etc.).
