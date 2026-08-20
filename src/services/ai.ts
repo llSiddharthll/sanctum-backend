@@ -1410,6 +1410,311 @@ export async function generateAiProposalDraft(
 }
 
 // ---------------------------------------------------------------------------
+//  Full marketing proposal (10-section, per the agency proposal template)
+// ---------------------------------------------------------------------------
+
+export interface MarketingProposalBrief {
+  clientName?: string | null;
+  agencyName?: string | null;
+  preparedBy?: string | null;
+  industry?: string | null;
+  services?: string[] | null;
+  painPoints?: string | null;
+  knownNumbers?: string | null;
+  budget?: string | null;
+  timeline?: string | null;
+  notes?: string | null;
+}
+
+export interface MarketingTier {
+  name: string;
+  recommended: boolean;
+  pricePerMonth: number | null; // rupees; null = to-be-filled
+  bestFor: string;
+  channels: string;
+  adSpend: string;
+  reporting: string;
+  strategist: string;
+  term: string;
+}
+
+export interface MarketingProposalContent {
+  kind: 'marketing';
+  title: string;
+  preparedBy: string;
+  situation: string;
+  whereYouShouldBe: string;
+  plan: { phase: string; outcome: string; bullets: string[] }[];
+  scope: { included: { service: string; detail: string }[]; excluded: string[] };
+  tiers: MarketingTier[];
+  pricingNote: string;
+  roi: { scenario: string; assumption: string; result: string; payback: string }[];
+  roiNote: string;
+  why: string;
+  faq: { q: string; a: string }[];
+  nextStep: string;
+}
+
+export interface MarketingProposalResult extends MarketingProposalContent {
+  source: 'gemini' | 'fallback';
+}
+
+const MARKETING_SYSTEM = `You are a senior proposal strategist at a full-service digital marketing agency. Write a decision document for ONE buyer that earns a signature. Rules:
+- Mirror the client's own situation; the "situation" section must be specific to THEM, not reusable.
+- Ban jargon (synergy, full-funnel, best-in-class, leverage(verb), holistic, unlock, circle back). One idea per short paragraph. Headings/claims state outcomes.
+- Never invent specific client numbers; use qualitative framing or clearly-labelled benchmark ranges. Never fabricate case studies.
+- Pricing: three tiers, the MIDDLE one recommended, steps ~1.6–2x apart. If you don't know real prices use null for pricePerMonth.
+- ROI: conservative / expected / strong scenarios with visible arithmetic in "assumption". Anchor the fee to the conservative case if the math supports it.
+- Exactly ONE next step. No fake urgency. No "About Us" padding.
+Return ONLY minified JSON, no prose, no code fences, matching exactly this TypeScript type:
+{"title":string,"situation":string,"whereYouShouldBe":string,"plan":[{"phase":string,"outcome":string,"bullets":string[]}],"scope":{"included":[{"service":string,"detail":string}],"excluded":string[]},"tiers":[{"name":string,"recommended":boolean,"pricePerMonth":number|null,"bestFor":string,"channels":string,"adSpend":string,"reporting":string,"strategist":string,"term":string}],"pricingNote":string,"roi":[{"scenario":string,"assumption":string,"result":string,"payback":string}],"roiNote":string,"why":string,"faq":[{"q":string,"a":string}],"nextStep":string}
+Currency is Indian Rupees (₹). plan = exactly 3 phases (Days 0–30 / 31–60 / 61–90). tiers = exactly 3 (STARTER, RECOMMENDED, SCALE). roi = exactly 3 rows. faq = 3 items.`;
+
+function briefLines(b: MarketingProposalBrief): string {
+  const svc = (b.services ?? []).filter(Boolean).join(', ');
+  return [
+    `Client / company: ${b.clientName || 'the client'}`,
+    b.industry ? `Industry: ${b.industry}` : '',
+    svc ? `Services being pitched: ${svc}` : 'Services: a tailored digital marketing engagement',
+    b.painPoints ? `Stated pain points / goals: ${b.painPoints}` : '',
+    b.knownNumbers ? `Known numbers: ${b.knownNumbers}` : '',
+    b.budget ? `Budget signal: ${b.budget}` : '',
+    b.timeline ? `Timeline / urgency: ${b.timeline}` : '',
+    b.notes ? `Extra notes: ${b.notes}` : '',
+    `Agency: ${b.agencyName || 'our agency'}${b.preparedBy ? `, prepared by ${b.preparedBy}` : ''}`,
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+/** Deterministic, personalised fallback used when AI is off/unparseable. */
+function fallbackMarketing(b: MarketingProposalBrief): MarketingProposalContent {
+  const client = b.clientName || 'your business';
+  const services =
+    (b.services ?? []).filter(Boolean).length > 0
+      ? (b.services as string[])
+      : ['Paid Media', 'SEO & Content', 'Analytics & CRO'];
+  const svcList = services.join(', ');
+  const preparedBy = b.preparedBy || b.agencyName || 'Your account team';
+  return {
+    kind: 'marketing',
+    title: `A 90-Day Growth Plan for ${client}`,
+    preparedBy,
+    situation: `${client}${b.industry ? ` operates in ${b.industry}, where` : ', where'} attention is expensive and buyers compare options in minutes. ${b.painPoints ? `You told us the priority is to ${b.painPoints}.` : `Based on what's public, we'd expect the main pressure is inconsistent lead flow and marketing spend that isn't clearly tied to revenue.`}\n\nRight now the effort is likely spread across channels without a single system connecting spend to outcomes — which makes it hard to know what to double down on.`,
+    whereYouShouldBe: `Within 90 days, ${client} should have a measurable, compounding pipeline: a clear picture of which channels drive revenue, a repeatable content and campaign engine, and reporting you can trust. The cost of staying put isn't zero — every month without a system is budget spent that can't be attributed, and ground ceded to competitors who can.`,
+    plan: [
+      {
+        phase: 'Phase 1 — Days 0–30 · Foundation',
+        outcome: 'A clean measurement base and quick wins live.',
+        bullets: [
+          'Audit current channels, tracking, and funnel; fix analytics gaps.',
+          `Stand up ${services[0] ?? 'paid media'} with tight targeting and a test budget.`,
+          'Agree the KPIs and the single dashboard we report against.',
+        ],
+      },
+      {
+        phase: 'Phase 2 — Days 31–60 · Momentum',
+        outcome: 'Winning channels scaled, weak ones cut.',
+        bullets: [
+          'Double down on the best-performing campaigns; pause the rest.',
+          `Ship the first ${services[1] ?? 'content'} assets and landing-page improvements.`,
+          'First full performance review against the KPIs.',
+        ],
+      },
+      {
+        phase: 'Phase 3 — Days 61–90 · Compounding',
+        outcome: 'A repeatable growth engine you can see working.',
+        bullets: [
+          'Optimise conversion paths and creative from real data.',
+          'Lock in the monthly operating rhythm and reporting cadence.',
+          '90-day results readout with the plan for the next quarter.',
+        ],
+      },
+    ],
+    scope: {
+      included: services.map((s) => ({
+        service: s,
+        detail: `[FILL: what's delivered for ${s} each month]`,
+      })),
+      excluded: [
+        'Ad spend / media budget (billed at actuals, separate from the fee)',
+        'Third-party tool licences and paid stock/creative assets',
+        'Work outside the services listed above (scoped separately)',
+      ],
+    },
+    tiers: [
+      {
+        name: 'STARTER',
+        recommended: false,
+        pricePerMonth: null,
+        bestFor: 'Getting started with one core channel',
+        channels: services.slice(0, 1).join(', ') || 'One channel',
+        adSpend: '[FILL: up to ₹X/mo managed]',
+        reporting: 'Monthly report',
+        strategist: 'Shared strategist',
+        term: 'Month-to-month',
+      },
+      {
+        name: 'RECOMMENDED',
+        recommended: true,
+        pricePerMonth: null,
+        bestFor: 'The full plan described above',
+        channels: svcList,
+        adSpend: '[FILL: up to ₹X/mo managed]',
+        reporting: 'Bi-weekly report + monthly review call',
+        strategist: 'Dedicated strategist',
+        term: '3-month minimum, then monthly',
+      },
+      {
+        name: 'SCALE',
+        recommended: false,
+        pricePerMonth: null,
+        bestFor: 'Moving faster across more channels',
+        channels: `${svcList} + additional channels`,
+        adSpend: '[FILL: higher spend managed]',
+        reporting: 'Weekly report + bi-weekly calls',
+        strategist: 'Dedicated strategist + specialist team',
+        term: '6-month minimum',
+      },
+    ],
+    pricingNote:
+      'Fees are monthly and cover the work above. Ad spend is passed through at actuals and billed separately. Nothing is introduced for the first time in fine print.',
+    roi: [
+      {
+        scenario: 'Conservative',
+        assumption: '[FILL: baseline metric] × [FILL: conservative % lift]',
+        result: '[FILL: result / ₹ impact]',
+        payback: '[FILL: months]',
+      },
+      {
+        scenario: 'Expected',
+        assumption: '[FILL: baseline metric] × [FILL: expected % lift]',
+        result: '[FILL: result / ₹ impact]',
+        payback: '[FILL: months]',
+      },
+      {
+        scenario: 'Strong',
+        assumption: '[FILL: baseline metric] × [FILL: strong % lift]',
+        result: '[FILL: result / ₹ impact]',
+        payback: '[FILL: months]',
+      },
+    ],
+    roiNote:
+      '[FILL: “Even in the conservative scenario, this pays for itself by month X” — only if the numbers above support it.]',
+    why: `[FILL: 1–2 case studies matching ${client}'s industry or problem — starting metric → ending metric → timeframe → what changed. If none matches, replace with a stated guarantee or a pilot structure.]`,
+    faq: [
+      {
+        q: 'How soon will we see results?',
+        a: 'Foundational fixes and quick wins land inside the first 30 days; compounding results build across the 90-day plan. We report against agreed KPIs from week one so you always know where you stand.',
+      },
+      {
+        q: 'What if it isn’t working?',
+        a: 'We review against the KPIs at every checkpoint. If a channel underperforms, we reallocate — you’re never locked into spend that isn’t returning. The recommended tier starts with a 3-month window so we can prove the model.',
+      },
+      {
+        q: 'Who actually does the work?',
+        a: 'A dedicated strategist owns your account and coordinates the specialists (media, content, analytics). You get one point of contact, not a rotating cast.',
+      },
+    ],
+    nextStep: `To get started, reply to this proposal or accept it online, and we’ll book a 30-minute kickoff to lock the plan${b.timeline ? ` ahead of ${b.timeline}` : ' and hit the ground running'}.`,
+  };
+}
+
+const marketingCoerceSchema = z.object({
+  title: z.string(),
+  situation: z.string(),
+  whereYouShouldBe: z.string(),
+  plan: z
+    .array(
+      z.object({
+        phase: z.string(),
+        outcome: z.string(),
+        bullets: z.array(z.string()).default([]),
+      }),
+    )
+    .default([]),
+  scope: z
+    .object({
+      included: z
+        .array(z.object({ service: z.string(), detail: z.string() }))
+        .default([]),
+      excluded: z.array(z.string()).default([]),
+    })
+    .default({ included: [], excluded: [] }),
+  tiers: z
+    .array(
+      z.object({
+        name: z.string(),
+        recommended: z.boolean().default(false),
+        pricePerMonth: z.number().nullable().default(null),
+        bestFor: z.string().default(''),
+        channels: z.string().default(''),
+        adSpend: z.string().default(''),
+        reporting: z.string().default(''),
+        strategist: z.string().default(''),
+        term: z.string().default(''),
+      }),
+    )
+    .default([]),
+  pricingNote: z.string().default(''),
+  roi: z
+    .array(
+      z.object({
+        scenario: z.string(),
+        assumption: z.string().default(''),
+        result: z.string().default(''),
+        payback: z.string().default(''),
+      }),
+    )
+    .default([]),
+  roiNote: z.string().default(''),
+  why: z.string().default(''),
+  faq: z.array(z.object({ q: z.string(), a: z.string() })).default([]),
+  nextStep: z.string().default(''),
+});
+
+export async function generateMarketingProposal(
+  brief: MarketingProposalBrief,
+): Promise<MarketingProposalResult> {
+  const text = await callGeminiText({
+    system: MARKETING_SYSTEM,
+    contents: [
+      {
+        role: 'user',
+        text: `Write the proposal for this brief. Output only the JSON.\n\n${briefLines(brief)}`,
+      },
+    ],
+  });
+
+  if (text && text.trim()) {
+    const cleaned = stripCodeFences(text);
+    const first = cleaned.indexOf('{');
+    const last = cleaned.lastIndexOf('}');
+    if (first !== -1 && last > first) {
+      const parsed = marketingCoerceSchema.safeParse(
+        (() => {
+          try {
+            return JSON.parse(cleaned.slice(first, last + 1));
+          } catch {
+            return null;
+          }
+        })(),
+      );
+      if (parsed.success && parsed.data.plan.length && parsed.data.tiers.length) {
+        return {
+          kind: 'marketing',
+          preparedBy: brief.preparedBy || brief.agencyName || 'Your account team',
+          ...parsed.data,
+          source: 'gemini',
+        };
+      }
+    }
+  }
+
+  return { ...fallbackMarketing(brief), source: 'fallback' };
+}
+
+// ---------------------------------------------------------------------------
 //  AI Agreement & Contract Generation
 // ---------------------------------------------------------------------------
 

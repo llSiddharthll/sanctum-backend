@@ -19,9 +19,13 @@ import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
 import { notifyMany, agencyOwners } from '../services/notifications.js';
-import { sendEmail } from '../services/email.js';
+import { sendEmail, basicHtml } from '../services/email.js';
 import { getFrontendOrigin } from '../lib/frontend-url.js';
-import { generateAiProposalDraft, enhanceTextWithAi } from '../services/ai.js';
+import {
+  generateAiProposalDraft,
+  enhanceTextWithAi,
+  generateMarketingProposal,
+} from '../services/ai.js';
 
 export const proposalsRouter = Router();
 
@@ -420,24 +424,18 @@ authRouter.post('/:id/send', async (req, res) => {
   const [agency] = await db.select().from(agencies).where(eq(agencies.id, ctx.agencyId)).limit(1);
   const publicUrl = `${getFrontendOrigin(req)}/proposals/view/${p.token}`;
 
+  const agencyName = agency?.name ?? 'Creative Monk';
   await sendEmail({
     to: body.recipientEmail,
-    subject: `Proposal: ${p.title} from ${agency?.name ?? 'Creative Monk'}`,
-    text: `Hello, We're pleased to share the proposal "${p.title}" with you. Review proposal here: ${publicUrl}`,
-    html: `
-      <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #0c0d0e; color: #f3f4f6; border-radius: 12px;">
-        <h2 style="color: #ff6b00; margin-top: 0;">${agency?.name ?? 'Creative Monk'} Proposal</h2>
-        <p>Hello,</p>
-        <p>We're pleased to share the proposal <strong>${p.title}</strong> with you.</p>
-        ${body.message ? `<p style="background: #18191b; padding: 12px; border-radius: 8px; color: #d1d5db;">${body.message}</p>` : ''}
-        <div style="margin: 30px 0; text-align: center;">
-          <a href="${publicUrl}" style="background: #ff6b00; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-weight: bold; display: inline-block;">
-            Review Proposal &rarr;
-          </a>
-        </div>
-        <p style="font-size: 12px; color: #6b7280;">If the button above does not work, copy and paste this URL into your browser:<br/>${publicUrl}</p>
-      </div>
-    `,
+    subject: `Your proposal from ${agencyName}: ${p.title}`,
+    text: `We're pleased to share the proposal "${p.title}" with you.${body.message ? `\n\n${body.message}` : ''}\n\nReview it online (no login needed): ${publicUrl}`,
+    html: basicHtml({
+      heading: p.title,
+      body: `${agencyName} has prepared a proposal for you — <strong>${p.title}</strong>. Open it below to read the plan, scope, investment options and projected return, and accept it right from the page.${body.message ? `<br><br><em>${body.message}</em>` : ''}`,
+      buttonLabel: 'Review the proposal',
+      buttonUrl: publicUrl,
+      preheader: `${agencyName} shared a proposal with you — open it in one tap.`,
+    }),
   });
 
   await db
@@ -574,6 +572,61 @@ authRouter.post('/ai/generate', async (req, res) => {
     clientName: body.clientName,
     budgetRupees: body.budgetRupees,
     deliverablesCount: body.deliverablesCount,
+  });
+  ok(res, result);
+});
+
+// POST /proposals/ai/marketing — generate a full 10-section marketing proposal
+// (Situation → ROI → FAQ → Next step) from a short brief, filled dynamically.
+const aiMarketingSchema = z.object({
+  clientId: z.string().optional(),
+  clientName: z.string().max(160).optional(),
+  industry: z.string().max(160).optional(),
+  services: z.array(z.string().max(60)).max(20).optional(),
+  painPoints: z.string().max(2000).optional(),
+  knownNumbers: z.string().max(2000).optional(),
+  budget: z.string().max(200).optional(),
+  timeline: z.string().max(200).optional(),
+  notes: z.string().max(2000).optional(),
+});
+
+authRouter.post('/ai/marketing', async (req, res) => {
+  const ctx = getAuth(req);
+  const body = aiMarketingSchema.parse(req.body);
+
+  const [agency] = await db
+    .select({ name: agencies.name })
+    .from(agencies)
+    .where(eq(agencies.id, ctx.agencyId))
+    .limit(1);
+
+  // Enrich the brief from the client record when a clientId is given.
+  let clientName = body.clientName;
+  let industry = body.industry;
+  if (body.clientId) {
+    const [c] = await db
+      .select({ name: clients.name, industry: clients.industry })
+      .from(clients)
+      .where(
+        and(eq(clients.id, body.clientId), eq(clients.agencyId, ctx.agencyId)),
+      )
+      .limit(1);
+    if (c) {
+      clientName = clientName ?? c.name;
+      industry = industry ?? c.industry ?? undefined;
+    }
+  }
+
+  const result = await generateMarketingProposal({
+    clientName,
+    industry,
+    agencyName: agency?.name ?? null,
+    services: body.services ?? null,
+    painPoints: body.painPoints ?? null,
+    knownNumbers: body.knownNumbers ?? null,
+    budget: body.budget ?? null,
+    timeline: body.timeline ?? null,
+    notes: body.notes ?? null,
   });
   ok(res, result);
 });
