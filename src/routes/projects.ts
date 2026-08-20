@@ -614,17 +614,37 @@ async function getScopedProject(
     .limit(1);
   if (!row) throw notFound('Project not found.');
 
-  // GET requests are read-only: a member with projects:view may open ANY
-  // project (view-only). Mutations (POST/PATCH/PUT/DELETE) still require the
-  // caller to belong to the project (or hold projects:manage).
-  const seeAll =
-    req.method === 'GET'
-      ? await canViewAllProjects(req)
-      : await canSeeAllProjects(req);
-  if (!seeAll) {
-    const allowed = await visibleProjectIds(ctx);
-    if (!allowed.includes(projectId)) throw notFound('Project not found.');
+  const isRead = req.method === 'GET';
+  const isTaskWrite = !isRead && req.path.includes('/tasks');
+
+  // (a) BROWSE [GET] and (b) TASK work [writes on a /tasks route] are open to
+  // any member with projects:view — browse any project, add tasks, and edit the
+  // tasks they can see (their own). Scoped members otherwise fall back to the
+  // projects they belong to / have a task on.
+  if (isRead || isTaskWrite) {
+    if (await canViewAllProjects(req)) return row as ProjectRow;
+    const ids = await visibleProjectIds(ctx);
+    if (!ids.includes(projectId)) throw notFound('Project not found.');
+    return row as ProjectRow;
   }
+
+  // Project-STRUCTURE writes (settings, members, milestones, project labels)
+  // require projects:manage OR ACTUAL project membership. A task merely assigned
+  // in the project does NOT grant structure-edit — otherwise a view member who
+  // added a task could then edit the whole project.
+  if (await canSeeAllProjects(req)) return row as ProjectRow;
+  const [mem] = await db
+    .select({ id: projectMembers.id })
+    .from(projectMembers)
+    .where(
+      and(
+        eq(projectMembers.agencyId, ctx.agencyId),
+        eq(projectMembers.projectId, projectId),
+        eq(projectMembers.userId, ctx.userId),
+      ),
+    )
+    .limit(1);
+  if (!mem) throw notFound('Project not found.');
   return row as ProjectRow;
 }
 
