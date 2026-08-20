@@ -32,7 +32,7 @@ import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { AppError, notFound, conflict, forbidden } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
-import { requireModuleRW, loadPermissions } from '../middleware/permissions.js';
+import { loadPermissions } from '../middleware/permissions.js';
 import { meetsLevel } from '../lib/permissions.js';
 import { getAuth, isPrivileged } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
@@ -42,7 +42,36 @@ import { listProjectTimers, stopTimersForTask } from './timers.js';
 // with the other nested routers).
 export const projectsRouter = Router({ mergeParams: true });
 projectsRouter.use(requireAuth);
-projectsRouter.use(requireModuleRW('projects'));
+// Projects module gate. Everyone needs at least VIEW. Creating/updating TASKS is
+// core work for any project participant (employees/members self-create tasks when
+// a manager isn't around), so task writes are allowed at VIEW — the per-route
+// handlers still enforce that the caller belongs to the project (getScopedProject).
+// Project-STRUCTURE changes (project settings, members, milestones, labels,
+// create/delete project, delete task) keep the normal edit/manage ceiling.
+projectsRouter.use(async (req, _res, next) => {
+  try {
+    const perms = await loadPermissions(req);
+    const level = perms.projects;
+    if (!meetsLevel(level, 'view')) {
+      throw forbidden("You don't have permission to view Projects.");
+    }
+    const isWrite = !['GET', 'HEAD', 'OPTIONS'].includes(req.method);
+    if (isWrite) {
+      const isTaskWork = req.path.includes('/tasks') && req.method !== 'DELETE';
+      if (!isTaskWork) {
+        const needed = req.method === 'DELETE' ? 'manage' : 'edit';
+        if (!meetsLevel(level, needed)) {
+          throw forbidden(
+            `You don't have permission to ${needed} Projects.`,
+          );
+        }
+      }
+    }
+    next();
+  } catch (err) {
+    next(err);
+  }
+});
 
 const PROJECT_TYPES = [
   'fixed_price',
