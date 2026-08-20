@@ -722,7 +722,9 @@ projectsRouter.get('/all-tasks', async (req, res) => {
   // Scope guard: only owner/admin/Manager (projects:manage) see every task.
   // A plain employee is limited to tasks in the projects they belong to or have
   // a task assigned on — they can't fetch the whole agency's board here.
-  if (!(await canViewAllProjects(req))) {
+  // (Uses the manage threshold on purpose — view-level project browsing must not
+  // widen which TASKS an employee sees.)
+  if (!(await canSeeAllProjects(req))) {
     const allowed = await visibleProjectIds(ctx);
     if (allowed.length === 0) return ok(res, []);
     filters.push(inArray(projectTasks.projectId, allowed));
@@ -1194,7 +1196,9 @@ projectsRouter.get('/:id/tasks', async (req, res) => {
 
   // Scoped members (Employee tier) only see the tasks assigned to them within a
   // project — either as the primary assignee or via the task-assignees join.
-  if (!(await canViewAllProjects(req))) {
+  // Manage threshold on purpose: a member can BROWSE any project (view), but in
+  // the Tasks tab an employee sees only their own tasks, not the whole team's.
+  if (!(await canSeeAllProjects(req))) {
     const myAssigned = db
       .select({ taskId: taskAssignees.taskId })
       .from(taskAssignees)
