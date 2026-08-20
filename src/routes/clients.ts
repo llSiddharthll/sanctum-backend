@@ -82,13 +82,13 @@ function safeJson(s: string): unknown {
   }
 }
 
-// GET /clients — list. Owner/admin and clients-managers (attendance-style
-// "manage" level) see every client; a plain member (Employee tier) sees only
-// the clients they're assigned to.
+// GET /clients — list. Any member with clients:view browses the full brand
+// directory (view-only); editing/managing a client stays gated by permissions.
+// (Reaching this handler already requires clients:view via the module gate.)
 clientsRouter.get('/', async (req, res) => {
   const ctx = getAuth(req);
   const perms = await loadPermissions(req);
-  const seeAll = isPrivileged(ctx.role) || meetsLevel(perms.clients, 'manage');
+  const seeAll = isPrivileged(ctx.role) || meetsLevel(perms.clients, 'view');
 
   if (seeAll) {
     const rows = await db

@@ -208,6 +208,18 @@ async function canSeeAllProjects(req: import('express').Request): Promise<boolea
 }
 
 /**
+ * READ visibility: any member with projects:view may BROWSE every project
+ * (view-only directory). Writes stay membership-gated via canSeeAllProjects —
+ * this only widens what a member can look at, never what they can change.
+ */
+async function canViewAllProjects(req: import('express').Request): Promise<boolean> {
+  const ctx = getAuth(req);
+  if (isPrivileged(ctx.role)) return true;
+  const perms = await loadPermissions(req);
+  return meetsLevel(perms.projects, 'view');
+}
+
+/**
  * The set of project ids a SCOPED member may see: projects they're a member of,
  * plus projects that hold a task assigned to them (primary `assigneeId` or a
  * `taskAssignees` row). Only call this for callers where canSeeAllProjects is
@@ -602,7 +614,14 @@ async function getScopedProject(
     .limit(1);
   if (!row) throw notFound('Project not found.');
 
-  if (!(await canSeeAllProjects(req))) {
+  // GET requests are read-only: a member with projects:view may open ANY
+  // project (view-only). Mutations (POST/PATCH/PUT/DELETE) still require the
+  // caller to belong to the project (or hold projects:manage).
+  const seeAll =
+    req.method === 'GET'
+      ? await canViewAllProjects(req)
+      : await canSeeAllProjects(req);
+  if (!seeAll) {
     const allowed = await visibleProjectIds(ctx);
     if (!allowed.includes(projectId)) throw notFound('Project not found.');
   }
@@ -660,7 +679,7 @@ projectsRouter.get('/', async (req, res) => {
   }
 
   // Scoped members only see the projects they belong to / are assigned on.
-  if (!(await canSeeAllProjects(req))) {
+  if (!(await canViewAllProjects(req))) {
     const allowed = await visibleProjectIds(ctx);
     if (allowed.length === 0) {
       ok(res, []);
@@ -703,7 +722,7 @@ projectsRouter.get('/all-tasks', async (req, res) => {
   // Scope guard: only owner/admin/Manager (projects:manage) see every task.
   // A plain employee is limited to tasks in the projects they belong to or have
   // a task assigned on — they can't fetch the whole agency's board here.
-  if (!(await canSeeAllProjects(req))) {
+  if (!(await canViewAllProjects(req))) {
     const allowed = await visibleProjectIds(ctx);
     if (allowed.length === 0) return ok(res, []);
     filters.push(inArray(projectTasks.projectId, allowed));
@@ -1175,7 +1194,7 @@ projectsRouter.get('/:id/tasks', async (req, res) => {
 
   // Scoped members (Employee tier) only see the tasks assigned to them within a
   // project — either as the primary assignee or via the task-assignees join.
-  if (!(await canSeeAllProjects(req))) {
+  if (!(await canViewAllProjects(req))) {
     const myAssigned = db
       .select({ taskId: taskAssignees.taskId })
       .from(taskAssignees)
