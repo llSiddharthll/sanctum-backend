@@ -1419,9 +1419,15 @@ projectsRouter.post('/:id/tasks', async (req, res) => {
   // Resolve the assignee set: explicit `assigneeIds` wins, else the legacy
   // single `assigneeId`. When NONE is given, auto-assign to the CREATOR so
   // members can self-create tasks (e.g. when a manager isn't around to assign).
+  // A scoped member (Employee tier) ALWAYS owns the tasks they create — they're
+  // added to the assignee set even if others are named, so the task lands on
+  // their board (a plain member only sees tasks assigned to them).
   const requested =
     body.assigneeIds ?? (body.assigneeId ? [body.assigneeId] : []);
-  const assigneeIds = [...new Set(requested.length ? requested : [ctx.userId])];
+  const ids = requested.length ? [...requested] : [ctx.userId];
+  const scopedMember = !(await canSeeAllProjects(req));
+  if (scopedMember && !ids.includes(ctx.userId)) ids.push(ctx.userId);
+  const assigneeIds = [...new Set(ids)];
   for (const uid of assigneeIds) {
     await requireAgencyUser(ctx, uid);
   }
