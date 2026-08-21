@@ -30,6 +30,7 @@ import { mirrorClientPostComment } from '../services/client-discussion.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireClientAuth, getClientCtx } from '../middleware/client.js';
 import { signDocumentUpload } from '../services/storage.js';
+import { uploadOrigin } from '../services/local-storage.js';
 
 /** Parse a stored platforms JSON string into a string[]. */
 function safePlatforms(json: string | null): string[] {
@@ -504,6 +505,7 @@ clientPortalRouter.post('/documents/sign', async (req, res) => {
       folder,
       filename: body.filename,
       contentType: body.contentType,
+      uploadBase: uploadOrigin(req),
     }),
   );
 });

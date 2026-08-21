@@ -1,7 +1,10 @@
+import path from 'node:path';
 import express from 'express';
 import helmet from 'helmet';
 import cookieParser from 'cookie-parser';
+import { env } from './env.js';
 import { corsMw } from './middleware/cors.js';
+import { uploadsRouter } from './routes/uploads.js';
 import {
   errorHandler,
   notFoundHandler,
@@ -46,8 +49,23 @@ export function createApp() {
   // Behind Render's proxy — trust it for req.ip / secure cookies.
   app.set('trust proxy', 1);
 
-  app.use(helmet());
+  app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
   app.use(corsMw);
+
+  // Self-hosted media (STORAGE_DRIVER=local): the raw-body upload endpoint is
+  // mounted BEFORE the JSON parser (so it never touches the binary body), and
+  // /files serves stored objects in dev (in prod nginx serves /files directly,
+  // before proxying, so this is a fallback).
+  app.use('/uploads', uploadsRouter);
+  app.use(
+    '/files',
+    express.static(path.resolve(env.MEDIA_DIR), {
+      maxAge: '30d',
+      immutable: true,
+      index: false,
+    }),
+  );
+
   app.use(express.json({ limit: '1mb' }));
   app.use(cookieParser());
   app.use(requestId);

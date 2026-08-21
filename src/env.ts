@@ -77,7 +77,7 @@ const envSchema = z.object({
   // 'cloudinary' (default, legacy) or 'r2' (Cloudflare R2 — S3-compatible, cheap
   // bulk storage, zero egress). Existing Cloudinary URLs keep working either way;
   // only NEW uploads follow the selected driver.
-  STORAGE_DRIVER: z.enum(['cloudinary', 'r2']).default('cloudinary'),
+  STORAGE_DRIVER: z.enum(['cloudinary', 'r2', 'local']).default('cloudinary'),
 
   // Cloudinary (optional once fully on R2; still required while it's the driver)
   CLOUDINARY_CLOUD_NAME: z.string().optional(),
@@ -92,6 +92,16 @@ const envSchema = z.object({
   // Public base URL objects are served from (bucket public r2.dev URL or a
   // custom domain), e.g. https://pub-xxxx.r2.dev  — no trailing slash needed.
   R2_PUBLIC_BASE_URL: z.string().optional(),
+
+  // Self-hosted / local storage (STORAGE_DRIVER=local). Files are written under
+  // MEDIA_DIR, served from MEDIA_PUBLIC_BASE (nginx alias in prod / express in
+  // dev), and the browser uploads to MEDIA_UPLOAD_BASE + /uploads/local via a
+  // short-lived signed token.
+  MEDIA_DIR: z.string().default('./.local-data/media'),
+  MEDIA_PUBLIC_BASE: z.string().optional(), // e.g. https://api.creativemonk.in/media
+  MEDIA_UPLOAD_BASE: z.string().optional(), // e.g. https://api.creativemonk.in (defaults to request origin)
+  // How long (days) media stays hot before the archive job may delete it.
+  MEDIA_RETENTION_DAYS: z.coerce.number().int().positive().default(60),
 
   // Email (SMTP). Optional: when absent, the email service logs instead of
   // sending (so dev works without creds). For Gmail use an App Password.

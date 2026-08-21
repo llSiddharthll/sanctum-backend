@@ -2,6 +2,7 @@ import { env } from '../env.js';
 import { newId } from '../lib/ids.js';
 import * as cloudinary from './cloudinary.js';
 import * as r2 from './r2.js';
+import * as local from './local-storage.js';
 
 /**
  * Upload-storage abstraction. `STORAGE_DRIVER` selects Cloudinary (legacy) or
@@ -29,13 +30,27 @@ export interface MediaSignInput {
   resourceType: 'image' | 'video';
   filename?: string;
   contentType?: string;
+  /** Origin the browser reaches the local upload endpoint at (STORAGE_DRIVER=local). */
+  uploadBase?: string;
 }
 
 /** Sign a content-post media upload (Clients module). */
 export async function signMediaUpload(input: MediaSignInput) {
+  const base = `agency/${input.agencyId}/client/${input.clientId}/post`;
+  const folder = input.postId ? `${base}/${input.postId}` : `${base}/_staging`;
+
+  if (env.STORAGE_DRIVER === 'local') {
+    const key = `${folder}/${newId('media')}${extOf(input.filename)}`;
+    return {
+      ...local.presignLocalPut(
+        key,
+        cleanCt(input.contentType),
+        input.uploadBase ?? '',
+      ),
+      resourceType: input.resourceType,
+    };
+  }
   if (env.STORAGE_DRIVER === 'r2') {
-    const base = `agency/${input.agencyId}/client/${input.clientId}/post`;
-    const folder = input.postId ? `${base}/${input.postId}` : `${base}/_staging`;
     const key = `${folder}/${newId('media')}${extOf(input.filename)}`;
     const presigned = await r2.presignPut(
       key,
@@ -60,10 +75,20 @@ export interface DocSignInput {
   folder: string;
   filename?: string;
   contentType?: string;
+  /** Origin the browser reaches the local upload endpoint at (STORAGE_DRIVER=local). */
+  uploadBase?: string;
 }
 
 /** Sign a Documents-hub / message-attachment upload (agency-scoped). */
 export async function signDocumentUpload(input: DocSignInput) {
+  if (env.STORAGE_DRIVER === 'local') {
+    const key = `${input.folder}/${newId('doc')}${extOf(input.filename)}`;
+    return local.presignLocalPut(
+      key,
+      cleanCt(input.contentType),
+      input.uploadBase ?? '',
+    );
+  }
   if (env.STORAGE_DRIVER === 'r2') {
     const key = `${input.folder}/${newId('doc')}${extOf(input.filename)}`;
     const presigned = await r2.presignPut(
@@ -93,12 +118,17 @@ export async function deleteAsset(opts: {
   resourceType?: 'image' | 'video' | 'raw';
 }): Promise<void> {
   const url = opts.secureUrl ?? '';
-  if (url.includes('res.cloudinary.com') || url.includes('cloudinary.com')) {
+  if (url.includes('cloudinary.com')) {
     await cloudinary.destroyAsset(opts.publicId, opts.resourceType ?? 'image');
     return;
   }
-  // R2 object key (or an unknown non-Cloudinary URL) → delete from R2.
-  await r2.deleteObject(opts.publicId);
+  if (url.includes('.r2.dev') || url.includes('r2.cloudflarestorage.com')) {
+    await r2.deleteObject(opts.publicId);
+    return;
+  }
+  // Otherwise a self-hosted object (publicId is the on-disk key). Falls through
+  // here for local URLs and any non-cloud URL.
+  await local.deleteObjectLocal(opts.publicId);
 }
 
 export { ALLOWED_FORMATS };

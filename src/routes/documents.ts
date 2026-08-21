@@ -18,6 +18,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth } from '../middleware/tenant.js';
 import { signDocumentUpload, deleteAsset } from '../services/storage.js';
+import { uploadOrigin } from '../services/local-storage.js';
 
 export const documentsRouter = Router();
 documentsRouter.use(requireAuth);
@@ -467,6 +468,7 @@ documentsRouter.post('/sign', async (req, res) => {
     folder,
     filename: body.filename,
     contentType: body.contentType,
+    uploadBase: uploadOrigin(req),
   });
   // Note: `folder` is fixed server-side; the optional body.folder is ignored
   // intentionally to keep uploads inside the tenant path.

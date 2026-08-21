@@ -10,6 +10,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth, requireClientAccess } from '../middleware/tenant.js';
 import { signMediaUpload, deleteAsset } from '../services/storage.js';
+import { uploadOrigin } from '../services/local-storage.js';
 import { broadcastPortalRefresh } from '../realtime/io.js';
 
 export const mediaRouter = Router();
@@ -54,6 +55,7 @@ mediaRouter.post('/sign', async (req, res) => {
     resourceType: body.resourceType,
     filename: body.filename,
     contentType: body.contentType,
+    uploadBase: uploadOrigin(req),
   });
   ok(res, signed);
 });
