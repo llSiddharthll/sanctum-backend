@@ -732,21 +732,24 @@ describe('projects permissions', () => {
     expect(create.status).toBe(403);
   });
 
-  it('lets a projects:view member read but not create a task (403)', async () => {
-    const { agent } = await createMemberSession(owner, {
+  it('lets a projects:view member read AND create a task (auto-assigned to them)', async () => {
+    const { agent, user } = await createMemberSession(owner, {
       permissions: { projects: 'view' },
     });
     const get = await agent.get(`${BASE}/projects/${projectId}`);
     expect(get.status).toBe(200);
 
+    // Members may add tasks to any project they can view; the task auto-assigns
+    // to the creator so it lands on their board.
     const create = await agent
       .post(`${BASE}/projects/${projectId}/tasks`)
-      .send({ title: 'Should fail' });
-    expect(create.status).toBe(403);
+      .send({ title: 'Member task', priority: 'high' });
+    expect(create.status).toBe(201);
+    expect(create.body.data.assigneeId).toBe(user.id);
   });
 
-  // timersRouter is now gated by requireModuleRW('projects'), so a projects:none
-  // member is denied (403) when trying to start a timer (privilege leak fixed).
+  // Timers are gated by the projects module: a projects:none member is denied
+  // (no leak), but any member with projects:VIEW may start their OWN timer.
   it('denies a projects:none member starting a timer (module gate)', async () => {
     const { agent } = await createMemberSession(owner, {
       permissions: { projects: 'none' },
@@ -755,6 +758,42 @@ describe('projects permissions', () => {
     expect(res.status).toBe(403);
     // Clean up if it actually started (so we don't leak a running timer).
     await agent.post(`${BASE}/timers/stop`);
+  });
+
+  it('lets a projects:view member start their own timer', async () => {
+    const { agent } = await createMemberSession(owner, {
+      permissions: { projects: 'view' },
+    });
+    const res = await agent.post(`${BASE}/timers/start`).send({ projectId });
+    expect(res.status).toBe(201);
+    await agent.post(`${BASE}/timers/stop`);
+  });
+
+  it('lets a projects:view member delete their OWN task but not others', async () => {
+    const { agent } = await createMemberSession(owner, {
+      permissions: { projects: 'view' },
+    });
+    // Member self-creates a task (auto-assigned to them) and can delete it.
+    const own = data(
+      await agent
+        .post(`${BASE}/projects/${projectId}/tasks`)
+        .send({ title: 'my task', priority: 'high' }),
+    );
+    const delOwn = await agent.delete(
+      `${BASE}/projects/${projectId}/tasks/${own.id}`,
+    );
+    expect(delOwn.status).toBe(200);
+
+    // A task assigned to someone else cannot be deleted by the member.
+    const other = data(
+      await owner
+        .post(`${BASE}/projects/${projectId}/tasks`)
+        .send({ title: 'owner task', priority: 'high' }),
+    );
+    const delOther = await agent.delete(
+      `${BASE}/projects/${projectId}/tasks/${other.id}`,
+    );
+    expect(delOther.status).toBe(403);
   });
 });
 

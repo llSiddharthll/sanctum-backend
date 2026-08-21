@@ -12,9 +12,10 @@ import {
 } from '../db/schema.js';
 import { ok, created, toIso } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
-import { notFound, conflict } from '../lib/errors.js';
+import { notFound, conflict, forbidden } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
-import { requireModuleRW } from '../middleware/permissions.js';
+import { loadPermissions } from '../middleware/permissions.js';
+import { meetsLevel } from '../lib/permissions.js';
 import { getAuth } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
 import {
@@ -26,10 +27,26 @@ import {
 
 export const timersRouter = Router();
 timersRouter.use(requireAuth);
-// Timers track work on projects/tasks → part of the Projects module.
-// GET=view, start/stop/edit=manage. Without this gate a projects:none member
-// could start/stop timers (privilege leak).
-timersRouter.use(requireModuleRW('projects'));
+// Timers track work on projects/tasks → part of the Projects module. Starting/
+// stopping a timer is the caller's OWN work-tracking (always keyed to
+// ctx.userId), so any member with projects:VIEW may do it — otherwise an
+// employee (projects:view) couldn't clock their own time. Editing time logs
+// keeps the edit ceiling. A projects:none member is still blocked (needs view).
+timersRouter.use(async (req, _res, next) => {
+  try {
+    const level = (await loadPermissions(req)).projects;
+    if (!meetsLevel(level, 'view')) {
+      return next(forbidden("You don't have permission to view Projects."));
+    }
+    const isWrite = !['GET', 'HEAD', 'OPTIONS'].includes(req.method);
+    if (isWrite && req.path.includes('/logs') && !meetsLevel(level, 'edit')) {
+      return next(forbidden("You don't have permission to edit Projects."));
+    }
+    next();
+  } catch (err) {
+    next(err);
+  }
+});
 
 type Ctx = ReturnType<typeof getAuth>;
 

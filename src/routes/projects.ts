@@ -42,12 +42,13 @@ import { listProjectTimers, stopTimersForTask } from './timers.js';
 // with the other nested routers).
 export const projectsRouter = Router({ mergeParams: true });
 projectsRouter.use(requireAuth);
-// Projects module gate. Everyone needs at least VIEW. Creating/updating TASKS is
-// core work for any project participant (employees/members self-create tasks when
-// a manager isn't around), so task writes are allowed at VIEW — the per-route
-// handlers still enforce that the caller belongs to the project (getScopedProject).
-// Project-STRUCTURE changes (project settings, members, milestones, labels,
-// create/delete project, delete task) keep the normal edit/manage ceiling.
+// Projects module gate. Everyone needs at least VIEW. Working on TASKS is core
+// work for any project participant (employees/members self-create tasks, track
+// time, and manage their own tasks), so ALL task writes — create, update, AND
+// delete — are allowed at VIEW; the per-route handlers still enforce scope
+// (getScopedProject membership for structure, task ownership for delete).
+// Project-STRUCTURE changes (project settings, members, milestones, project
+// labels, create/delete project) keep the normal edit/manage ceiling.
 projectsRouter.use(async (req, _res, next) => {
   try {
     const perms = await loadPermissions(req);
@@ -57,7 +58,7 @@ projectsRouter.use(async (req, _res, next) => {
     }
     const isWrite = !['GET', 'HEAD', 'OPTIONS'].includes(req.method);
     if (isWrite) {
-      const isTaskWork = req.path.includes('/tasks') && req.method !== 'DELETE';
+      const isTaskWork = req.path.includes('/tasks');
       if (!isTaskWork) {
         const needed = req.method === 'DELETE' ? 'manage' : 'edit';
         if (!meetsLevel(level, needed)) {
@@ -1777,6 +1778,26 @@ projectsRouter.delete('/:id/tasks/:taskId', async (req, res) => {
   const projectId = param(req, 'id');
   await getScopedProject(req, projectId);
   const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
+
+  // A scoped member (Employee tier) may only delete tasks assigned to them —
+  // they see only their own tasks, so this keeps delete symmetric with what
+  // they can act on. Owner/admin/manager (canSeeAllProjects) may delete any.
+  if (!(await canSeeAllProjects(req))) {
+    const [mine] = await db
+      .select({ t: taskAssignees.taskId })
+      .from(taskAssignees)
+      .where(
+        and(
+          eq(taskAssignees.agencyId, ctx.agencyId),
+          eq(taskAssignees.taskId, task.id),
+          eq(taskAssignees.userId, ctx.userId),
+        ),
+      )
+      .limit(1);
+    if (task.assigneeId !== ctx.userId && !mine) {
+      throw forbidden('You can only delete tasks assigned to you.');
+    }
+  }
 
   await db
     .delete(projectTasks)
