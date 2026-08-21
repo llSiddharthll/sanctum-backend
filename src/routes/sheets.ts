@@ -9,10 +9,24 @@ import { notFound } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth } from '../middleware/tenant.js';
+import { getFrontendOrigin } from '../lib/frontend-url.js';
+import { publishCalendarSheet } from '../services/sheet-publish.js';
 
 export const sheetsRouter = Router();
 sheetsRouter.use(requireAuth);
 sheetsRouter.use(requireModuleRW('sheets'));
+
+// POST /sheets/:id/publish — turn a content-calendar sheet into content posts +
+// assigned tasks (idempotent; skips already-published rows).
+sheetsRouter.post('/:id/publish', async (req, res) => {
+  const ctx = getAuth(req);
+  const result = await publishCalendarSheet(
+    ctx,
+    param(req, 'id'),
+    getFrontendOrigin(req),
+  );
+  ok(res, result);
+});
 
 const DEFAULT_SHEET_DATA = '{"cells":{},"rows":50,"cols":26}';
 

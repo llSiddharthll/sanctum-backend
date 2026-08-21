@@ -25,6 +25,7 @@ import { expensesRouter } from './routes/expenses.js';
 import { financeRouter } from './routes/finance.js';
 import { postsRouter } from './routes/posts.js';
 import { approvalsRouter } from './routes/approvals.js';
+import { reservationsRouter } from './routes/reservations.js';
 import { mediaRouter } from './routes/media.js';
 import { aiRouter } from './routes/ai.js';
 import { aiAssistantRouter } from './routes/ai-assistant.js';
@@ -97,6 +98,7 @@ export function createApp() {
   // Nested content routes under a client.
   api.use('/clients/:clientId/posts', postsRouter);
   api.use('/clients/:clientId/posts/:postId', approvalsRouter);
+  api.use('/clients/:clientId/reservations', reservationsRouter);
   api.use('/clients/:clientId/ai', aiRouter);
 
   // Agency-level AI assistant (documents, chat, task breakdown) — distinct

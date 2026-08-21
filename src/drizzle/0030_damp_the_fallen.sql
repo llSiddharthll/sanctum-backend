@@ -1,0 +1,1 @@
+ALTER TABLE `sanctum_project_tasks` ADD `post_id` text;

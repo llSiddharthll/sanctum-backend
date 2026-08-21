@@ -27,7 +27,9 @@ import {
   timeLogs,
   timers,
   users,
+  contentPosts,
 } from '../db/schema.js';
+import { broadcastPortalRefresh } from '../realtime/io.js';
 import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { AppError, notFound, conflict, forbidden } from '../lib/errors.js';
@@ -1702,6 +1704,40 @@ projectsRouter.patch('/:id/tasks/:taskId', async (req, res) => {
     await stopTimersForTask(ctx, task.id, patch.title ?? task.title).catch(
       () => undefined,
     );
+  }
+
+  // Calendar pipeline: a task auto-created by publishing a content-calendar
+  // sheet links to a content post. Completing the task publishes the post (the
+  // client portal calendar shows it done); reopening reverts it to scheduled.
+  if (task.postId && body.status !== undefined && body.status !== task.status) {
+    const nowDone = body.status === 'done';
+    const wasDone = task.status === 'done';
+    if (nowDone !== wasDone) {
+      const [post] = await db
+        .select({
+          id: contentPosts.id,
+          clientId: contentPosts.clientId,
+          status: contentPosts.status,
+        })
+        .from(contentPosts)
+        .where(
+          and(
+            eq(contentPosts.id, task.postId),
+            eq(contentPosts.agencyId, ctx.agencyId),
+          ),
+        )
+        .limit(1);
+      if (post) {
+        const nextStatus = nowDone ? 'posted' : 'scheduled';
+        if (post.status !== nextStatus) {
+          await db
+            .update(contentPosts)
+            .set({ status: nextStatus, updatedAt: new Date() })
+            .where(eq(contentPosts.id, post.id));
+          broadcastPortalRefresh(post.clientId);
+        }
+      }
+    }
   }
 
   // Audit: a status change is its own action for the activity feed; otherwise

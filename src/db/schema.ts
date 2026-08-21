@@ -762,6 +762,10 @@ export const projectTasks = sqliteTable(
     // Self-FK to a parent task (one level only — enforced in the API). The
     // actual FK + cascade is declared in the table callback below.
     parentTaskId: text('parent_task_id'),
+    // Set when this task was auto-created by publishing a calendar sheet — links
+    // it to the content post it produces, so completing the task flips the post
+    // to 'posted' (and surfaces on the client portal calendar).
+    postId: text('post_id'),
     position: integer('position').notNull().default(0),
     createdAt: ts('created_at').notNull().default(now),
     updatedAt: ts('updated_at').notNull().default(now),
@@ -1541,6 +1545,36 @@ export const sheets = sqliteTable(
     updatedAt: ts('updated_at').notNull().default(now),
   },
   (tbl) => [index('ix_sheets_agency_updated').on(tbl.agencyId, tbl.updatedAt)],
+);
+
+// ============================================================
+//  CALENDAR_RESERVATIONS (a reserved day — e.g. a shoot — that blocks tasks;
+//  clientId null = agency-wide). Shown on the calendar; publish skips these.
+// ============================================================
+export const calendarReservations = sqliteTable(
+  t('calendar_reservations'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    clientId: text('client_id').references(() => clients.id, {
+      onDelete: 'cascade',
+    }),
+    date: ts('date').notNull(),
+    label: text('label').notNull().default('Reserved'),
+    createdBy: text('created_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: ts('created_at').notNull().default(now),
+  },
+  (tbl) => [
+    index('ix_reservations_agency_client_date').on(
+      tbl.agencyId,
+      tbl.clientId,
+      tbl.date,
+    ),
+  ],
 );
 
 // ============================================================

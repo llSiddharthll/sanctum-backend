@@ -211,6 +211,20 @@
       "when": 1787346886932,
       "tag": "0029_elite_korvac",
       "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "6",
+      "when": 1787351003087,
+      "tag": "0030_damp_the_fallen",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "6",
+      "when": 1787351276808,
+      "tag": "0031_superb_aqueduct",
+      "breakpoints": true
     }
   ]
 }
