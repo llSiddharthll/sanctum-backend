@@ -4,6 +4,7 @@ import { and, asc, eq, ne, or } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   agencies,
+  calendarReservations,
   clients,
   contentPosts,
   documents,
@@ -267,6 +268,18 @@ portalRouter.get('/resolve', async (req, res) => {
     )
     .orderBy(asc(documents.name));
 
+  // Reserved days (e.g. a shoot) for this client — surfaced on the portal
+  // calendar so the client sees blocked-out dates.
+  const reservationRows = await db
+    .select()
+    .from(calendarReservations)
+    .where(
+      and(
+        eq(calendarReservations.agencyId, p.agencyId),
+        eq(calendarReservations.clientId, p.clientId),
+      ),
+    );
+
   ok(res, {
     agency: agency
       ? {
@@ -291,6 +304,11 @@ portalRouter.get('/resolve', async (req, res) => {
       portalRole: client.portalRole,
     },
     posts: result,
+    reservations: reservationRows.map((r) => ({
+      id: r.id,
+      date: toIso(r.date),
+      label: r.label,
+    })),
     documents: docRows.map((d) => ({
       id: d.id,
       name: d.name,

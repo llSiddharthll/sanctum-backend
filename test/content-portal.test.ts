@@ -255,6 +255,23 @@ describe('content posts + portal workflow', () => {
     expect(ids).not.toContain(draftId); // draft is hidden from the portal
   });
 
+  it('surfaces the client\'s reserved days on the portal calendar', async () => {
+    const ag = await signupAgency();
+    const cid = data(await ag.agent.post(`${BASE}/clients`).send({ name: 'Reserve Co' })).id;
+    await ag.agent
+      .post(`${BASE}/clients/${cid}/reservations`)
+      .send({ date: '2026-12-25', label: 'Holiday shoot' });
+
+    const token = await mintPortalToken(ag.agent, cid);
+    const res = await portal(token).get('/resolve');
+    expect(res.status).toBe(200);
+    const body = data(res);
+    expect(Array.isArray(body.reservations)).toBe(true);
+    const r = body.reservations.find((x: any) => x.label === 'Holiday shoot');
+    expect(r, 'reserved day should appear on the portal').toBeTruthy();
+    expect(r.date.slice(0, 10)).toBe('2026-12-25');
+  });
+
   it('keeps a post visible in the portal after the client requests changes', async () => {
     // Regression: requesting changes flips status to changes_requested, which
     // the default visible-status config omitted — making the post vanish from

@@ -4,6 +4,7 @@ import { and, asc, desc, eq, inArray, isNull, ne, or, sql, sum } from 'drizzle-o
 import { db } from '../db/client.js';
 import {
   agencies,
+  calendarReservations,
   clients,
   contentPosts,
   documents,
@@ -742,8 +743,25 @@ clientPortalRouter.get('/calendar', async (req, res) => {
     for (const r of cc) commentCount.set(r.postId, Number(r.n));
   }
 
+  // Reserved days (e.g. a shoot) — shown on the client's calendar so they can
+  // see days the agency has blocked out.
+  const reservations = await db
+    .select()
+    .from(calendarReservations)
+    .where(
+      and(
+        eq(calendarReservations.agencyId, ctx.agencyId),
+        eq(calendarReservations.clientId, ctx.clientId),
+      ),
+    );
+
   ok(res, {
     canApprove: cli?.role !== 'reviewer',
+    reservations: reservations.map((r) => ({
+      id: r.id,
+      date: toIso(r.date),
+      label: r.label,
+    })),
     posts: filtered.map((p) => ({
       id: p.id,
       postType: p.postType,
