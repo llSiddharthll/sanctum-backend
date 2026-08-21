@@ -32,9 +32,21 @@ import {
 import { audit } from '../services/audit.js';
 import { rateLimitConfig } from '../middleware/rate-limit.js';
 import { env } from '../env.js';
+import { getStorageStatus } from '../services/storage-status.js';
 
 export const agenciesRouter = Router();
 agenciesRouter.use(requireAuth);
+
+// GET /agency/storage — disk usage, last backup result, and alerts for the
+// Settings → Storage & Backups panel (owner/admin; self-hosted storage only).
+agenciesRouter.get(
+  '/storage',
+  requireRole('owner', 'admin'),
+  requireModule('settings', 'view'),
+  async (_req, res) => {
+    ok(res, await getStorageStatus());
+  },
+);
 
 // GET /agency — current agency profile.
 agenciesRouter.get('/', async (req, res) => {
