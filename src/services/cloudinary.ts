@@ -2,10 +2,17 @@ import { v2 as cloudinary } from 'cloudinary';
 import { env } from '../env.js';
 import { newId } from '../lib/ids.js';
 
+// Cloudinary config is optional now (R2 can be the driver). These coalesce to ''
+// when unset; the sign functions are only ever called when STORAGE_DRIVER is
+// 'cloudinary', where the env is present.
+const CLD_NAME = env.CLOUDINARY_CLOUD_NAME ?? '';
+const CLD_KEY = env.CLOUDINARY_API_KEY ?? '';
+const CLD_SECRET = env.CLOUDINARY_API_SECRET ?? '';
+
 cloudinary.config({
-  cloud_name: env.CLOUDINARY_CLOUD_NAME,
-  api_key: env.CLOUDINARY_API_KEY,
-  api_secret: env.CLOUDINARY_API_SECRET,
+  cloud_name: CLD_NAME,
+  api_key: CLD_KEY,
+  api_secret: CLD_SECRET,
   secure: true,
 });
 
@@ -58,18 +65,18 @@ export function signUpload(params: SignParams): SignedUpload {
 
   const signature = cloudinary.utils.api_sign_request(
     paramsToSign,
-    env.CLOUDINARY_API_SECRET,
+    CLD_SECRET,
   );
 
   return {
-    cloudName: env.CLOUDINARY_CLOUD_NAME,
-    apiKey: env.CLOUDINARY_API_KEY,
+    cloudName: CLD_NAME,
+    apiKey: CLD_KEY,
     timestamp,
     signature,
     folder,
     publicId,
     resourceType: params.resourceType,
-    uploadUrl: `https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/${params.resourceType}/upload`,
+    uploadUrl: `https://api.cloudinary.com/v1_1/${CLD_NAME}/${params.resourceType}/upload`,
     allowedFormats: ALLOWED_FORMATS,
     maxBytes: MAX_BYTES,
     expiresAt: new Date((timestamp + 3600) * 1000).toISOString(),
@@ -123,12 +130,12 @@ export function signDocumentUpload(
 
   const signature = cloudinary.utils.api_sign_request(
     paramsToSign,
-    env.CLOUDINARY_API_SECRET,
+    CLD_SECRET,
   );
 
   return {
-    cloudName: env.CLOUDINARY_CLOUD_NAME,
-    apiKey: env.CLOUDINARY_API_KEY,
+    cloudName: CLD_NAME,
+    apiKey: CLD_KEY,
     timestamp,
     signature,
     folder: params.folder,

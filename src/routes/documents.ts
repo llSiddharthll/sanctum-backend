@@ -17,7 +17,7 @@ import { badRequest, notFound } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth } from '../middleware/tenant.js';
-import { signDocumentUpload, destroyAsset } from '../services/cloudinary.js';
+import { signDocumentUpload, deleteAsset } from '../services/storage.js';
 
 export const documentsRouter = Router();
 documentsRouter.use(requireAuth);
@@ -451,6 +451,8 @@ documentsRouter.delete('/folders/:id', async (req, res) => {
 // ============================================================
 const signSchema = z.object({
   folder: z.string().trim().max(200).optional(),
+  filename: z.string().optional(),
+  contentType: z.string().optional(),
 });
 
 documentsRouter.post('/sign', async (req, res) => {
@@ -460,7 +462,12 @@ documentsRouter.post('/sign', async (req, res) => {
   // Force a tenant-scoped folder so one agency cannot write into another's.
   const folder = `sanctum/${ctx.agencyId}/documents`;
 
-  const signed = signDocumentUpload({ agencyId: ctx.agencyId, folder });
+  const signed = await signDocumentUpload({
+    agencyId: ctx.agencyId,
+    folder,
+    filename: body.filename,
+    contentType: body.contentType,
+  });
   // Note: `folder` is fixed server-side; the optional body.folder is ignored
   // intentionally to keep uploads inside the tenant path.
   void body.folder;
@@ -646,13 +653,14 @@ documentsRouter.delete('/:id', async (req, res) => {
       and(eq(documents.id, documentId), eq(documents.agencyId, ctx.agencyId)),
     );
 
-  // Best-effort: never fail the delete if Cloudinary errors.
+  // Best-effort: never fail the delete if the storage provider errors.
   if (doc.publicId) {
     try {
-      await destroyAsset(
-        doc.publicId,
-        doc.resourceType as 'image' | 'raw' | 'video',
-      );
+      await deleteAsset({
+        publicId: doc.publicId,
+        secureUrl: doc.fileUrl,
+        resourceType: doc.resourceType as 'image' | 'raw' | 'video',
+      });
     } catch {
       // non-fatal — reconciliation can clean up later
     }

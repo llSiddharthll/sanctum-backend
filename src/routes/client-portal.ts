@@ -29,7 +29,7 @@ import { audit } from '../services/audit.js';
 import { mirrorClientPostComment } from '../services/client-discussion.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireClientAuth, getClientCtx } from '../middleware/client.js';
-import { signDocumentUpload } from '../services/cloudinary.js';
+import { signDocumentUpload } from '../services/storage.js';
 
 /** Parse a stored platforms JSON string into a string[]. */
 function safePlatforms(json: string | null): string[] {
@@ -488,11 +488,24 @@ async function loadClientFolder(
   return f;
 }
 
-// POST /client/documents/sign — Cloudinary signed direct-upload params.
+// POST /client/documents/sign — signed direct-upload params (Cloudinary or R2).
+const clientDocSignSchema = z.object({
+  filename: z.string().optional(),
+  contentType: z.string().optional(),
+});
 clientPortalRouter.post('/documents/sign', async (req, res) => {
   const ctx = getClientCtx(req);
+  const body = clientDocSignSchema.parse(req.body ?? {});
   const folder = `sanctum/${ctx.agencyId}/documents`;
-  ok(res, signDocumentUpload({ agencyId: ctx.agencyId, folder }));
+  ok(
+    res,
+    await signDocumentUpload({
+      agencyId: ctx.agencyId,
+      folder,
+      filename: body.filename,
+      contentType: body.contentType,
+    }),
+  );
 });
 
 // POST /client/documents — persist an uploaded file OR an external link.

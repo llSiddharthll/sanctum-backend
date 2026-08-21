@@ -9,7 +9,7 @@ import { notFound } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth, requireClientAccess } from '../middleware/tenant.js';
-import { signUpload, destroyAsset } from '../services/cloudinary.js';
+import { signMediaUpload, deleteAsset } from '../services/storage.js';
 import { broadcastPortalRefresh } from '../realtime/io.js';
 
 export const mediaRouter = Router();
@@ -17,11 +17,13 @@ mediaRouter.use(requireAuth);
 // Post media is part of the Clients module: GET=view, writes=manage.
 mediaRouter.use(requireModuleRW('clients'));
 
-// POST /media/sign — Cloudinary signed upload signature.
+// POST /media/sign — signed direct-upload params (Cloudinary or R2 per driver).
 const signSchema = z.object({
   clientId: z.string().min(1),
   postId: z.string().optional(),
   resourceType: z.enum(['image', 'video']).default('image'),
+  filename: z.string().optional(),
+  contentType: z.string().optional(),
 });
 
 mediaRouter.post('/sign', async (req, res) => {
@@ -45,11 +47,13 @@ mediaRouter.post('/sign', async (req, res) => {
     if (!post) throw notFound('Post not found.');
   }
 
-  const signed = signUpload({
+  const signed = await signMediaUpload({
     agencyId: ctx.agencyId,
     clientId: body.clientId,
     postId: body.postId,
     resourceType: body.resourceType,
+    filename: body.filename,
+    contentType: body.contentType,
   });
   ok(res, signed);
 });
@@ -149,7 +153,11 @@ mediaRouter.delete('/:mediaId', async (req, res) => {
   // Ensure the caller can access this client (member assignment check).
   await requireClientAccess(ctx, media.clientId);
 
-  await destroyAsset(media.cloudinaryPublicId, media.resourceType);
+  await deleteAsset({
+    publicId: media.cloudinaryPublicId,
+    secureUrl: media.secureUrl,
+    resourceType: media.resourceType,
+  });
   await db.delete(postMedia).where(eq(postMedia.id, media.id));
 
   // Decrement storage counter (floor at 0).

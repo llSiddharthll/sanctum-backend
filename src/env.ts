@@ -73,10 +73,25 @@ const envSchema = z.object({
       { message: 'VAULT_ENC_KEY must be base64 of exactly 32 bytes' },
     ),
 
-  // Cloudinary
-  CLOUDINARY_CLOUD_NAME: z.string().min(1),
-  CLOUDINARY_API_KEY: z.string().min(1),
-  CLOUDINARY_API_SECRET: z.string().min(1),
+  // Storage driver for user uploads (media, documents, attachments).
+  // 'cloudinary' (default, legacy) or 'r2' (Cloudflare R2 — S3-compatible, cheap
+  // bulk storage, zero egress). Existing Cloudinary URLs keep working either way;
+  // only NEW uploads follow the selected driver.
+  STORAGE_DRIVER: z.enum(['cloudinary', 'r2']).default('cloudinary'),
+
+  // Cloudinary (optional once fully on R2; still required while it's the driver)
+  CLOUDINARY_CLOUD_NAME: z.string().optional(),
+  CLOUDINARY_API_KEY: z.string().optional(),
+  CLOUDINARY_API_SECRET: z.string().optional(),
+
+  // Cloudflare R2 (S3-compatible). Required when STORAGE_DRIVER=r2.
+  R2_ACCOUNT_ID: z.string().optional(),
+  R2_ACCESS_KEY_ID: z.string().optional(),
+  R2_SECRET_ACCESS_KEY: z.string().optional(),
+  R2_BUCKET: z.string().optional(),
+  // Public base URL objects are served from (bucket public r2.dev URL or a
+  // custom domain), e.g. https://pub-xxxx.r2.dev  — no trailing slash needed.
+  R2_PUBLIC_BASE_URL: z.string().optional(),
 
   // Email (SMTP). Optional: when absent, the email service logs instead of
   // sending (so dev works without creds). For Gmail use an App Password.
