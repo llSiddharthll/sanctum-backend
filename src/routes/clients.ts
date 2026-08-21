@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, eq, inArray, count, desc, sql } from 'drizzle-orm';
+import { randomBytes } from 'node:crypto';
+import { and, asc, eq, inArray, count, desc, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   agencies,
@@ -19,7 +20,7 @@ import {
   auditLog,
 } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
-import { newId, newOpaqueToken, hashToken } from '../lib/ids.js';
+import { newId, newOpaqueToken } from '../lib/ids.js';
 import { conflict, notFound, quotaExceeded, badRequest } from '../lib/errors.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import {
@@ -37,6 +38,7 @@ import {
 import { audit } from '../services/audit.js';
 import { sendPortalWelcome, sendEmail, basicHtml } from '../services/email.js';
 import { getFrontendOrigin } from '../lib/frontend-url.js';
+import { hashPassword } from '../lib/password.js';
 
 export const clientsRouter = Router();
 clientsRouter.use(requireAuth);
@@ -478,36 +480,179 @@ clientsRouter.post(
   });
 });
 
-// POST /clients/:clientId/portal-share-email — email the client a branded link
-// that opens their full portal (no password). Reuses a token minted just now on
-// the client; the raw token is passed in so copy/share/email all share one link.
-const shareEmailSchema = z.object({
-  token: z.string().min(10),
-  email: z.string().email().optional(),
-});
-clientsRouter.post(
-  '/:clientId/portal-share-email',
+// ============================================================
+//  Secure client-portal LOGIN (email + password).
+//  Replaces the old no-password /access share link: the agency provisions a
+//  real role:'client' account for the brand and hands the client credentials
+//  they type at /login. The password is never stored in plaintext — it's shown
+//  once on create/reset, so the caller must copy/share it immediately.
+// ============================================================
+
+// Human-friendly password: 15 chars from an unambiguous alphabet (no 0/O/1/l/I),
+// grouped for readability. ~86 bits of entropy.
+const PW_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+function generatePortalPassword(): string {
+  const bytes = randomBytes(15);
+  let out = '';
+  for (let i = 0; i < 15; i += 1) {
+    out += PW_ALPHABET[bytes[i] % PW_ALPHABET.length];
+    if (i === 4 || i === 9) out += '-';
+  }
+  return out;
+}
+
+/** The brand's canonical portal-login account (role:'client'), if any. */
+async function findClientLogin(agencyId: string, clientId: string) {
+  const [u] = await db
+    .select()
+    .from(users)
+    .where(
+      and(
+        eq(users.agencyId, agencyId),
+        eq(users.clientId, clientId),
+        eq(users.role, 'client'),
+      ),
+    )
+    .orderBy(asc(users.createdAt))
+    .limit(1);
+  return u ?? null;
+}
+
+// GET /clients/:clientId/portal-login — status of the brand's login account.
+// Never returns a password (it isn't stored); just whether one exists + its
+// email + last sign-in, so the UI can show "create" vs "reset".
+clientsRouter.get(
+  '/:clientId/portal-login',
   requireRole('owner', 'admin'),
   async (req, res) => {
     const ctx = getAuth(req);
     const client = await requireClientAccess(ctx, param(req, 'clientId'));
-    const body = shareEmailSchema.parse(req.body);
+    const login = await findClientLogin(ctx.agencyId, client.id);
+    ok(res, {
+      exists: !!login,
+      email: login?.email ?? client.contactEmail ?? null,
+      lastLoginAt: login ? toIso(login.lastLoginAt) : null,
+      loginUrl: `${getFrontendOrigin(req)}/login`,
+    });
+  },
+);
 
-    // The token must be a live portal token for THIS client (never email a link
-    // for someone else's brand).
-    const [tok] = await db
-      .select()
-      .from(portalTokens)
-      .where(eq(portalTokens.tokenHash, hashToken(body.token)))
-      .limit(1);
-    if (!tok || tok.clientId !== client.id || tok.revoked) {
-      throw notFound('That portal link is not valid for this client.');
+// POST /clients/:clientId/portal-login — create or reset the brand's secure
+// login and return the plaintext password ONCE. Body: { email?, password? }.
+// email defaults to the client's contact email; password is auto-generated
+// unless one is supplied. Scope = all of the brand's projects.
+const portalLoginSchema = z.object({
+  email: z.string().email().optional(),
+  password: z.string().min(8).max(200).optional(),
+});
+clientsRouter.post(
+  '/:clientId/portal-login',
+  requireRole('owner', 'admin'),
+  async (req, res) => {
+    const ctx = getAuth(req);
+    const client = await requireClientAccess(ctx, param(req, 'clientId'));
+    const body = portalLoginSchema.parse(req.body);
+
+    const existing = await findClientLogin(ctx.agencyId, client.id);
+    const email = (
+      body.email?.trim() ||
+      existing?.email ||
+      client.contactEmail ||
+      ''
+    )
+      .toLowerCase()
+      .trim();
+    if (!email) {
+      throw badRequest(
+        'No email for this client — add a contact email or enter one to use as the login.',
+      );
     }
 
-    const to = body.email?.trim() || client.contactEmail;
+    // The login email must be unique within the agency and must not collide
+    // with a staff account or a DIFFERENT client's login.
+    const [clash] = await db
+      .select({ id: users.id, role: users.role, clientId: users.clientId })
+      .from(users)
+      .where(
+        and(
+          eq(users.agencyId, ctx.agencyId),
+          sql`lower(${users.email}) = ${email}`,
+        ),
+      )
+      .limit(1);
+    if (clash && clash.id !== existing?.id) {
+      throw conflict(
+        'That email is already used by another account in your workspace. Use a different email.',
+      );
+    }
+
+    const password = body.password?.trim() || generatePortalPassword();
+    const passwordHash = await hashPassword(password);
+    let isNew: boolean;
+
+    if (existing) {
+      await db
+        .update(users)
+        .set({ email, passwordHash, status: 'active' })
+        .where(eq(users.id, existing.id));
+      isNew = false;
+    } else {
+      await db.insert(users).values({
+        id: newId('usr'),
+        agencyId: ctx.agencyId,
+        clientId: client.id,
+        email,
+        passwordHash,
+        fullName: `${client.name} (portal)`,
+        role: 'client',
+        status: 'active',
+        // Clients have no module permissions; scope = all brand projects.
+        permissionsJson: null,
+      });
+      isNew = true;
+    }
+
+    await audit({
+      agencyId: ctx.agencyId,
+      actorType: ctx.role,
+      actorId: ctx.userId,
+      action: isNew ? 'portal_login.create' : 'portal_login.reset',
+      entityType: 'client',
+      entityId: client.id,
+      metadata: { email },
+      ip: req.ip,
+    });
+
+    const payload = {
+      email,
+      password, // shown ONCE — not persisted in plaintext.
+      loginUrl: `${getFrontendOrigin(req)}/login`,
+      created: isNew,
+    };
+    if (isNew) created(res, payload);
+    else ok(res, payload);
+  },
+);
+
+// POST /clients/:clientId/portal-login-email — email the client their branded
+// secure-login credentials (login link + email + password).
+const loginEmailSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(1),
+  sendTo: z.string().email().optional(),
+});
+clientsRouter.post(
+  '/:clientId/portal-login-email',
+  requireRole('owner', 'admin'),
+  async (req, res) => {
+    const ctx = getAuth(req);
+    const client = await requireClientAccess(ctx, param(req, 'clientId'));
+    const body = loginEmailSchema.parse(req.body);
+
+    const to = body.sendTo?.trim() || body.email.trim() || client.contactEmail;
     if (!to) {
       throw badRequest(
-        'No email on file for this client — add a contact email or enter one to send to.',
+        'No email to send to — add a contact email or enter one.',
       );
     }
 
@@ -517,26 +662,26 @@ clientsRouter.post(
       .where(eq(agencies.id, ctx.agencyId))
       .limit(1);
     const agencyName = agency?.name ?? 'Your agency';
-    const link = `${getFrontendOrigin(req)}/access/${body.token}`;
+    const loginUrl = `${getFrontendOrigin(req)}/login`;
 
     await sendEmail({
       to,
-      subject: `Your ${agencyName} client portal is ready`,
+      subject: `Your ${agencyName} client portal login`,
       html: basicHtml({
-        heading: `Welcome to your portal`,
-        body: `Hi ${client.name}, ${agencyName} has set up your private client portal. In one place you can follow your projects, view the content calendar, review proposals & agreements, see invoices, and download shared files.<br><br>No password needed — just tap below to open it. Keep this link private; anyone with it can view your portal.`,
-        buttonLabel: 'Open my portal',
-        buttonUrl: link,
-        preheader: `${agencyName} shared your client portal — open it in one tap.`,
+        heading: 'Your secure portal login',
+        body: `Hi ${client.name}, ${agencyName} has set up your private client portal — follow your projects, view the content calendar, review proposals & agreements, see invoices, and download shared files, all in one place.<br><br>Sign in with these details:<br><br><strong>Email:</strong> ${body.email}<br><strong>Password:</strong> ${body.password}<br><br>Keep these private. For your security, don't forward this email — you can change your password after signing in.`,
+        buttonLabel: 'Sign in to your portal',
+        buttonUrl: loginUrl,
+        preheader: `Your ${agencyName} portal login details inside.`,
       }),
-      text: `${agencyName} shared your client portal. Open it here (no password needed): ${link}`,
+      text: `${agencyName} client portal login.\nSign in: ${loginUrl}\nEmail: ${body.email}\nPassword: ${body.password}\n\nKeep these private.`,
     });
 
     await audit({
       agencyId: ctx.agencyId,
       actorType: ctx.role,
       actorId: ctx.userId,
-      action: 'portal_token.email',
+      action: 'portal_login.email',
       entityType: 'client',
       entityId: client.id,
       metadata: { to },
