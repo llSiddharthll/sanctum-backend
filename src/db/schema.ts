@@ -1103,6 +1103,8 @@ export const invoices = sqliteTable(
     notes: text('notes'),
     terms: text('terms'),
     bankDetails: text('bank_details'),
+    // When this invoice was created from an uploaded document, the file URL.
+    fileUrl: text('file_url'),
     createdBy: text('created_by').references(() => users.id, {
       onDelete: 'set null',
     }),

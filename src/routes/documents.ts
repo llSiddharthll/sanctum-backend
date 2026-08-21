@@ -10,6 +10,7 @@ import {
   users,
   proposals,
   agreements,
+  invoices,
 } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
@@ -52,6 +53,8 @@ const OWNER_ONLY_CATEGORIES = new Set([
 const PROPOSAL_CATEGORIES = new Set(['proposal']);
 /** Categories that spawn an Agreement record on upload (needs a client). */
 const AGREEMENT_CATEGORIES = new Set(['agreement', 'contract', 'nda']);
+/** Categories that spawn an Invoice record on upload (needs a client). */
+const INVOICE_CATEGORIES = new Set(['invoice']);
 const RESOURCE_TYPES = ['image', 'raw', 'video'] as const;
 
 const documentSelection = {
@@ -556,16 +559,21 @@ documentsRouter.post('/', async (req, res) => {
 });
 
 /**
- * When a document is uploaded as a proposal/agreement, spawn the matching
- * Business record carrying the file. Agreements require a client, so if none is
- * given we skip (the doc still exists, owner-only). Returns a small descriptor
- * or null when nothing was created.
+ * When a document is uploaded as a proposal/agreement/invoice, spawn the
+ * matching Business record carrying the file so it surfaces in that tab.
+ * Agreements + invoices require a client, so if none is given we skip (the doc
+ * still exists, owner-only). When the document is marked client-visible the
+ * record is created as 'sent' so it also shows in the client's portal tab;
+ * otherwise it stays 'draft' (agency-only). Returns a descriptor or null.
  */
 async function maybeConvertDocument(
   ctx: ReturnType<typeof getAuth>,
   category: string,
   body: z.infer<typeof createSchema>,
-): Promise<{ type: 'proposal' | 'agreement'; id: string } | null> {
+): Promise<{ type: 'proposal' | 'agreement' | 'invoice'; id: string } | null> {
+  const toClient = body.clientVisible === true;
+  const now = toClient ? new Date() : null;
+
   if (PROPOSAL_CATEGORIES.has(category)) {
     const propId = newId('prop');
     await db.insert(proposals).values({
@@ -573,7 +581,8 @@ async function maybeConvertDocument(
       agencyId: ctx.agencyId,
       clientId: body.clientId ?? null,
       title: body.name,
-      status: 'draft',
+      status: toClient ? 'sent' : 'draft',
+      sentAt: now,
       contentJson: JSON.stringify({ source: 'document', fileUrl: body.fileUrl }),
       fileUrl: body.fileUrl,
       createdBy: ctx.userId,
@@ -588,12 +597,32 @@ async function maybeConvertDocument(
       agencyId: ctx.agencyId,
       clientId: body.clientId,
       title: body.name,
-      status: 'draft',
+      status: toClient ? 'sent' : 'draft',
+      sentAt: now,
       termsJson: JSON.stringify({ source: 'document', fileUrl: body.fileUrl }),
       fileUrl: body.fileUrl,
       createdBy: ctx.userId,
     });
     return { type: 'agreement', id: agrId };
+  }
+  if (INVOICE_CATEGORIES.has(category)) {
+    if (!body.clientId) return null; // invoices require a client (NOT NULL)
+    const invId = newId('inv');
+    const year = new Date().getFullYear();
+    const invoiceNumber = `INV-${year}-${String(Date.now() % 10000).padStart(4, '0')}`;
+    await db.insert(invoices).values({
+      id: invId,
+      agencyId: ctx.agencyId,
+      clientId: body.clientId,
+      invoiceNumber,
+      status: toClient ? 'sent' : 'draft',
+      issueDate: new Date(),
+      fileUrl: body.fileUrl,
+      createdBy: ctx.userId,
+      // Money fields default to 0 — a document invoice carries the file, not
+      // computed line items. The agency can add items later if needed.
+    });
+    return { type: 'invoice', id: invId };
   }
   return null;
 }

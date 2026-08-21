@@ -43,6 +43,7 @@ const invoiceSelection = {
   notes: invoices.notes,
   terms: invoices.terms,
   bankDetails: invoices.bankDetails,
+  fileUrl: invoices.fileUrl,
   createdBy: invoices.createdBy,
   createdAt: invoices.createdAt,
   updatedAt: invoices.updatedAt,
@@ -70,6 +71,7 @@ type InvoiceSelectedRow = {
   notes: string | null;
   terms: string | null;
   bankDetails: string | null;
+  fileUrl: string | null;
   createdBy: string | null;
   createdAt: Date;
   updatedAt: Date;
@@ -124,6 +126,7 @@ function serializeInvoice(
     notes: inv.notes,
     terms: inv.terms,
     bankDetails: inv.bankDetails,
+    fileUrl: 'fileUrl' in inv ? inv.fileUrl : null,
     items: extra?.items?.map((it) => ({
       id: it.id,
       description: it.description,
