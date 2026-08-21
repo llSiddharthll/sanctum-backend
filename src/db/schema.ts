@@ -469,6 +469,11 @@ export const postMedia = sqliteTable(
     width: integer('width'),
     height: integer('height'),
     position: integer('position').notNull().default(0),
+    // Self-hosted retention: once the local file is moved to the Drive archive
+    // and removed from disk, `archived` flips true so the UI shows a
+    // "contact us to restore" state instead of a broken image.
+    archived: integer('archived', { mode: 'boolean' }).notNull().default(false),
+    archivedAt: ts('archived_at'),
     createdAt: ts('created_at').notNull().default(now),
   },
   (tbl) => [
@@ -1385,6 +1390,10 @@ export const documents = sqliteTable(
     // Optional folder this doc lives in (see document_folders). NULL = root.
     // Plain text (no drizzle FK) to avoid documents↔folders circular inference.
     folderId: text('folder_id'),
+    // Self-hosted retention: true once the local file is archived to Drive and
+    // removed from disk (UI then shows a "contact us to restore" state).
+    archived: integer('archived', { mode: 'boolean' }).notNull().default(false),
+    archivedAt: ts('archived_at'),
     createdAt: ts('created_at').notNull().default(now),
     updatedAt: ts('updated_at').notNull().default(now),
   },

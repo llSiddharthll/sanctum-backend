@@ -33,6 +33,7 @@ import { audit } from '../services/audit.js';
 import { rateLimitConfig } from '../middleware/rate-limit.js';
 import { env } from '../env.js';
 import { getStorageStatus } from '../services/storage-status.js';
+import { runMediaArchive } from '../services/media-archive.js';
 
 export const agenciesRouter = Router();
 agenciesRouter.use(requireAuth);
@@ -45,6 +46,27 @@ agenciesRouter.get(
   requireModule('settings', 'view'),
   async (_req, res) => {
     ok(res, await getStorageStatus());
+  },
+);
+
+// POST /agency/storage/archive — run the media archive/retention job on demand
+// (owner). `dryRun` reports what WOULD be archived without touching anything;
+// `olderThanDays` overrides the retention window (for testing).
+const archiveSchema = z.object({
+  dryRun: z.boolean().optional(),
+  olderThanDays: z.number().int().min(0).max(3650).optional(),
+});
+agenciesRouter.post(
+  '/storage/archive',
+  requireRole('owner', 'admin'),
+  requireModule('settings', 'manage'),
+  async (req, res) => {
+    const body = archiveSchema.parse(req.body ?? {});
+    const result = await runMediaArchive({
+      dryRun: body.dryRun,
+      retentionDays: body.olderThanDays,
+    });
+    ok(res, result);
   },
 );
 

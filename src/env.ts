@@ -102,6 +102,12 @@ const envSchema = z.object({
   MEDIA_UPLOAD_BASE: z.string().optional(), // e.g. https://api.creativemonk.in (defaults to request origin)
   // How long (days) media stays hot before the archive job may delete it.
   MEDIA_RETENTION_DAYS: z.coerce.number().int().positive().default(60),
+  // Weekly auto-archive+delete of media older than the retention window. Off by
+  // default; the local file is only removed AFTER its archive copy succeeds.
+  MEDIA_AUTODELETE_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
 
   // Email (SMTP). Optional: when absent, the email service logs instead of
   // sending (so dev works without creds). For Gmail use an App Password.

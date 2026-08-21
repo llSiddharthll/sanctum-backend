@@ -3,6 +3,8 @@ import { db } from '../db/client.js';
 import { agencies } from '../db/schema.js';
 import { emailEmployeeReports } from './reports.js';
 import { sweepStaleTimers } from '../routes/timers.js';
+import { runMediaArchive } from './media-archive.js';
+import { env } from '../env.js';
 
 /** Previous calendar month as {from:'YYYY-MM-01', to:'YYYY-MM-<last>'} (UTC). */
 export function previousMonthRange(now: Date): { from: string; to: string } {
@@ -55,4 +57,22 @@ export function startScheduler(): void {
       .catch((e) => console.error('[timers] shift-end sweep failed', e));
   });
   console.log('[scheduler] timer shift-end sweep scheduled (*/15 * * * *)');
+
+  // Weekly (Sun 22:00): archive + delete self-hosted media past the retention
+  // window. Off unless MEDIA_AUTODELETE_ENABLED — local files are only removed
+  // after their archive copy to Drive succeeds.
+  if (env.MEDIA_AUTODELETE_ENABLED) {
+    cron.schedule('0 22 * * 0', () => {
+      void runMediaArchive()
+        .then((r) => {
+          if (r.archived > 0 || r.errors > 0) {
+            console.log(
+              `[media-archive] archived ${r.archived}, errors ${r.errors} (scanned ${r.scanned})`,
+            );
+          }
+        })
+        .catch((e) => console.error('[media-archive] run failed', e));
+    });
+    console.log('[scheduler] media archive scheduled (0 22 * * 0)');
+  }
 }

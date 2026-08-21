@@ -69,6 +69,7 @@ const documentSelection = {
   clientVisible: documents.clientVisible,
   hideFromTeam: documents.hideFromTeam,
   folderId: documents.folderId,
+  archived: documents.archived,
   uploadedBy: documents.uploadedBy,
   createdAt: documents.createdAt,
   updatedAt: documents.updatedAt,
@@ -92,6 +93,7 @@ type DocumentRow = {
   clientVisible: boolean;
   hideFromTeam: boolean;
   folderId: string | null;
+  archived: boolean;
   uploadedBy: string | null;
   createdAt: Date | null;
   updatedAt: Date | null;
@@ -118,6 +120,7 @@ function serializeDocument(d: DocumentRow) {
     clientVisible: d.clientVisible,
     hideFromTeam: d.hideFromTeam,
     folderId: d.folderId,
+    archived: d.archived,
     uploadedBy: d.uploadedBy,
     uploadedByName: d.uploadedByName,
     createdAt: toIso(d.createdAt),
