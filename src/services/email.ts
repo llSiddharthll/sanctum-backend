@@ -82,14 +82,23 @@ function esc(s: string): string {
  */
 export function basicHtml(opts: {
   heading: string;
-  body: string;
+  /** Plain-text body (escaped; newlines preserved via white-space:pre-line). */
+  body?: string;
+  /** Pre-formatted HTML body (rendered as-is). Use for bold/links/line breaks. */
+  bodyHtml?: string;
   buttonLabel?: string;
   buttonUrl?: string;
   preheader?: string;
 }): string {
   const year = new Date().getUTCFullYear();
   const brandName = env.EMAIL_FROM_NAME || 'Sanctum';
-  const preheader = esc(opts.preheader ?? opts.body.replace(/\s+/g, ' ').slice(0, 140));
+  const plain = (opts.body ?? opts.bodyHtml ?? '').replace(/<[^>]+>/g, ' ');
+  const preheader = esc(opts.preheader ?? plain.replace(/\s+/g, ' ').slice(0, 140));
+  // The body cell: escape plain text (pre-line keeps its newlines), or render
+  // caller-supplied HTML verbatim.
+  const bodyCell = opts.bodyHtml
+    ? `<td style="font-size:16px;line-height:1.7;color:${BRAND.body}">${opts.bodyHtml}</td>`
+    : `<td style="font-size:16px;line-height:1.7;color:${BRAND.body};white-space:pre-line">${esc(opts.body ?? '')}</td>`;
 
   // Bulletproof, full-width CTA (with MSO/Outlook VML fallback).
   const button =
@@ -105,7 +114,7 @@ export function basicHtml(opts: {
             </v:roundrect>
             <![endif]-->
             <!--[if !mso]><!-- -->
-            <a href="${opts.buttonUrl}" style="display:block;width:100%;background:linear-gradient(135deg,${BRAND.orangeSoft} 0%,${BRAND.orange} 52%,${BRAND.orangeDark} 100%);background-color:${BRAND.orange};color:#ffffff;text-decoration:none;font-size:16px;font-weight:700;line-height:54px;height:54px;text-align:center;border-radius:14px;box-shadow:0 10px 26px rgba(239,126,26,0.38);letter-spacing:.3px">${esc(opts.buttonLabel)} &#8594;</a>
+            <a href="${opts.buttonUrl}" style="display:inline-block;padding:15px 40px;background:linear-gradient(135deg,${BRAND.orangeSoft} 0%,${BRAND.orange} 52%,${BRAND.orangeDark} 100%);background-color:${BRAND.orange};color:#ffffff;text-decoration:none;font-size:16px;font-weight:700;line-height:1.2;text-align:center;border-radius:12px;box-shadow:0 10px 26px rgba(239,126,26,0.38);letter-spacing:.3px">${esc(opts.buttonLabel)} &#8594;</a>
             <!--<![endif]-->
           </td>
         </tr>
@@ -122,13 +131,23 @@ export function basicHtml(opts: {
 <meta name="supported-color-schemes" content="light">
 <title>${esc(brandName)}</title>
 <!--[if mso]><xml><o:OfficeDocumentSettings><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml><![endif]-->
+<style>
+  /* On phones, fill the width (instead of the client zooming the 600px card
+     out) and trim the side padding so the content isn't a narrow column. */
+  @media only screen and (max-width:620px){
+    .sanctum-card{width:100%!important;max-width:100%!important;border-radius:0 0 20px 20px!important}
+    .sanctum-pad{padding-left:20px!important;padding-right:20px!important}
+    .sanctum-pad-sm{padding-left:20px!important;padding-right:20px!important}
+  }
+  a{text-decoration:none}
+</style>
 </head>
 <body style="margin:0;padding:0;background:${BRAND.pageBg};-webkit-font-smoothing:antialiased;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Helvetica,Arial,sans-serif">
   <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;visibility:hidden">${preheader}&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;</div>
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.pageBg}">
     <tr>
       <td align="center" style="padding:28px 12px 36px">
-        <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:600px;max-width:600px;box-shadow:0 30px 70px rgba(0,0,0,0.55);border-radius:28px">
+        <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" class="sanctum-card" style="width:600px;max-width:600px;box-shadow:0 30px 70px rgba(0,0,0,0.55);border-radius:28px">
 
           <!-- Glassmorphism hero (pre-rendered, fades into the card) -->
           <tr>
@@ -144,7 +163,7 @@ export function basicHtml(opts: {
             <td style="background:${BRAND.cardBg};border:1px solid ${BRAND.line};border-top:0;border-radius:0 0 28px 28px">
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
                 <tr>
-                  <td style="padding:14px 32px 32px">
+                  <td class="sanctum-pad" style="padding:20px 30px 26px">
                     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
                       <!-- eyebrow chip -->
                       <tr><td style="padding-bottom:18px">
@@ -152,16 +171,16 @@ export function basicHtml(opts: {
                           <td style="background:${BRAND.chipBg};border:1px solid ${BRAND.chipLine};border-radius:100px;padding:7px 16px;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:${BRAND.chipText}">Sanctum</td>
                         </tr></table>
                       </td></tr>
-                      <tr><td style="font-size:29px;line-height:1.22;font-weight:800;color:${BRAND.heading};padding-bottom:16px;letter-spacing:-0.6px">${esc(opts.heading)}</td></tr>
-                      <tr><td style="font-size:16px;line-height:1.72;color:${BRAND.body};white-space:pre-line">${esc(opts.body)}</td></tr>
-                      ${button ? `<tr><td style="padding-top:30px">${button}</td></tr>` : ''}
+                      <tr><td style="font-size:26px;line-height:1.25;font-weight:800;color:${BRAND.heading};padding-bottom:14px;letter-spacing:-0.5px">${esc(opts.heading)}</td></tr>
+                      <tr>${bodyCell}</tr>
+                      ${button ? `<tr><td style="padding-top:24px">${button}</td></tr>` : ''}
                     </table>
                   </td>
                 </tr>
                 <!-- divider + helper note -->
-                <tr><td style="padding:0 32px"><div style="height:1px;background:${BRAND.line};line-height:1px;font-size:0">&nbsp;</div></td></tr>
+                <tr><td class="sanctum-pad" style="padding:0 30px"><div style="height:1px;background:${BRAND.line};line-height:1px;font-size:0">&nbsp;</div></td></tr>
                 <tr>
-                  <td style="padding:22px 32px 30px">
+                  <td class="sanctum-pad" style="padding:20px 30px 26px">
                     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.panelBg};border:1px solid ${BRAND.line};border-radius:16px">
                       <tr>
                         <td valign="middle" width="40" style="padding:16px 0 16px 18px">

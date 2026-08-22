@@ -682,7 +682,7 @@ clientsRouter.post(
         : `Your ${agencyName} client portal login`,
       html: basicHtml({
         heading: note ? 'A new document is ready' : 'Your secure portal login',
-        body: `Hi ${client.name}, ${intro}<br><br>${creds}`,
+        bodyHtml: `Hi ${client.name}, ${intro}<br><br>${creds}`,
         buttonLabel: 'Sign in to your portal',
         buttonUrl: loginUrl,
         preheader: note ?? `Your ${agencyName} portal login details inside.`,

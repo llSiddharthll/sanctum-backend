@@ -431,7 +431,7 @@ authRouter.post('/:id/send', async (req, res) => {
     text: `We're pleased to share the proposal "${p.title}" with you.${body.message ? `\n\n${body.message}` : ''}\n\nReview it online (no login needed): ${publicUrl}`,
     html: basicHtml({
       heading: p.title,
-      body: `${agencyName} has prepared a proposal for you — <strong>${p.title}</strong>. Open it below to read the plan, scope, investment options and projected return, and accept it right from the page.${body.message ? `<br><br><em>${body.message}</em>` : ''}`,
+      bodyHtml: `${agencyName} has prepared a proposal for you — <strong>${p.title}</strong>. Open it below to read the plan, scope, investment options and projected return, and accept it right from the page.${body.message ? `<br><br><em>${body.message}</em>` : ''}`,
       buttonLabel: 'Review the proposal',
       buttonUrl: publicUrl,
       preheader: `${agencyName} shared a proposal with you — open it in one tap.`,
