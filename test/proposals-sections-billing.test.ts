@@ -67,6 +67,29 @@ describe('proposals: custom sections + per-line billing', () => {
     expect(monthly.title).toBe('Social Media Management');
   });
 
+  it('a document proposal can be edited: title + replaced file (fileUrl column)', async () => {
+    const created = data(
+      await owner.post(`${BASE}/proposals`).send({
+        title: 'Doc Proposal',
+        clientId,
+        content: { source: 'document', fileUrl: 'https://files.example.com/old.pdf' },
+        fileUrl: 'https://files.example.com/old.pdf',
+      }),
+    );
+    // Note: create doesn't take fileUrl, but the PUT (edit) does — replace it.
+    const put = await owner.put(`${BASE}/proposals/${created.id}`).send({
+      title: 'Doc Proposal (renamed)',
+      content: { source: 'document', fileUrl: 'https://files.example.com/new.pdf' },
+      fileUrl: 'https://files.example.com/new.pdf',
+    });
+    expect(put.status).toBe(200);
+    const list = data(await owner.get(`${BASE}/proposals`));
+    const p = list.find((x: any) => x.id === created.id);
+    expect(p.title).toBe('Doc Proposal (renamed)');
+    expect(p.fileUrl).toBe('https://files.example.com/new.pdf');
+    expect(p.content.fileUrl).toBe('https://files.example.com/new.pdf');
+  });
+
   it('a proposal with no monthly lines stays one-time', async () => {
     const created = data(
       await owner.post(`${BASE}/proposals`).send({

@@ -662,6 +662,9 @@ const updateProposalSchema = z.object({
   recurringPaise: z.number().int().min(0).nullable().optional(),
   validUntil: z.coerce.date().optional().nullable(),
   content: z.record(z.string(), z.any()).optional(),
+  // The uploaded-document URL (for a document-sourced proposal; lets the file
+  // be replaced, and is cleared when converting it to a form-authored one).
+  fileUrl: z.string().url().nullable().optional(),
 });
 
 authRouter.put('/:id', async (req, res) => {
@@ -694,6 +697,7 @@ authRouter.put('/:id', async (req, res) => {
     patch.recurringPaise = body.recurringPaise ?? 0;
   if (body.validUntil !== undefined) patch.validUntil = body.validUntil;
   if (body.content !== undefined) patch.contentJson = JSON.stringify(body.content);
+  if (body.fileUrl !== undefined) patch.fileUrl = body.fileUrl;
 
   // Editing a declined proposal revives it as a draft so it can be revised and
   // re-sent (clears the prior rejection).
