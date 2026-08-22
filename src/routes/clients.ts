@@ -638,8 +638,12 @@ clientsRouter.post(
 // secure-login credentials (login link + email + password).
 const loginEmailSchema = z.object({
   email: z.string().email(),
-  password: z.string().min(1),
+  // Omit when the client already has a login (we don't know their password) —
+  // the email then just links them to sign in with their existing credentials.
+  password: z.string().min(1).optional(),
   sendTo: z.string().email().optional(),
+  // Optional context line, e.g. "A new invoice is ready to view in your portal."
+  note: z.string().trim().max(300).optional(),
 });
 clientsRouter.post(
   '/:clientId/portal-login-email',
@@ -663,18 +667,27 @@ clientsRouter.post(
       .limit(1);
     const agencyName = agency?.name ?? 'Your agency';
     const loginUrl = `${getFrontendOrigin(req)}/login`;
+    const note = body.note?.trim();
+    const intro = note
+      ? note
+      : `${agencyName} has set up your private client portal — follow your projects, view the content calendar, review proposals & agreements, see invoices, and download shared files, all in one place.`;
+    const creds = body.password
+      ? `Sign in with these details:<br><br><strong>Email:</strong> ${body.email}<br><strong>Password:</strong> ${body.password}<br><br>Keep these private — you can change your password after signing in.`
+      : `Sign in with your email (<strong>${body.email}</strong>) and your existing password. Forgot it? Ask ${agencyName} to reset it for you.`;
 
     await sendEmail({
       to,
-      subject: `Your ${agencyName} client portal login`,
+      subject: note
+        ? `${agencyName}: a new document is ready in your portal`
+        : `Your ${agencyName} client portal login`,
       html: basicHtml({
-        heading: 'Your secure portal login',
-        body: `Hi ${client.name}, ${agencyName} has set up your private client portal — follow your projects, view the content calendar, review proposals & agreements, see invoices, and download shared files, all in one place.<br><br>Sign in with these details:<br><br><strong>Email:</strong> ${body.email}<br><strong>Password:</strong> ${body.password}<br><br>Keep these private. For your security, don't forward this email — you can change your password after signing in.`,
+        heading: note ? 'A new document is ready' : 'Your secure portal login',
+        body: `Hi ${client.name}, ${intro}<br><br>${creds}`,
         buttonLabel: 'Sign in to your portal',
         buttonUrl: loginUrl,
-        preheader: `Your ${agencyName} portal login details inside.`,
+        preheader: note ?? `Your ${agencyName} portal login details inside.`,
       }),
-      text: `${agencyName} client portal login.\nSign in: ${loginUrl}\nEmail: ${body.email}\nPassword: ${body.password}\n\nKeep these private.`,
+      text: `${note ? note + '\n\n' : ''}${agencyName} client portal.\nSign in: ${loginUrl}\nEmail: ${body.email}${body.password ? '\nPassword: ' + body.password : '\nUse your existing password.'}\n\nKeep these private.`,
     });
 
     await audit({

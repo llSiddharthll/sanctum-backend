@@ -63,6 +63,26 @@ describe('secure client-portal login', () => {
     expect(after.email).toBe(email);
   });
 
+  it('emails a portal link with a password (new login) and without one (existing)', async () => {
+    const email = `emaillink.${Date.now()}@client.test`;
+    const cli = await makeClient(owner, 'Email Co', email);
+    await owner.post(`${BASE}/clients/${cli.id}/portal-login`).send({});
+
+    // With credentials (a note referencing the new document).
+    const withPw = await owner
+      .post(`${BASE}/clients/${cli.id}/portal-login-email`)
+      .send({ email, password: 'Secret123', note: 'A new invoice is ready to view in your portal.' });
+    expect(withPw.status).toBe(200);
+    expect(data(withPw).sent).toBe(true);
+
+    // Without a password (client already has a login) — must still succeed.
+    const noPw = await owner
+      .post(`${BASE}/clients/${cli.id}/portal-login-email`)
+      .send({ email, note: 'A new invoice is ready to view in your portal.' });
+    expect(noPw.status).toBe(200);
+    expect(data(noPw).sent).toBe(true);
+  });
+
   it('resetting rotates the password — the old one stops working', async () => {
     const email = `reset.${Date.now()}@client.test`;
     const cli = await makeClient(owner, 'Reset Co', email);
