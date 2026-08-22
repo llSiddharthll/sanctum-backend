@@ -44,7 +44,7 @@ describe('secure client-portal login', () => {
     const creds = data(res);
     expect(creds.email).toBe(email);
     expect(typeof creds.password).toBe('string');
-    expect(creds.password.length).toBeGreaterThanOrEqual(10);
+    expect(creds.password.length).toBeGreaterThanOrEqual(8);
     expect(creds.created).toBe(true);
 
     // The client can log in with those credentials, as a 'client'.

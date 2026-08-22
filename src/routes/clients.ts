@@ -488,15 +488,16 @@ clientsRouter.post(
 //  once on create/reset, so the caller must copy/share it immediately.
 // ============================================================
 
-// Human-friendly password: 15 chars from an unambiguous alphabet (no 0/O/1/l/I),
-// grouped for readability. ~86 bits of entropy.
-const PW_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+// Easy-to-type password: 8 lowercase-unambiguous chars (no i/l/o/0/1),
+// grouped 4-4 (e.g. "kmrp-2t9x"). All lowercase + digits so there's no
+// case-switching on a phone keyboard.
+const PW_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789';
 function generatePortalPassword(): string {
-  const bytes = randomBytes(15);
+  const bytes = randomBytes(8);
   let out = '';
-  for (let i = 0; i < 15; i += 1) {
+  for (let i = 0; i < 8; i += 1) {
     out += PW_ALPHABET[bytes[i] % PW_ALPHABET.length];
-    if (i === 4 || i === 9) out += '-';
+    if (i === 3) out += '-';
   }
   return out;
 }
