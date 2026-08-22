@@ -27,6 +27,7 @@ import { ok, created, toIso, param } from '../lib/http.js';
 import { badRequest, forbidden, notFound } from '../lib/errors.js';
 import { newId } from '../lib/ids.js';
 import { audit } from '../services/audit.js';
+import { agencyOwners, notifyMany } from '../services/notifications.js';
 import { mirrorClientPostComment } from '../services/client-discussion.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireClientAuth, getClientCtx } from '../middleware/client.js';
@@ -1032,6 +1033,24 @@ clientPortalRouter.post('/proposals/:id/accept', async (req, res) => {
     ip: req.ip,
   });
 
+  // Alert the agency owners (proposals are owner-only) in real time.
+  try {
+    const owners = await agencyOwners(ctx.agencyId);
+    if (owners.length) {
+      await notifyMany(owners, {
+        agencyId: ctx.agencyId,
+        type: 'proposal.accepted',
+        title: 'Proposal accepted',
+        body: `${name} accepted “${p.title}”.`,
+        entityType: 'proposal',
+        entityId: p.id,
+        link: '/proposals',
+      });
+    }
+  } catch {
+    /* best-effort — never fail the client's action */
+  }
+
   ok(res, { accepted: true });
 });
 
@@ -1161,6 +1180,24 @@ clientPortalRouter.post('/agreements/:id/sign', async (req, res) => {
     entityId: a.id,
     ip: req.ip,
   });
+
+  // Alert the agency owners (agreements are owner-only) in real time.
+  try {
+    const owners = await agencyOwners(ctx.agencyId);
+    if (owners.length) {
+      await notifyMany(owners, {
+        agencyId: ctx.agencyId,
+        type: 'agreement.signed',
+        title: 'Agreement signed',
+        body: `${body.signerName} signed “${a.title}”.`,
+        entityType: 'agreement',
+        entityId: a.id,
+        link: '/agreements',
+      });
+    }
+  } catch {
+    /* best-effort */
+  }
 
   ok(res, { signed: true, signedAt: new Date().toISOString() });
 });

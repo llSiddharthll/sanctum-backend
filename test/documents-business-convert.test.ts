@@ -49,6 +49,8 @@ describe('documents → proposals / agreements / invoices', () => {
 
   const clientGet = (path: string) =>
     supertest(app).get(`${BASE}${path}`).set('Authorization', `Bearer ${clientAt}`);
+  const clientPost = (path: string, body?: object) =>
+    supertest(app).post(`${BASE}${path}`).set('Authorization', `Bearer ${clientAt}`).send(body ?? {});
 
   it('proposal upload → sent proposal in the agency tab AND the client portal (with fileUrl)', async () => {
     const doc = await uploadDoc(owner, {
@@ -71,6 +73,13 @@ describe('documents → proposals / agreements / invoices', () => {
     const cp = client.find((p: any) => p.id === propId);
     expect(cp, 'proposal should appear in the client portal').toBeTruthy();
     expect(cp.fileUrl).toBe(doc.fileUrl);
+
+    // A document proposal has no review token, but the client can still approve
+    // it in place from the portal (by id).
+    const accept = await clientPost(`/client/proposals/${propId}/accept`);
+    expect(accept.status).toBe(200);
+    const after = data(await clientGet('/client/proposals'));
+    expect(after.find((p: any) => p.id === propId).status).toBe('accepted');
   });
 
   it('agreement upload (client-visible) → agency + client agreement tab', async () => {
@@ -88,6 +97,14 @@ describe('documents → proposals / agreements / invoices', () => {
     const client = data(await clientGet('/client/agreements'));
     const ca = client.find((a: any) => a.id === agrId);
     expect(ca?.fileUrl).toBe(doc.fileUrl);
+
+    // The client can e-sign the document agreement in place (by id, no token).
+    const sign = await clientPost(`/client/agreements/${agrId}/sign`, {
+      signerName: 'Client Boss',
+      signerEmail: 'boss@client.test',
+      signatureDataUrl: 'signed:Client Boss',
+    });
+    expect(sign.status).toBe(200);
   });
 
   it('invoice upload appears in the Invoices tab; client visibility follows the toggle', async () => {
