@@ -1054,6 +1054,68 @@ clientPortalRouter.post('/proposals/:id/accept', async (req, res) => {
   ok(res, { accepted: true });
 });
 
+// POST /client/proposals/:id/reject — the client requests changes / declines.
+const clientRejectSchema = z.object({
+  reason: z.string().trim().max(1000).optional(),
+});
+clientPortalRouter.post('/proposals/:id/reject', async (req, res) => {
+  const ctx = getClientCtx(req);
+  const body = clientRejectSchema.parse(req.body);
+  const [p] = await db
+    .select()
+    .from(proposals)
+    .where(
+      and(
+        eq(proposals.id, param(req, 'id')),
+        eq(proposals.agencyId, ctx.agencyId),
+        eq(proposals.clientId, ctx.clientId),
+      ),
+    )
+    .limit(1);
+
+  if (!p) throw notFound('Proposal not found.');
+  const name = await clientDisplayName(ctx.userId);
+
+  await db
+    .update(proposals)
+    .set({
+      status: 'rejected',
+      rejectionReason: body.reason?.trim() || null,
+      rejectedAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .where(eq(proposals.id, p.id));
+
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: 'client',
+    actorId: ctx.userId,
+    action: 'proposal.reject',
+    entityType: 'proposal',
+    entityId: p.id,
+    ip: req.ip,
+  });
+
+  try {
+    const owners = await agencyOwners(ctx.agencyId);
+    if (owners.length) {
+      await notifyMany(owners, {
+        agencyId: ctx.agencyId,
+        type: 'proposal.changes_requested',
+        title: 'Proposal — changes requested',
+        body: `${name} requested changes on “${p.title}”${body.reason?.trim() ? `: ${body.reason.trim()}` : '.'}`,
+        entityType: 'proposal',
+        entityId: p.id,
+        link: '/proposals',
+      });
+    }
+  } catch {
+    /* best-effort */
+  }
+
+  ok(res, { rejected: true });
+});
+
 // ============================================================
 //  CLIENT PORTAL: AGREEMENTS
 // ============================================================

@@ -74,8 +74,12 @@ describe('documents → proposals / agreements / invoices', () => {
     expect(cp, 'proposal should appear in the client portal').toBeTruthy();
     expect(cp.fileUrl).toBe(doc.fileUrl);
 
-    // A document proposal has no review token, but the client can still approve
-    // it in place from the portal (by id).
+    // A document proposal has no review token, but the client can request
+    // changes OR approve it in place from the portal (by id).
+    const reject = await clientPost(`/client/proposals/${propId}/reject`, { reason: 'Lower the price' });
+    expect(reject.status).toBe(200);
+    expect(data(await clientGet('/client/proposals')).find((p: any) => p.id === propId).status).toBe('rejected');
+
     const accept = await clientPost(`/client/proposals/${propId}/accept`);
     expect(accept.status).toBe(200);
     const after = data(await clientGet('/client/proposals'));
