@@ -6,6 +6,7 @@ import {
   projectTasks,
   taskAssignees,
   projects,
+  projectMembers,
   clients,
   users,
   calendarReservations,
@@ -93,26 +94,68 @@ export async function publishCalendarSheet(
       'Link this calendar to a client before publishing (it creates that client’s posts).',
     );
   }
-  if (!sheet.projectId) {
-    throw new AppError(
-      'VALIDATION_ERROR',
-      'Link this calendar to a project before publishing (tasks are created there).',
-    );
-  }
 
-  // Verify client + project belong to the agency.
+  // Verify the client belongs to the agency.
   const [client] = await db
     .select({ id: clients.id, name: clients.name })
     .from(clients)
     .where(and(eq(clients.id, sheet.clientId), eq(clients.agencyId, ctx.agencyId)))
     .limit(1);
-  const [project] = await db
-    .select({ id: projects.id })
-    .from(projects)
-    .where(and(eq(projects.id, sheet.projectId), eq(projects.agencyId, ctx.agencyId)))
-    .limit(1);
-  if (!client || !project) {
-    throw new AppError('VALIDATION_ERROR', 'The linked client or project no longer exists.');
+  if (!client) {
+    throw new AppError('VALIDATION_ERROR', 'The linked client no longer exists.');
+  }
+
+  // Resolve a project to host the tasks. A project is optional in the picker —
+  // many clients don't have one yet — so if none is linked (or the link is
+  // stale) we reuse the client's existing project, else auto-create a
+  // "Content Calendar" project and link it back to the sheet for next time.
+  let projectId = sheet.projectId;
+  if (projectId) {
+    const [project] = await db
+      .select({ id: projects.id })
+      .from(projects)
+      .where(and(eq(projects.id, projectId), eq(projects.agencyId, ctx.agencyId)))
+      .limit(1);
+    if (!project) projectId = null; // stale link → re-resolve below
+  }
+  if (!projectId) {
+    const [existing] = await db
+      .select({ id: projects.id })
+      .from(projects)
+      .where(
+        and(eq(projects.agencyId, ctx.agencyId), eq(projects.clientId, sheet.clientId)),
+      )
+      .limit(1);
+    if (existing) {
+      projectId = existing.id;
+    } else {
+      projectId = newId('prj');
+      await db.insert(projects).values({
+        id: projectId,
+        agencyId: ctx.agencyId,
+        clientId: sheet.clientId,
+        name: (sheet.title || '').trim() || 'Content Calendar',
+        type: 'retainer',
+        status: 'active',
+        createdBy: ctx.userId,
+      });
+      // The publisher owns the auto-created project (so it's visible to them).
+      await db
+        .insert(projectMembers)
+        .values({
+          id: newId('prm'),
+          agencyId: ctx.agencyId,
+          projectId,
+          userId: ctx.userId,
+          role: 'owner',
+        })
+        .onConflictDoNothing();
+    }
+    // Link the resolved project back to the sheet for subsequent publishes.
+    await db
+      .update(sheets)
+      .set({ projectId, updatedAt: new Date() })
+      .where(eq(sheets.id, sheetId));
   }
 
   const cols = data.columns;
@@ -199,7 +242,7 @@ export async function publishCalendarSheet(
       await db.insert(projectTasks).values({
         id: taskId,
         agencyId: ctx.agencyId,
-        projectId: sheet.projectId,
+        projectId,
         title: caption,
         assigneeId: assignee,
         dueDate: date,

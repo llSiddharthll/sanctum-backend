@@ -103,6 +103,33 @@ describe('sheets → calendar publish pipeline', () => {
     expect(pub2.postsCreated).toBe(0);
   });
 
+  it('publishes with only a client linked — auto-creates a project for the tasks', async () => {
+    // A brand-new client with no projects (the common case the picker showed
+    // "No projects" for). Publishing should still work: a project is created.
+    const soloClient = await makeClient(owner, 'No-Project Co');
+    const sheet = data(await owner.post(`${BASE}/sheets`).send({ title: 'Solo Cal' }));
+    await owner.patch(`${BASE}/sheets/${sheet.id}`).send({
+      clientId: soloClient, // note: NO projectId
+      data: calData({
+        A2: { v: '2026-11-02' }, B2: { v: 'reel' }, C2: { v: 'Solo reel' }, E2: { v: memberId },
+      }),
+    });
+
+    const pub = data(await owner.post(`${BASE}/sheets/${sheet.id}/publish`));
+    expect(pub.postsCreated).toBe(1);
+    expect(pub.tasksCreated).toBe(1);
+
+    // The sheet is now linked to an auto-created project.
+    const reloaded = data(await owner.get(`${BASE}/sheets/${sheet.id}`));
+    expect(reloaded.projectId).toBeTruthy();
+
+    // That project belongs to the client and carries the task.
+    const proj = data(await owner.get(`${BASE}/projects/${reloaded.projectId}`));
+    expect(proj.clientId).toBe(soloClient);
+    const tasks = data(await owner.get(`${BASE}/projects/${reloaded.projectId}/tasks`));
+    expect(tasks.some((t: any) => t.title === 'Solo reel')).toBe(true);
+  });
+
   it('skips reserved days, and completing a linked task publishes its post', async () => {
     await owner.post(`${BASE}/clients/${clientId}/reservations`).send({ date: '2026-10-10', label: 'Shoot' });
     const sheet = data(await owner.post(`${BASE}/sheets`).send({ title: 'Cal2' }));
