@@ -41,35 +41,79 @@ function a1(row: number, col: number): string {
 
 const POST_TYPES = ['reel', 'story', 'carousel', 'post'] as const;
 
-function parseDate(raw: unknown): Date | null {
+const MONTHS: Record<string, number> = {
+  jan: 1, january: 1,
+  feb: 2, february: 2,
+  mar: 3, march: 3,
+  apr: 4, april: 4,
+  may: 5,
+  jun: 6, june: 6,
+  jul: 7, july: 7,
+  aug: 8, august: 8,
+  sep: 9, sept: 9, september: 9,
+  oct: 10, october: 10,
+  nov: 11, november: 11,
+  dec: 12, december: 12,
+};
+
+/** Two-digit years → 2000s (so "26" = 2026). */
+function fullYear(y: number): number {
+  return y < 100 ? 2000 + y : y;
+}
+
+/** Build a UTC date, rejecting impossible ones (e.g. 31-02) instead of rolling over. */
+function makeDate(year: number, mon: number, day: number): Date | null {
+  if (!(mon >= 1 && mon <= 12 && day >= 1 && day <= 31)) return null;
+  const d = new Date(Date.UTC(year, mon - 1, day));
+  if (
+    d.getUTCFullYear() !== year ||
+    d.getUTCMonth() !== mon - 1 ||
+    d.getUTCDate() !== day
+  ) {
+    return null; // rolled over → invalid calendar date
+  }
+  return d;
+}
+
+/**
+ * Parse a calendar-cell date, permissively, across the formats people actually
+ * type. Numeric dates are day-first (DD-MM-YYYY — the Indian default the grid
+ * shows) unless the fields make that impossible; separators may be - / or . ;
+ * years may be 2 or 4 digits; textual months ("1 Sep 2026", "September 1, 26")
+ * are accepted in either order.
+ */
+export function parseDate(raw: unknown): Date | null {
   if (raw == null || raw === '') return null;
   const s = String(raw).trim();
+  if (!s) return null;
 
-  // ISO: YYYY-MM-DD (or YYYY/MM/DD)
-  let m = /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/.exec(s);
-  if (m) {
-    const [, y, mo, d] = m;
-    return new Date(Date.UTC(+y, +mo - 1, +d));
-  }
+  // ISO / year-first: YYYY-MM-DD, YYYY/MM/DD, YYYY.MM.DD (+ optional time).
+  let m = /^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[ T].*)?$/.exec(s);
+  if (m) return makeDate(+m[1], +m[2], +m[3]);
 
-  // Day-first / month-first: DD-MM-YYYY or DD/MM/YYYY (the Indian default the
-  // grid shows). `new Date("01-09-2026")` would wrongly read this as MM-DD, so
-  // parse it ourselves. Disambiguate the obvious cases, else assume day-first.
-  m = /^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/.exec(s);
+  // Numeric day/month-first: D-M-YYYY, D/M/YY, D.M.YYYY, etc.
+  m = /^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})$/.exec(s);
   if (m) {
     let day = +m[1];
     let mon = +m[2];
-    const year = +m[3];
-    if (day <= 12 && mon > 12) {
-      // second field can't be a month → it's the day (US MM-DD-YYYY)
-      [day, mon] = [mon, day];
-    }
-    if (mon >= 1 && mon <= 12 && day >= 1 && day <= 31) {
-      return new Date(Date.UTC(year, mon - 1, day));
-    }
+    const year = fullYear(+m[3]);
+    if (day <= 12 && mon > 12) [day, mon] = [mon, day]; // must be US MM-DD
+    return makeDate(year, mon, day);
   }
 
-  // Fallback: let the engine try (handles "Sep 1 2026", ISO datetimes, etc.).
+  // Textual, day-first: "1 Sep 2026", "1st September 26", "1-Sep-2026".
+  m = /^(\d{1,2})(?:st|nd|rd|th)?[\s.\-]+([A-Za-z]+)[\s.,\-]+(\d{2,4})$/.exec(s);
+  if (m && MONTHS[m[2].toLowerCase()]) {
+    return makeDate(fullYear(+m[3]), MONTHS[m[2].toLowerCase()], +m[1]);
+  }
+
+  // Textual, month-first: "Sep 1 2026", "September 1, 2026", "Sep-1-26".
+  m = /^([A-Za-z]+)[\s.\-]+(\d{1,2})(?:st|nd|rd|th)?[\s.,\-]+(\d{2,4})$/.exec(s);
+  if (m && MONTHS[m[1].toLowerCase()]) {
+    return makeDate(fullYear(+m[3]), MONTHS[m[1].toLowerCase()], +m[2]);
+  }
+
+  // Fallback: let the JS engine try (ISO datetimes, RFC strings, etc.).
   const d = new Date(s);
   return Number.isNaN(d.getTime()) ? null : d;
 }
