@@ -4,6 +4,7 @@ import { agencies } from '../db/schema.js';
 import { emailEmployeeReports } from './reports.js';
 import { sweepStaleTimers } from '../routes/timers.js';
 import { runMediaArchive } from './media-archive.js';
+import { sweepEndedMonths } from './archive.js';
 import { env } from '../env.js';
 
 /** Previous calendar month as {from:'YYYY-MM-01', to:'YYYY-MM-<last>'} (UTC). */
@@ -41,11 +42,35 @@ async function runMonthlyReports(): Promise<void> {
  * report (and owners the team overview) on the 1st of every month at 09:00 UTC.
  * Single fork (pm2) → fires once; a restart does not replay past fires.
  */
+/** Archive incomplete tasks/posts from every fully-ended month (all agencies). */
+async function runMonthArchiveSweep(reason: string): Promise<void> {
+  try {
+    const r = await sweepEndedMonths(new Date());
+    if (r.tasks > 0 || r.posts > 0) {
+      console.log(
+        `[archive] ${reason}: archived ${r.tasks} task(s) + ${r.posts} post(s) from ended months`,
+      );
+    }
+  } catch (e) {
+    console.error(`[archive] ${reason} sweep failed`, e);
+  }
+}
+
 export function startScheduler(): void {
   cron.schedule('0 9 1 * *', () => {
     void runMonthlyReports();
   });
   console.log('[scheduler] monthly employee reports scheduled (0 9 1 * *)');
+
+  // 1st of the month at 00:15 UTC: sweep the just-ended month's incomplete
+  // tasks/posts into the month-wise archive. Also backfill once at boot so any
+  // already-ended months are cleaned up immediately (idempotent).
+  cron.schedule('15 0 1 * *', () => {
+    void runMonthArchiveSweep('monthly');
+  });
+  console.log('[scheduler] monthly archive sweep scheduled (15 0 1 * *)');
+  // Backfill shortly after boot (delay so it doesn't slow startup).
+  setTimeout(() => void runMonthArchiveSweep('startup backfill'), 20_000);
 
   // Every 15 min: auto-close timers left running past their shift end (for
   // people who forgot to stop the timer AND to check out).

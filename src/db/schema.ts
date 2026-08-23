@@ -426,6 +426,10 @@ export const contentPosts = sqliteTable(
       () => aiGenerations.id,
       { onDelete: 'set null' },
     ),
+    // Set when an unposted entry is swept into the month-wise archive after its
+    // scheduled month ends. archivedMonth = 'YYYY-MM' of the scheduled date.
+    archivedAt: ts('archived_at'),
+    archivedMonth: text('archived_month'),
     createdAt: ts('created_at').notNull().default(now),
     updatedAt: ts('updated_at').notNull().default(now),
   },
@@ -434,6 +438,11 @@ export const contentPosts = sqliteTable(
       tbl.agencyId,
       tbl.clientId,
       tbl.scheduledAt,
+    ),
+    index('ix_posts_agency_client_archived').on(
+      tbl.agencyId,
+      tbl.clientId,
+      tbl.archivedMonth,
     ),
     index('ix_posts_agency_client_status').on(
       tbl.agencyId,
@@ -767,11 +776,16 @@ export const projectTasks = sqliteTable(
     // to 'posted' (and surfaces on the client portal calendar).
     postId: text('post_id'),
     position: integer('position').notNull().default(0),
+    // Set when an incomplete task is swept into the month-wise archive after its
+    // due month ends. archivedMonth = 'YYYY-MM' of the due date it belonged to.
+    archivedAt: ts('archived_at'),
+    archivedMonth: text('archived_month'),
     createdAt: ts('created_at').notNull().default(now),
     updatedAt: ts('updated_at').notNull().default(now),
   },
   (tbl) => [
     index('ix_tasks_agency_project').on(tbl.agencyId, tbl.projectId),
+    index('ix_tasks_agency_archived').on(tbl.agencyId, tbl.archivedMonth),
     index('ix_tasks_agency_project_status').on(
       tbl.agencyId,
       tbl.projectId,

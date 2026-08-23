@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, asc, count, eq, gte, inArray, lt, ne } from 'drizzle-orm';
+import { and, asc, count, eq, gte, inArray, isNotNull, isNull, lt, ne } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { contentPosts, postMedia } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
@@ -10,6 +10,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth, requireClientAccess } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
+import { unarchivePost } from '../services/archive.js';
 import { notifyClientReviewReady } from '../services/client-notify.js';
 import { broadcastPortalRefresh } from '../realtime/io.js';
 
@@ -51,6 +52,8 @@ function serializePost(p: typeof contentPosts.$inferSelect) {
     status: p.status,
     createdBy: p.createdBy,
     aiGenerationId: p.aiGenerationId,
+    archivedAt: toIso(p.archivedAt),
+    archivedMonth: p.archivedMonth,
     createdAt: toIso(p.createdAt),
     updatedAt: toIso(p.updatedAt),
   };
@@ -76,11 +79,12 @@ function monthRange(month: string): { from: Date; to: Date } | null {
   return { from, to };
 }
 
-// GET /clients/:clientId/posts?month=YYYY-MM&status=a,b&type=reel
+// GET /clients/:clientId/posts?month=YYYY-MM&status=a,b&type=reel&archived=true
 const listQuery = z.object({
   month: z.string().optional(),
   status: z.string().optional(),
   type: z.string().optional(),
+  archived: z.enum(['true', 'false']).optional(),
 });
 
 postsRouter.get('/', async (req, res) => {
@@ -94,11 +98,19 @@ postsRouter.get('/', async (req, res) => {
     eq(contentPosts.clientId, clientId),
   ];
 
-  if (q.month) {
-    const range = monthRange(q.month);
-    if (!range) throw notFound('Invalid month.');
-    filters.push(gte(contentPosts.scheduledAt, range.from));
-    filters.push(lt(contentPosts.scheduledAt, range.to));
+  // Active calendar excludes archived posts; ?archived=true returns ONLY the
+  // month-wise archive (filter to one bucket with ?month=YYYY-MM).
+  if (q.archived === 'true') {
+    filters.push(isNotNull(contentPosts.archivedAt));
+    if (q.month) filters.push(eq(contentPosts.archivedMonth, q.month));
+  } else {
+    filters.push(isNull(contentPosts.archivedAt));
+    if (q.month) {
+      const range = monthRange(q.month);
+      if (!range) throw notFound('Invalid month.');
+      filters.push(gte(contentPosts.scheduledAt, range.from));
+      filters.push(lt(contentPosts.scheduledAt, range.to));
+    }
   }
   if (q.status) {
     const statuses = q.status.split(',').filter(Boolean) as PostStatus[];
@@ -419,5 +431,22 @@ postsRouter.post('/:postId/transition', async (req, res) => {
     .select()
     .from(contentPosts)
     .where(eq(contentPosts.id, post.id));
+  ok(res, serializePost(row!));
+});
+
+// POST /clients/:clientId/posts/:id/unarchive — restore an archived post to the
+// active calendar (clients:manage via the router gate).
+postsRouter.post('/:id/unarchive', async (req, res) => {
+  const ctx = getAuth(req);
+  const clientId = param(req, 'clientId');
+  await requireClientAccess(ctx, clientId);
+  const id = param(req, 'id');
+  const restored = await unarchivePost(ctx.agencyId, id);
+  if (!restored) throw notFound('Archived post not found.');
+  broadcastPortalRefresh(clientId);
+  const [row] = await db
+    .select()
+    .from(contentPosts)
+    .where(eq(contentPosts.id, id));
   ok(res, serializePost(row!));
 });

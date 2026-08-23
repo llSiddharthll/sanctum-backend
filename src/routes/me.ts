@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, asc, eq, gte, inArray, ne, or, sql, sum } from 'drizzle-orm';
+import { and, asc, eq, gte, inArray, isNull, ne, or, sql, sum } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   clients,
@@ -79,6 +79,7 @@ meRouter.get('/tasks', async (req, res) => {
 
   const filters = [
     eq(projectTasks.agencyId, ctx.agencyId),
+    isNull(projectTasks.archivedAt), // archived tasks live only in History
     or(
       eq(projectTasks.assigneeId, ctx.userId),
       inArray(projectTasks.id, assignedTaskIds),
@@ -157,6 +158,7 @@ meRouter.get('/overview', async (req, res) => {
       and(
         eq(projectTasks.agencyId, ctx.agencyId),
         mine,
+        isNull(projectTasks.archivedAt),
         ne(projectTasks.status, 'done'),
       ),
     );

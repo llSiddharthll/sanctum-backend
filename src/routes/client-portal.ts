@@ -690,6 +690,7 @@ clientPortalRouter.get('/calendar', async (req, res) => {
         eq(contentPosts.agencyId, ctx.agencyId),
         eq(contentPosts.clientId, ctx.clientId),
         ne(contentPosts.status, 'draft'),
+        isNull(contentPosts.archivedAt), // archived (past-month) posts hidden
       ),
     )
     .orderBy(asc(contentPosts.scheduledAt));

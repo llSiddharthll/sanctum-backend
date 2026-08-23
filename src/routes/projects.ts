@@ -6,6 +6,7 @@ import {
   desc,
   eq,
   inArray,
+  isNotNull,
   isNull,
   like,
   or,
@@ -38,6 +39,7 @@ import { loadPermissions } from '../middleware/permissions.js';
 import { meetsLevel } from '../lib/permissions.js';
 import { getAuth, isPrivileged } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
+import { sweepEndedMonths, unarchiveTask } from '../services/archive.js';
 import { listProjectTimers, stopTimersForTask } from './timers.js';
 
 // mergeParams keeps any parent params available (none today, but consistent
@@ -113,11 +115,13 @@ const LABEL_COLORS = [
 const tasksTotalSq = sql<number>`(
   select count(*) from ${projectTasks}
   where ${projectTasks.projectId} = ${projects.id}
+    and ${projectTasks.archivedAt} is null
 )`;
 const tasksDoneSq = sql<number>`(
   select count(*) from ${projectTasks}
   where ${projectTasks.projectId} = ${projects.id}
     and ${projectTasks.status} = 'done'
+    and ${projectTasks.archivedAt} is null
 )`;
 const milestonesTotalSq = sql<number>`(
   select count(*) from ${projectMilestones}
@@ -330,6 +334,8 @@ function serializeTask(tk: typeof projectTasks.$inferSelect) {
     completedAt: toIso(tk.completedAt),
     parentTaskId: tk.parentTaskId,
     position: tk.position,
+    archivedAt: toIso(tk.archivedAt),
+    archivedMonth: tk.archivedMonth,
     createdAt: toIso(tk.createdAt),
     updatedAt: toIso(tk.updatedAt),
   };
@@ -732,6 +738,9 @@ projectsRouter.get('/all-tasks', async (req, res) => {
   const assigneeId = req.query.assigneeId as string | undefined;
   const search = req.query.search as string | undefined;
 
+  const archived = req.query.archived === 'true';
+  const month = req.query.month as string | undefined;
+
   const filters = [eq(projectTasks.agencyId, ctx.agencyId)];
   if (projectId) filters.push(eq(projectTasks.projectId, projectId));
   if (status) filters.push(eq(projectTasks.status, status as any));
@@ -740,6 +749,14 @@ projectsRouter.get('/all-tasks', async (req, res) => {
   if (clientId) filters.push(eq(projects.clientId, clientId));
   if (search && search.trim()) {
     filters.push(like(projectTasks.title, `%${search.trim()}%`));
+  }
+  // Active board excludes archived tasks; ?archived=true returns ONLY the
+  // month-wise archive (optionally a single ?month=YYYY-MM).
+  if (archived) {
+    filters.push(isNotNull(projectTasks.archivedAt));
+    if (month) filters.push(eq(projectTasks.archivedMonth, month));
+  } else {
+    filters.push(isNull(projectTasks.archivedAt));
   }
 
   // Scope guard: only owner/admin/Manager (projects:manage) see every task.
@@ -777,6 +794,32 @@ projectsRouter.get('/all-tasks', async (req, res) => {
       assigneeName: r.assigneeName,
     })),
   );
+});
+
+// POST /projects/tasks/archive-run — sweep this agency's ended months now.
+// (Auto-runs monthly + on boot; this lets a manager force it from History.)
+projectsRouter.post('/tasks/archive-run', async (req, res) => {
+  const ctx = getAuth(req);
+  if (!(await canSeeAllProjects(req))) {
+    return void res
+      .status(403)
+      .json({ error: 'You need manage access on projects to archive months.' });
+  }
+  const r = await sweepEndedMonths(new Date(), ctx.agencyId);
+  ok(res, r);
+});
+
+// POST /projects/tasks/:taskId/unarchive — restore an archived task.
+projectsRouter.post('/tasks/:taskId/unarchive', async (req, res) => {
+  const ctx = getAuth(req);
+  if (!(await canSeeAllProjects(req))) {
+    return void res
+      .status(403)
+      .json({ error: 'You need manage access on projects to restore a task.' });
+  }
+  const done = await unarchiveTask(ctx.agencyId, param(req, 'taskId'));
+  if (!done) throw notFound('Archived task not found.');
+  ok(res, { restored: true });
 });
 
 // POST /projects
@@ -1215,6 +1258,9 @@ projectsRouter.get('/:id/tasks', async (req, res) => {
   const filters = [
     eq(projectTasks.agencyId, ctx.agencyId),
     eq(projectTasks.projectId, projectId),
+    // Archived (past-month, incomplete) tasks live only in the Tasks-module
+    // History; the project board shows active tasks.
+    isNull(projectTasks.archivedAt),
   ];
 
   // Scoped members (Employee tier) only see the tasks assigned to them within a

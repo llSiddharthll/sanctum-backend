@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, asc, eq, ne, or } from 'drizzle-orm';
+import { and, asc, eq, isNull, ne, or } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   agencies,
@@ -202,6 +202,7 @@ portalRouter.get('/resolve', async (req, res) => {
         eq(contentPosts.agencyId, p.agencyId),
         eq(contentPosts.clientId, p.clientId),
         ne(contentPosts.status, 'draft'),
+        isNull(contentPosts.archivedAt), // archived (past-month) posts hidden
       ),
     )
     .orderBy(asc(contentPosts.scheduledAt));
@@ -335,6 +336,7 @@ async function scopedPost(p: PortalContext, postId: string) {
         eq(contentPosts.agencyId, p.agencyId),
         eq(contentPosts.clientId, p.clientId),
         ne(contentPosts.status, 'draft'),
+        isNull(contentPosts.archivedAt),
       ),
     )
     .limit(1);
