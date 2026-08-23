@@ -1550,6 +1550,37 @@ export const sheets = sqliteTable(
 );
 
 // ============================================================
+//  SHEET_PUBLICATIONS (durable link from a published calendar row → the post +
+//  task it produced). Kept OUT of the mutable sheet.data JSON (which the editor
+//  overwrites on autosave) so re-publishing reliably UPDATES an edited row
+//  instead of duplicating it. One row per (sheet, rowIndex).
+// ============================================================
+export const sheetPublications = sqliteTable(
+  t('sheet_publications'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    sheetId: text('sheet_id')
+      .notNull()
+      .references(() => sheets.id, { onDelete: 'cascade' }),
+    rowIndex: integer('row_index').notNull(),
+    postId: text('post_id').references(() => contentPosts.id, {
+      onDelete: 'cascade',
+    }),
+    taskId: text('task_id').references(() => projectTasks.id, {
+      onDelete: 'cascade',
+    }),
+    createdAt: ts('created_at').notNull().default(now),
+  },
+  (tbl) => [
+    uniqueIndex('ux_sheet_publications_sheet_row').on(tbl.sheetId, tbl.rowIndex),
+    index('ix_sheet_publications_sheet').on(tbl.sheetId),
+  ],
+);
+
+// ============================================================
 //  CALENDAR_RESERVATIONS (a reserved day — e.g. a shoot — that blocks tasks;
 //  clientId null = agency-wide). Shown on the calendar; publish skips these.
 // ============================================================

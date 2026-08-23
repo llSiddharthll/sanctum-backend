@@ -130,6 +130,44 @@ describe('sheets → calendar publish pipeline', () => {
     expect(tasks.some((t: any) => t.title === 'Solo reel')).toBe(true);
   });
 
+  it('parses Indian DD-MM-YYYY dates (not as US MM-DD) and corrects them on re-publish', async () => {
+    const sheet = data(await owner.post(`${BASE}/sheets`).send({ title: 'DMY Cal' }));
+    // Dates typed the way the grid shows them: DD-MM-YYYY. "01-09-2026" must be
+    // 1 Sep 2026, NOT 9 Jan 2026 (which `new Date()` would do).
+    await owner.patch(`${BASE}/sheets/${sheet.id}`).send({
+      clientId,
+      projectId,
+      data: calData({
+        A2: { v: '01-09-2026' }, B2: { v: 'reel' }, C2: { v: 'DMY reel' }, E2: { v: memberId },
+        A3: { v: '02/09/2026' }, B3: { v: 'post' }, C3: { v: 'Slash post' }, E3: { v: memberId },
+      }),
+    });
+    const pub = data(await owner.post(`${BASE}/sheets/${sheet.id}/publish`));
+    expect(pub.postsCreated).toBe(2);
+
+    const sep = data(await owner.get(`${BASE}/clients/${clientId}/posts?month=2026-09`));
+    const dmy = sep.find((p: any) => p.caption === 'DMY reel');
+    expect(dmy).toBeTruthy(); // landed in September, not January
+    expect(new Date(dmy.scheduledAt).getUTCMonth()).toBe(8); // 0-based → Sep
+    expect(new Date(dmy.scheduledAt).getUTCDate()).toBe(1);
+
+    // Editing the date + re-publishing MOVES the existing post (no duplicate).
+    await owner.patch(`${BASE}/sheets/${sheet.id}`).send({
+      data: calData({
+        A2: { v: '15-09-2026' }, B2: { v: 'reel' }, C2: { v: 'DMY reel' }, E2: { v: memberId },
+        A3: { v: '02/09/2026' }, B3: { v: 'post' }, C3: { v: 'Slash post' }, E3: { v: memberId },
+      }),
+    });
+    const pub2 = data(await owner.post(`${BASE}/sheets/${sheet.id}/publish`));
+    expect(pub2.postsCreated).toBe(0);
+    expect(pub2.updated).toBe(2);
+
+    const sep2 = data(await owner.get(`${BASE}/clients/${clientId}/posts?month=2026-09`));
+    const moved = sep2.filter((p: any) => p.caption === 'DMY reel');
+    expect(moved.length).toBe(1); // still one post, not duplicated
+    expect(new Date(moved[0].scheduledAt).getUTCDate()).toBe(15); // moved to the 15th
+  });
+
   it('skips reserved days, and completing a linked task publishes its post', async () => {
     await owner.post(`${BASE}/clients/${clientId}/reservations`).send({ date: '2026-10-10', label: 'Shoot' });
     const sheet = data(await owner.post(`${BASE}/sheets`).send({ title: 'Cal2' }));
