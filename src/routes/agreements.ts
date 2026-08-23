@@ -14,11 +14,15 @@ import { newId, newOpaqueToken } from '../lib/ids.js';
 import { notFound } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireModuleRW } from '../middleware/permissions.js';
-import { getAuth } from '../middleware/tenant.js';
+import { getAuth, requireClientAccess } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
 import { notifyMany, agencyOwners } from '../services/notifications.js';
 import { sendEmail } from '../services/email.js';
 import { getFrontendOrigin } from '../lib/frontend-url.js';
+import {
+  mintClientPortalLogin,
+  sendClientPortalLoginEmail,
+} from '../lib/client-portal-login.js';
 import { generateAiAgreementDraft, enhanceTextWithAi } from '../services/ai.js';
 
 export const agreementsRouter = Router();
@@ -352,26 +356,51 @@ authRouter.post('/:id/send', async (req, res) => {
 
   const [agency] = await db.select().from(agencies).where(eq(agencies.id, ctx.agencyId)).limit(1);
   const signUrl = `${getFrontendOrigin(req)}/agreements/sign/${a.token}`;
+  const agencyName = agency?.name ?? 'Creative Monk';
 
-  await sendEmail({
-    to: body.recipientEmail,
-    subject: `Action Required: Please sign ${a.title} with ${agency?.name ?? 'Creative Monk'}`,
-    text: `Hello, Your agreement "${a.title}" is ready for review and digital signature: ${signUrl}`,
-    html: `
-      <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #0c0d0e; color: #f3f4f6; border-radius: 12px;">
-        <h2 style="color: #ff6b00; margin-top: 0;">${agency?.name ?? 'Creative Monk'} Agreement</h2>
-        <p>Hello,</p>
-        <p>Your agreement <strong>${a.title}</strong> is ready for review and digital signature.</p>
-        ${body.message ? `<p style="background: #18191b; padding: 12px; border-radius: 8px; color: #d1d5db;">${body.message}</p>` : ''}
-        <div style="margin: 30px 0; text-align: center;">
-          <a href="${signUrl}" style="background: #ff6b00; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-weight: bold; display: inline-block;">
-            Review & Sign Agreement &rarr;
-          </a>
+  // Document-mode agreements (an uploaded file, no in-app terms) have
+  // nothing for the bare token link to render — mail the client their
+  // portal sign-in instead, so they can actually open the file.
+  const viaPortalLogin = !!(a.fileUrl && a.clientId);
+  if (viaPortalLogin) {
+    const client = await requireClientAccess(ctx, a.clientId);
+    const login = await mintClientPortalLogin({
+      agencyId: ctx.agencyId,
+      clientId: client.id,
+      clientName: client.name,
+      clientContactEmail: client.contactEmail,
+      email: body.recipientEmail,
+    });
+    await sendClientPortalLoginEmail({
+      req,
+      agencyName,
+      clientName: client.name,
+      to: body.recipientEmail,
+      email: login.email,
+      password: login.password,
+      note: `${body.message ? `${body.message} ` : ''}A new agreement — "${a.title}" — is ready to review and sign in your portal.`.trim(),
+    });
+  } else {
+    await sendEmail({
+      to: body.recipientEmail,
+      subject: `Action Required: Please sign ${a.title} with ${agencyName}`,
+      text: `Hello, Your agreement "${a.title}" is ready for review and digital signature: ${signUrl}`,
+      html: `
+        <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #0c0d0e; color: #f3f4f6; border-radius: 12px;">
+          <h2 style="color: #ff6b00; margin-top: 0;">${agencyName} Agreement</h2>
+          <p>Hello,</p>
+          <p>Your agreement <strong>${a.title}</strong> is ready for review and digital signature.</p>
+          ${body.message ? `<p style="background: #18191b; padding: 12px; border-radius: 8px; color: #d1d5db;">${body.message}</p>` : ''}
+          <div style="margin: 30px 0; text-align: center;">
+            <a href="${signUrl}" style="background: #ff6b00; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-weight: bold; display: inline-block;">
+              Review & Sign Agreement &rarr;
+            </a>
+          </div>
+          <p style="font-size: 12px; color: #6b7280;">If the button above does not work, copy and paste this URL into your browser:<br/>${signUrl}</p>
         </div>
-        <p style="font-size: 12px; color: #6b7280;">If the button above does not work, copy and paste this URL into your browser:<br/>${signUrl}</p>
-      </div>
-    `,
-  });
+      `,
+    });
+  }
 
   await db
     .update(agreements)
@@ -389,7 +418,7 @@ authRouter.post('/:id/send', async (req, res) => {
     action: 'agreement.send',
     entityType: 'agreement',
     entityId: a.id,
-    metadata: { recipientEmail: body.recipientEmail },
+    metadata: { recipientEmail: body.recipientEmail, viaPortalLogin },
     ip: req.ip,
   });
 

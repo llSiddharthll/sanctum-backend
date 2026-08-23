@@ -16,11 +16,15 @@ import { newId, newOpaqueToken } from '../lib/ids.js';
 import { notFound, badRequest } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireModuleRW } from '../middleware/permissions.js';
-import { getAuth } from '../middleware/tenant.js';
+import { getAuth, requireClientAccess } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
 import { notifyMany, agencyOwners } from '../services/notifications.js';
 import { sendEmail, basicHtml } from '../services/email.js';
 import { getFrontendOrigin } from '../lib/frontend-url.js';
+import {
+  mintClientPortalLogin,
+  sendClientPortalLoginEmail,
+} from '../lib/client-portal-login.js';
 import {
   generateAiProposalDraft,
   enhanceTextWithAi,
@@ -423,20 +427,44 @@ authRouter.post('/:id/send', async (req, res) => {
 
   const [agency] = await db.select().from(agencies).where(eq(agencies.id, ctx.agencyId)).limit(1);
   const publicUrl = `${getFrontendOrigin(req)}/proposals/view/${p.token}`;
-
   const agencyName = agency?.name ?? 'Creative Monk';
-  await sendEmail({
-    to: body.recipientEmail,
-    subject: `Your proposal from ${agencyName}: ${p.title}`,
-    text: `We're pleased to share the proposal "${p.title}" with you.${body.message ? `\n\n${body.message}` : ''}\n\nReview it online (no login needed): ${publicUrl}`,
-    html: basicHtml({
-      heading: p.title,
-      bodyHtml: `${agencyName} has prepared a proposal for you — <strong>${p.title}</strong>. Open it below to read the plan, scope, investment options and projected return, and accept it right from the page.${body.message ? `<br><br><em>${body.message}</em>` : ''}`,
-      buttonLabel: 'Review the proposal',
-      buttonUrl: publicUrl,
-      preheader: `${agencyName} shared a proposal with you — open it in one tap.`,
-    }),
-  });
+
+  // Document-mode proposals (an uploaded file, no in-app content) have
+  // nothing for the bare token link to render — mail the client their
+  // portal sign-in instead, so they can actually open the file.
+  const viaPortalLogin = !!(p.fileUrl && p.clientId);
+  if (viaPortalLogin) {
+    const client = await requireClientAccess(ctx, p.clientId as string);
+    const login = await mintClientPortalLogin({
+      agencyId: ctx.agencyId,
+      clientId: client.id,
+      clientName: client.name,
+      clientContactEmail: client.contactEmail,
+      email: body.recipientEmail,
+    });
+    await sendClientPortalLoginEmail({
+      req,
+      agencyName,
+      clientName: client.name,
+      to: body.recipientEmail,
+      email: login.email,
+      password: login.password,
+      note: `${body.message ? `${body.message} ` : ''}A new proposal — "${p.title}" — is ready to view in your portal.`.trim(),
+    });
+  } else {
+    await sendEmail({
+      to: body.recipientEmail,
+      subject: `Your proposal from ${agencyName}: ${p.title}`,
+      text: `We're pleased to share the proposal "${p.title}" with you.${body.message ? `\n\n${body.message}` : ''}\n\nReview it online (no login needed): ${publicUrl}`,
+      html: basicHtml({
+        heading: p.title,
+        bodyHtml: `${agencyName} has prepared a proposal for you — <strong>${p.title}</strong>. Open it below to read the plan, scope, investment options and projected return, and accept it right from the page.${body.message ? `<br><br><em>${body.message}</em>` : ''}`,
+        buttonLabel: 'Review the proposal',
+        buttonUrl: publicUrl,
+        preheader: `${agencyName} shared a proposal with you — open it in one tap.`,
+      }),
+    });
+  }
 
   await db
     .update(proposals)
@@ -454,7 +482,7 @@ authRouter.post('/:id/send', async (req, res) => {
     action: 'proposal.send',
     entityType: 'proposal',
     entityId: p.id,
-    metadata: { recipientEmail: body.recipientEmail },
+    metadata: { recipientEmail: body.recipientEmail, viaPortalLogin },
     ip: req.ip,
   });
 

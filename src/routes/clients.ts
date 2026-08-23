@@ -1,7 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { randomBytes } from 'node:crypto';
-import { and, asc, eq, inArray, count, desc, sql } from 'drizzle-orm';
+import { and, eq, inArray, count, desc, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   agencies,
@@ -36,9 +35,13 @@ import {
   assignedClientIds,
 } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
-import { sendPortalWelcome, sendEmail, basicHtml } from '../services/email.js';
+import { sendPortalWelcome } from '../services/email.js';
 import { getFrontendOrigin } from '../lib/frontend-url.js';
-import { hashPassword } from '../lib/password.js';
+import {
+  findClientLogin,
+  mintClientPortalLogin,
+  sendClientPortalLoginEmail,
+} from '../lib/client-portal-login.js';
 
 export const clientsRouter = Router();
 clientsRouter.use(requireAuth);
@@ -488,37 +491,6 @@ clientsRouter.post(
 //  once on create/reset, so the caller must copy/share it immediately.
 // ============================================================
 
-// Easy-to-type password: 8 lowercase-unambiguous chars (no i/l/o/0/1),
-// grouped 4-4 (e.g. "kmrp-2t9x"). All lowercase + digits so there's no
-// case-switching on a phone keyboard.
-const PW_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789';
-function generatePortalPassword(): string {
-  const bytes = randomBytes(8);
-  let out = '';
-  for (let i = 0; i < 8; i += 1) {
-    out += PW_ALPHABET[bytes[i] % PW_ALPHABET.length];
-    if (i === 3) out += '-';
-  }
-  return out;
-}
-
-/** The brand's canonical portal-login account (role:'client'), if any. */
-async function findClientLogin(agencyId: string, clientId: string) {
-  const [u] = await db
-    .select()
-    .from(users)
-    .where(
-      and(
-        eq(users.agencyId, agencyId),
-        eq(users.clientId, clientId),
-        eq(users.role, 'client'),
-      ),
-    )
-    .orderBy(asc(users.createdAt))
-    .limit(1);
-  return u ?? null;
-}
-
 // GET /clients/:clientId/portal-login — status of the brand's login account.
 // Never returns a password (it isn't stored); just whether one exists + its
 // email + last sign-in, so the UI can show "create" vs "reset".
@@ -554,64 +526,14 @@ clientsRouter.post(
     const client = await requireClientAccess(ctx, param(req, 'clientId'));
     const body = portalLoginSchema.parse(req.body);
 
-    const existing = await findClientLogin(ctx.agencyId, client.id);
-    const email = (
-      body.email?.trim() ||
-      existing?.email ||
-      client.contactEmail ||
-      ''
-    )
-      .toLowerCase()
-      .trim();
-    if (!email) {
-      throw badRequest(
-        'No email for this client — add a contact email or enter one to use as the login.',
-      );
-    }
-
-    // The login email must be unique within the agency and must not collide
-    // with a staff account or a DIFFERENT client's login.
-    const [clash] = await db
-      .select({ id: users.id, role: users.role, clientId: users.clientId })
-      .from(users)
-      .where(
-        and(
-          eq(users.agencyId, ctx.agencyId),
-          sql`lower(${users.email}) = ${email}`,
-        ),
-      )
-      .limit(1);
-    if (clash && clash.id !== existing?.id) {
-      throw conflict(
-        'That email is already used by another account in your workspace. Use a different email.',
-      );
-    }
-
-    const password = body.password?.trim() || generatePortalPassword();
-    const passwordHash = await hashPassword(password);
-    let isNew: boolean;
-
-    if (existing) {
-      await db
-        .update(users)
-        .set({ email, passwordHash, status: 'active' })
-        .where(eq(users.id, existing.id));
-      isNew = false;
-    } else {
-      await db.insert(users).values({
-        id: newId('usr'),
-        agencyId: ctx.agencyId,
-        clientId: client.id,
-        email,
-        passwordHash,
-        fullName: `${client.name} (portal)`,
-        role: 'client',
-        status: 'active',
-        // Clients have no module permissions; scope = all brand projects.
-        permissionsJson: null,
-      });
-      isNew = true;
-    }
+    const { email, password, created: isNew } = await mintClientPortalLogin({
+      agencyId: ctx.agencyId,
+      clientId: client.id,
+      clientName: client.name,
+      clientContactEmail: client.contactEmail,
+      email: body.email,
+      password: body.password,
+    });
 
     await audit({
       agencyId: ctx.agencyId,
@@ -667,28 +589,16 @@ clientsRouter.post(
       .where(eq(agencies.id, ctx.agencyId))
       .limit(1);
     const agencyName = agency?.name ?? 'Your agency';
-    const loginUrl = `${getFrontendOrigin(req)}/login`;
     const note = body.note?.trim();
-    const intro = note
-      ? note
-      : `${agencyName} has set up your private client portal — follow your projects, view the content calendar, review proposals & agreements, see invoices, and download shared files, all in one place.`;
-    const creds = body.password
-      ? `Sign in with these details:<br><br><strong>Email:</strong> ${body.email}<br><strong>Password:</strong> ${body.password}<br><br>Keep these private — you can change your password after signing in.`
-      : `Sign in with your email (<strong>${body.email}</strong>) and your existing password. Forgot it? Ask ${agencyName} to reset it for you.`;
 
-    await sendEmail({
+    await sendClientPortalLoginEmail({
+      req,
+      agencyName,
+      clientName: client.name,
       to,
-      subject: note
-        ? `${agencyName}: a new document is ready in your portal`
-        : `Your ${agencyName} client portal login`,
-      html: basicHtml({
-        heading: note ? 'A new document is ready' : 'Your secure portal login',
-        bodyHtml: `Hi ${client.name}, ${intro}<br><br>${creds}`,
-        buttonLabel: 'Sign in to your portal',
-        buttonUrl: loginUrl,
-        preheader: note ?? `Your ${agencyName} portal login details inside.`,
-      }),
-      text: `${note ? note + '\n\n' : ''}${agencyName} client portal.\nSign in: ${loginUrl}\nEmail: ${body.email}${body.password ? '\nPassword: ' + body.password : '\nUse your existing password.'}\n\nKeep these private.`,
+      email: body.email,
+      password: body.password,
+      note,
     });
 
     await audit({

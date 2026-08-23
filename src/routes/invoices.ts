@@ -9,14 +9,19 @@ import {
   clients,
   projects,
   users,
+  agencies,
 } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { notFound } from '../lib/errors.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { requireModuleRW } from '../middleware/permissions.js';
-import { getAuth } from '../middleware/tenant.js';
+import { getAuth, requireClientAccess } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
+import {
+  mintClientPortalLogin,
+  sendClientPortalLoginEmail,
+} from '../lib/client-portal-login.js';
 
 export const invoicesRouter = Router();
 invoicesRouter.use(requireAuth);
@@ -412,4 +417,69 @@ invoicesRouter.patch('/:id/status', async (req, res) => {
     .where(and(eq(invoices.id, invoiceId), eq(invoices.agencyId, ctx.agencyId)));
 
   ok(res, { status: body.status });
+});
+
+// ---- SEND INVOICE ----
+// Invoices have no public no-login view page — the client's only way to see
+// one online is the logged-in client portal — so sending an invoice always
+// mails the client their portal sign-in (link + email + password), the same
+// credential email used for document-mode proposals/agreements.
+invoicesRouter.post('/:id/send', async (req, res) => {
+  const ctx = getAuth(req);
+  const invoiceId = param(req, 'id');
+  const body = z
+    .object({ recipientEmail: z.string().email(), message: z.string().optional() })
+    .parse(req.body);
+
+  const [inv] = await db
+    .select()
+    .from(invoices)
+    .where(and(eq(invoices.id, invoiceId), eq(invoices.agencyId, ctx.agencyId)))
+    .limit(1);
+  if (!inv) throw notFound('Invoice not found.');
+
+  const client = await requireClientAccess(ctx, inv.clientId);
+  const [agency] = await db.select({ name: agencies.name }).from(agencies).where(eq(agencies.id, ctx.agencyId)).limit(1);
+  const agencyName = agency?.name ?? 'Creative Monk';
+
+  const login = await mintClientPortalLogin({
+    agencyId: ctx.agencyId,
+    clientId: client.id,
+    clientName: client.name,
+    clientContactEmail: client.contactEmail,
+    email: body.recipientEmail,
+  });
+
+  const amountLabel = `₹${(inv.total / 100).toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
+  const invoiceLabel = inv.invoiceNumber ? `Invoice ${inv.invoiceNumber}` : 'A new invoice';
+  await sendClientPortalLoginEmail({
+    req,
+    agencyName,
+    clientName: client.name,
+    to: body.recipientEmail,
+    email: login.email,
+    password: login.password,
+    note: `${body.message ? `${body.message} ` : ''}${invoiceLabel} for ${amountLabel} is ready to view in your portal.`.trim(),
+  });
+
+  await db
+    .update(invoices)
+    .set({
+      status: inv.status === 'draft' ? 'sent' : inv.status,
+      updatedAt: new Date(),
+    })
+    .where(eq(invoices.id, inv.id));
+
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'invoice.send',
+    entityType: 'invoice',
+    entityId: inv.id,
+    metadata: { recipientEmail: body.recipientEmail },
+    ip: req.ip,
+  });
+
+  ok(res, { sent: true });
 });
