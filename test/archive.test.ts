@@ -63,6 +63,15 @@ describe('month-end archive sweep', () => {
     expect(arch.archivedMonth).toBe('2026-07');
     expect(arch.archivedAt).toBeTruthy();
 
+    // The mobile app reads the caller's own archive via /me/tasks?archived=true.
+    const mine = data(await owner.get(`${BASE}/me/tasks?archived=true`));
+    const myArch = mine.find((t: any) => t.id === past.id);
+    expect(myArch).toBeTruthy();
+    expect(myArch.archivedMonth).toBe('2026-07');
+    // And the active /me/tasks excludes it.
+    const myActive = data(await owner.get(`${BASE}/me/tasks`));
+    expect(myActive.map((t: any) => t.id)).not.toContain(past.id);
+
     // Restore it → back on the active board, out of the archive.
     const restore = await owner.post(`${BASE}/projects/tasks/${past.id}/unarchive`).send({});
     expect(restore.status).toBe(200);

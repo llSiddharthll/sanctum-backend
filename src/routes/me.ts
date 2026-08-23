@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, asc, eq, gte, inArray, isNull, ne, or, sql, sum } from 'drizzle-orm';
+import { and, asc, eq, gte, inArray, isNotNull, isNull, ne, or, sql, sum } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   clients,
@@ -37,6 +37,8 @@ const listTasksQuery = z.object({
     .enum(['true', 'false'])
     .optional()
     .transform((v) => v === 'true'),
+  // "true" → the caller's month-wise archive (incomplete past-month tasks).
+  archived: z.enum(['true', 'false']).optional(),
 });
 
 const myTaskSelection = {
@@ -48,6 +50,7 @@ const myTaskSelection = {
   projectId: projectTasks.projectId,
   projectName: projects.name,
   clientName: clients.name,
+  archivedMonth: projectTasks.archivedMonth,
 };
 
 type MyTaskRow = {
@@ -59,6 +62,7 @@ type MyTaskRow = {
   projectId: string;
   projectName: string;
   clientName: string | null;
+  archivedMonth: string | null;
 };
 
 meRouter.get('/tasks', async (req, res) => {
@@ -79,7 +83,11 @@ meRouter.get('/tasks', async (req, res) => {
 
   const filters = [
     eq(projectTasks.agencyId, ctx.agencyId),
-    isNull(projectTasks.archivedAt), // archived tasks live only in History
+    // Active list excludes archived; ?archived=true returns ONLY the caller's
+    // month-wise archive.
+    q.archived === 'true'
+      ? isNotNull(projectTasks.archivedAt)
+      : isNull(projectTasks.archivedAt),
     or(
       eq(projectTasks.assigneeId, ctx.userId),
       inArray(projectTasks.id, assignedTaskIds),
@@ -88,7 +96,7 @@ meRouter.get('/tasks', async (req, res) => {
 
   if (q.status) {
     filters.push(eq(projectTasks.status, q.status));
-  } else if (!q.includeDone) {
+  } else if (!q.includeDone && q.archived !== 'true') {
     filters.push(ne(projectTasks.status, 'done'));
   }
 
@@ -117,6 +125,7 @@ meRouter.get('/tasks', async (req, res) => {
       projectId: r.projectId,
       projectName: r.projectName,
       clientName: r.clientName,
+      archivedMonth: r.archivedMonth,
     })),
   );
 });
