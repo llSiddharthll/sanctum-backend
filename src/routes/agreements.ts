@@ -11,7 +11,7 @@ import {
 } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
 import { newId, newOpaqueToken } from '../lib/ids.js';
-import { notFound } from '../lib/errors.js';
+import { notFound, badRequest } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth, requireClientAccess } from '../middleware/tenant.js';
@@ -517,6 +517,33 @@ authRouter.put('/:id', async (req, res) => {
 
   const [updated] = await db.select().from(agreements).where(eq(agreements.id, a.id));
   ok(res, serializeAgreement(updated!, ctx.role === 'owner'));
+});
+
+// DELETE /agreements/:id — remove a not-yet-executed agreement. Signed/active
+// contracts are legally binding and cannot be deleted (delete needs manage).
+authRouter.delete('/:id', async (req, res) => {
+  const ctx = getAuth(req);
+  const agreementId = param(req, 'id');
+  const [a] = await db
+    .select()
+    .from(agreements)
+    .where(and(eq(agreements.id, agreementId), eq(agreements.agencyId, ctx.agencyId)))
+    .limit(1);
+  if (!a) throw notFound('Agreement not found.');
+  if (a.status === 'signed' || a.status === 'active') {
+    throw badRequest('A signed or active agreement cannot be deleted.');
+  }
+  await db.delete(agreements).where(eq(agreements.id, a.id));
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'agreement.delete',
+    entityType: 'agreement',
+    entityId: a.id,
+    ip: req.ip,
+  });
+  ok(res, { deleted: true, id: a.id });
 });
 
 agreementsRouter.use('/', authRouter);
