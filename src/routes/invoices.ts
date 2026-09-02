@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, desc, eq, inArray, sum } from 'drizzle-orm';
+import { and, desc, eq, inArray, sql, sum } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   invoices,
@@ -13,7 +13,7 @@ import {
 } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
-import { notFound } from '../lib/errors.js';
+import { notFound, badRequest } from '../lib/errors.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth, requireClientAccess } from '../middleware/tenant.js';
@@ -163,19 +163,49 @@ invoicesRouter.get('/', async (req, res) => {
   const ctx = getAuth(req);
   const clientId = req.query.clientId as string | undefined;
   const projectId = req.query.projectId as string | undefined;
+  const status = req.query.status as string | undefined;
+  const search = (req.query.search as string | undefined)?.trim();
 
   const filters = [eq(invoices.agencyId, ctx.agencyId)];
   if (clientId) filters.push(eq(invoices.clientId, clientId));
   if (projectId) filters.push(eq(invoices.projectId, projectId));
+  if (status && status !== 'all') {
+    filters.push(eq(invoices.status, status as typeof invoices.$inferSelect.status));
+  }
+  if (search) {
+    const term = `%${search.toLowerCase()}%`;
+    filters.push(
+      sql`(lower(${invoices.invoiceNumber}) like ${term} or lower(${clients.name}) like ${term})`,
+    );
+  }
 
-  const rows = await db
+  // Pagination is OPT-IN: only when an explicit `limit` is given, so existing
+  // clients (the shipped mobile app) keep receiving the full list.
+  const rawLimit = req.query.limit ? Number(req.query.limit) : null;
+  const limit =
+    rawLimit && Number.isFinite(rawLimit)
+      ? Math.min(Math.max(1, Math.trunc(rawLimit)), 200)
+      : null;
+  const offset = Math.max(0, Math.trunc(Number(req.query.offset) || 0));
+
+  const baseQuery = db
     .select(invoiceSelection)
     .from(invoices)
     .leftJoin(clients, eq(clients.id, invoices.clientId))
     .leftJoin(projects, eq(projects.id, invoices.projectId))
     .leftJoin(users, eq(users.id, invoices.createdBy))
     .where(and(...filters))
-    .orderBy(desc(invoices.createdAt));
+    .orderBy(desc(invoices.issueDate), desc(invoices.createdAt));
+
+  const rows = limit ? await baseQuery.limit(limit).offset(offset) : await baseQuery;
+
+  // Total matching rows, so the UI can render page controls.
+  const [countRow] = await db
+    .select({ n: sql<number>`count(*)` })
+    .from(invoices)
+    .leftJoin(clients, eq(clients.id, invoices.clientId))
+    .where(and(...filters));
+  const total = Number(countRow?.n ?? 0);
 
   const invoiceIds = rows.map((r) => r.id);
   const paymentSums = new Map<string, number>();
@@ -202,7 +232,70 @@ invoicesRouter.get('/', async (req, res) => {
         paidAmount: paymentSums.get(r.id) ?? 0,
       }),
     ),
+    200,
+    { total, limit, offset },
   );
+});
+
+// ---- SUMMARY (KPIs over ALL invoices, not just the current page) ----
+// Must be registered before '/:id' or Express matches it as an invoice id.
+invoicesRouter.get('/summary', async (req, res) => {
+  const ctx = getAuth(req);
+
+  const rows = await db
+    .select({
+      id: invoices.id,
+      total: invoices.total,
+      status: invoices.status,
+      dueDate: invoices.dueDate,
+    })
+    .from(invoices)
+    .where(eq(invoices.agencyId, ctx.agencyId));
+
+  const paidByInvoice = new Map<string, number>();
+  const payRows = await db
+    .select({
+      invoiceId: invoicePayments.invoiceId,
+      totalPaid: sum(invoicePayments.amount),
+    })
+    .from(invoicePayments)
+    .where(eq(invoicePayments.agencyId, ctx.agencyId))
+    .groupBy(invoicePayments.invoiceId);
+  for (const p of payRows) paidByInvoice.set(p.invoiceId, Number(p.totalPaid ?? 0));
+
+  const now = Date.now();
+  let totalInvoiced = 0;
+  let collected = 0;
+  let outstanding = 0;
+  let overdueAmount = 0;
+  let overdueCount = 0;
+  let issuedCount = 0;
+
+  for (const r of rows) {
+    const paid = paidByInvoice.get(r.id) ?? 0;
+    // A cancelled invoice is not a receivable — it must not inflate
+    // outstanding, overdue or total invoiced.
+    if (r.status === 'cancelled') continue;
+    issuedCount += 1;
+    totalInvoiced += r.total;
+    collected += Math.min(paid, r.total);
+    const balance = Math.max(0, r.total - paid);
+    outstanding += balance;
+    if (balance > 0 && r.dueDate && new Date(r.dueDate).getTime() < now) {
+      overdueAmount += balance;
+      overdueCount += 1;
+    }
+  }
+
+  ok(res, {
+    totalInvoiced, // paise
+    collected,
+    outstanding,
+    overdueAmount,
+    overdueCount,
+    issuedCount,
+    cancelledCount: rows.length - issuedCount,
+  });
 });
 
 // ---- CREATE INVOICE ----
@@ -412,6 +505,125 @@ invoicesRouter.post('/:id/payments', async (req, res) => {
   });
 
   ok(res, { paymentId: payId, status: newStatus, totalPaid });
+});
+
+// ---- EDIT INVOICE ----
+// Full field edit. When `items` is supplied the line items are replaced and all
+// money is recomputed server-side. Any edit to an invoice linked to Refrens is
+// pushed back up, which is what makes editing genuinely two-way.
+const updateInvoiceSchema = z.object({
+  clientId: z.string().min(1).optional(),
+  projectId: z.string().nullable().optional(),
+  issueDate: z.coerce.date().optional(),
+  dueDate: z.coerce.date().nullable().optional(),
+  isInterstate: z.boolean().optional(),
+  currency: z.string().trim().max(8).optional(),
+  notes: z.string().trim().max(2000).nullable().optional(),
+  terms: z.string().trim().max(2000).nullable().optional(),
+  bankDetails: z.string().trim().max(1000).nullable().optional(),
+  items: z.array(itemSchema).min(1).optional(),
+});
+
+invoicesRouter.patch('/:id', async (req, res) => {
+  const ctx = getAuth(req);
+  const invoiceId = param(req, 'id');
+  const body = updateInvoiceSchema.parse(req.body);
+
+  const [existing] = await db
+    .select()
+    .from(invoices)
+    .where(and(eq(invoices.id, invoiceId), eq(invoices.agencyId, ctx.agencyId)))
+    .limit(1);
+  if (!existing) throw notFound('Invoice not found.');
+  if (existing.status === 'cancelled') {
+    throw badRequest('A cancelled invoice cannot be edited.');
+  }
+
+  const patch: Partial<typeof invoices.$inferInsert> = { updatedAt: new Date() };
+  if (body.clientId !== undefined) patch.clientId = body.clientId;
+  if (body.projectId !== undefined) patch.projectId = body.projectId;
+  if (body.issueDate !== undefined) patch.issueDate = body.issueDate;
+  if (body.dueDate !== undefined) patch.dueDate = body.dueDate;
+  if (body.currency !== undefined) patch.currency = body.currency;
+  if (body.notes !== undefined) patch.notes = body.notes;
+  if (body.terms !== undefined) patch.terms = body.terms;
+  if (body.bankDetails !== undefined) patch.bankDetails = body.bankDetails;
+
+  const isInterstate = body.isInterstate ?? existing.isInterstate;
+  if (body.isInterstate !== undefined) patch.isInterstate = body.isInterstate;
+
+  // Recompute money whenever the lines or the tax treatment change.
+  if (body.items || body.isInterstate !== undefined) {
+    const items =
+      body.items ??
+      (
+        await db
+          .select()
+          .from(invoiceItems)
+          .where(eq(invoiceItems.invoiceId, existing.id))
+      ).map((it) => ({
+        description: it.description,
+        quantity: it.quantity,
+        unit: it.unit,
+        rate: it.rate,
+        gstRate: it.gstRate,
+      }));
+
+    let subtotal = 0;
+    let taxTotal = 0;
+    const prepared = items.map((it, idx) => {
+      const amount = Math.round(it.quantity * it.rate);
+      subtotal += amount;
+      taxTotal += Math.round((amount * it.gstRate) / 100);
+      return {
+        id: newId('itm'),
+        agencyId: ctx.agencyId,
+        invoiceId: existing.id,
+        description: it.description,
+        quantity: it.quantity,
+        unit: it.unit,
+        rate: it.rate,
+        gstRate: it.gstRate,
+        amount,
+        position: idx,
+      };
+    });
+
+    patch.subtotal = subtotal;
+    patch.taxTotal = taxTotal;
+    patch.cgst = isInterstate ? 0 : Math.round(taxTotal / 2);
+    patch.sgst = isInterstate ? 0 : taxTotal - Math.round(taxTotal / 2);
+    patch.igst = isInterstate ? taxTotal : 0;
+    patch.total = subtotal + taxTotal;
+
+    await db.delete(invoiceItems).where(eq(invoiceItems.invoiceId, existing.id));
+    for (const itm of prepared) await db.insert(invoiceItems).values(itm);
+  }
+
+  await db.update(invoices).set(patch).where(eq(invoices.id, existing.id));
+
+  // Two-way: mirror the edit onto the linked Refrens invoice.
+  if (existing.refrensId && refrensAutoPushEnabled()) {
+    await pushInvoice(ctx.agencyId, existing.id).catch(() => undefined);
+  }
+
+  await audit({
+    agencyId: ctx.agencyId,
+    actorType: ctx.role,
+    actorId: ctx.userId,
+    action: 'invoice.update',
+    entityType: 'invoice',
+    entityId: existing.id,
+    ip: req.ip,
+  });
+
+  const [row] = await db.select().from(invoices).where(eq(invoices.id, existing.id));
+  const items = await db
+    .select()
+    .from(invoiceItems)
+    .where(eq(invoiceItems.invoiceId, existing.id))
+    .orderBy(invoiceItems.position);
+  ok(res, serializeInvoice(row!, { items }));
 });
 
 // ---- UPDATE STATUS ----

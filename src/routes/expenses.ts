@@ -156,6 +156,10 @@ expensesRouter.get('/', async (req, res) => {
 // ============================================================
 const EXPENSE_TYPES = ['one_time', 'monthly_recurring'] as const;
 
+// z.coerce.date() maps null -> new Date(null) = the epoch, which silently moves
+// an expense to 1970 and out of every current report. Require a real value.
+const strictDate = z.union([z.string().min(1), z.number(), z.date()]).pipe(z.coerce.date());
+
 const createSchema = z.object({
   category: z.enum(EXPENSE_CATEGORIES).optional(),
   expenseType: z.enum(EXPENSE_TYPES).optional(),
@@ -163,7 +167,7 @@ const createSchema = z.object({
   description: z.string().max(2000).optional(),
   projectId: z.string().min(1).optional(),
   clientId: z.string().min(1).optional(),
-  expenseDate: z.coerce.date().optional(),
+  expenseDate: strictDate.optional(),
   receiptUrl: z.string().url().max(1000).optional(),
   gstDeductible: z.boolean().optional(),
   gstAmount: z.number().int().min(0).optional(), // paise
@@ -228,7 +232,9 @@ const updateSchema = z.object({
   description: z.string().max(2000).nullable().optional(),
   projectId: z.string().min(1).nullable().optional(),
   clientId: z.string().min(1).nullable().optional(),
-  expenseDate: z.coerce.date().nullable().optional(),
+  // NOT nullable: a null expenseDate drops the row out of every date-ranged
+  // finance report while the expense still exists.
+  expenseDate: strictDate.optional(),
   receiptUrl: z.string().url().max(1000).nullable().optional(),
   gstDeductible: z.boolean().optional(),
   gstAmount: z.number().int().min(0).nullable().optional(),
