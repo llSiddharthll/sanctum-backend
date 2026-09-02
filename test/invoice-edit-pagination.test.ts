@@ -126,4 +126,31 @@ describe('invoices: pagination, summary, edit', () => {
     const res = await other.patch(`${BASE}/invoices/${made[0]}`).send({ notes: 'hax' });
     expect(res.status).toBe(404);
   });
+  it('filters by issue-date range, inclusive of the final day', async () => {
+    const inv = data(
+      await owner.post(`${BASE}/invoices`).send({
+        clientId,
+        issueDate: '2026-06-30T18:30:00.000Z',
+        items: [{ description: 'June work', quantity: 1, rate: 100_000, gstRate: 18 }],
+      }),
+    );
+
+    // A `to` of the 30th must include something issued later that same day.
+    const inRange = await owner.get(`${BASE}/invoices?from=2026-06-01&to=2026-06-30`);
+    expect(inRange.body.data.some((i: any) => i.id === inv.id)).toBe(true);
+
+    const outOfRange = await owner.get(`${BASE}/invoices?from=2026-07-01&to=2026-07-31`);
+    expect(outOfRange.body.data.some((i: any) => i.id === inv.id)).toBe(false);
+  });
+
+  it('summary honours the same date range as the table', async () => {
+    const all = data(await owner.get(`${BASE}/invoices/summary`));
+    const narrow = data(
+      await owner.get(`${BASE}/invoices/summary?from=2030-01-01&to=2030-12-31`),
+    );
+    // A window with no invoices in it must report zeroes, not agency totals.
+    expect(narrow.totalInvoiced).toBe(0);
+    expect(narrow.issuedCount).toBe(0);
+    expect(all.totalInvoiced).toBeGreaterThan(0);
+  });
 });

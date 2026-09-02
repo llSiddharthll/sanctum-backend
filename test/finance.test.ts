@@ -122,15 +122,16 @@ describe('finance workflow', () => {
     expect((await agent.get(`${BASE}/finance/overview`)).status).toBe(403);
   });
 
-  it('lets a finance:view member read but not create/patch (403 on writes)', async () => {
+  it('denies finance to a non-owner even with finance:view (owner-only module)', async () => {
     const { agent } = await createMemberSession(owner, {
       permissions: { finance: 'view' },
     });
-    // Reads allowed.
-    expect((await agent.get(`${BASE}/expenses`)).status).toBe(200);
-    expect((await agent.get(`${BASE}/finance/overview`)).status).toBe(200);
+    // Finance is owner-only by policy: managers and members must not see the
+    // agency's money at all, so even an explicit finance:view grant is refused.
+    expect((await agent.get(`${BASE}/expenses`)).status).toBe(403);
+    expect((await agent.get(`${BASE}/finance/overview`)).status).toBe(403);
+    expect((await agent.get(`${BASE}/invoices`)).status).toBe(403);
 
-    // Writes forbidden (needs `manage`).
     const createExpense = await agent
       .post(`${BASE}/expenses`)
       .send({ amount: 1000, category: 'office' });

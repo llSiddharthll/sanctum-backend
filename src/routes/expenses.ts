@@ -129,7 +129,13 @@ expensesRouter.get('/', async (req, res) => {
   if (q.projectId) filters.push(eq(expenses.projectId, q.projectId));
   if (q.clientId) filters.push(eq(expenses.clientId, q.clientId));
   if (q.from) filters.push(gte(expenses.expenseDate, q.from));
-  if (q.to) filters.push(lte(expenses.expenseDate, q.to));
+  if (q.to) {
+    // Inclusive: a `to` of 2026-06-30 must cover that whole day, not stop at
+    // midnight (which silently dropped everything logged later that day).
+    const end = new Date(q.to);
+    end.setUTCHours(23, 59, 59, 999);
+    filters.push(lte(expenses.expenseDate, end));
+  }
   if (q.search && q.search.trim()) {
     const term = `%${q.search.trim()}%`;
     const cond = or(

@@ -88,8 +88,9 @@ describe('RBAC — predefined role presets', () => {
       permissions: Record<string, string>;
     }>;
     expect(presets.map((p) => p.key).sort()).toEqual(['employee', 'manager']);
+    // Managers are explicitly denied finance.
     expect(presets.find((p) => p.key === 'manager')!.permissions.finance).toBe(
-      'view',
+      'none',
     );
     expect(presets.find((p) => p.key === 'employee')!.permissions.projects).toBe(
       'edit',
@@ -110,7 +111,10 @@ describe('RBAC — predefined role presets', () => {
       permissions: manager.permissions,
     });
     expect(created.status).toBe(201);
-    expect(data(created).permissions.finance).toBe('view');
+    // Managers do not see the agency's money — the preset denies finance
+    // (and the Business module) outright.
+    expect(data(created).permissions.finance).toBe('none');
+    expect(data(created).permissions.business).toBe('none');
     const customRoleId = data(created).id as string;
 
     // Assign to a member.
@@ -120,12 +124,12 @@ describe('RBAC — predefined role presets', () => {
       .send({ customRoleId });
     expect(assign.status).toBe(200);
 
-    // Manager can VIEW finance…
-    expect((await m.agent.get(`${BASE}/finance/overview`)).status).toBe(200);
-    // …but cannot WRITE finance (view < edit) — the module gate blocks the POST.
+    // Finance is owner-only by policy, so a Manager cannot read it at all —
+    // not even with the preset's finance grant.
+    expect((await m.agent.get(`${BASE}/finance/overview`)).status).toBe(403);
     const exp = await m.agent
       .post(`${BASE}/expenses`)
-      .send({ amountCents: 1000, category: 'misc', incurredOn: '2026-07-01' });
+      .send({ amount: 1000, category: 'office' });
     expect(exp.status).toBe(403);
   });
 });

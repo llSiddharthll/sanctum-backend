@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, desc, eq, inArray, sql, sum } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, lte, sql, sum } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   invoices,
@@ -158,6 +158,30 @@ function serializeInvoice(
   };
 }
 
+/**
+ * Date-range bounds for `?from=`/`?to=`.
+ *
+ * A bare `YYYY-MM-DD` is treated as a UTC day so the result never depends on
+ * the server's timezone: `to=2026-06-30` covers through 23:59:59.999Z that day.
+ * (Using local setHours put the bound at 18:29Z under IST and silently dropped
+ * invoices issued later on the final day.)
+ */
+const DATE_ONLY = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+function rangeStart(v: string): Date | null {
+  const m = DATE_ONLY.exec(v);
+  if (m) return new Date(Date.UTC(+m[1]!, +m[2]! - 1, +m[3]!, 0, 0, 0, 0));
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function rangeEnd(v: string): Date | null {
+  const m = DATE_ONLY.exec(v);
+  if (m) return new Date(Date.UTC(+m[1]!, +m[2]! - 1, +m[3]!, 23, 59, 59, 999));
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
 // ---- LIST INVOICES ----
 invoicesRouter.get('/', async (req, res) => {
   const ctx = getAuth(req);
@@ -172,6 +196,10 @@ invoicesRouter.get('/', async (req, res) => {
   if (status && status !== 'all') {
     filters.push(eq(invoices.status, status as typeof invoices.$inferSelect.status));
   }
+  const from = req.query.from ? rangeStart(String(req.query.from)) : null;
+  const to = req.query.to ? rangeEnd(String(req.query.to)) : null;
+  if (from) filters.push(gte(invoices.issueDate, from));
+  if (to) filters.push(lte(invoices.issueDate, to));
   if (search) {
     const term = `%${search.toLowerCase()}%`;
     filters.push(
@@ -242,6 +270,13 @@ invoicesRouter.get('/', async (req, res) => {
 invoicesRouter.get('/summary', async (req, res) => {
   const ctx = getAuth(req);
 
+  // The KPI tiles must describe the same slice the table is showing.
+  const sFilters = [eq(invoices.agencyId, ctx.agencyId)];
+  const sFrom = req.query.from ? rangeStart(String(req.query.from)) : null;
+  const sTo = req.query.to ? rangeEnd(String(req.query.to)) : null;
+  if (sFrom) sFilters.push(gte(invoices.issueDate, sFrom));
+  if (sTo) sFilters.push(lte(invoices.issueDate, sTo));
+
   const rows = await db
     .select({
       id: invoices.id,
@@ -250,7 +285,7 @@ invoicesRouter.get('/summary', async (req, res) => {
       dueDate: invoices.dueDate,
     })
     .from(invoices)
-    .where(eq(invoices.agencyId, ctx.agencyId));
+    .where(and(...sFilters));
 
   const paidByInvoice = new Map<string, number>();
   const payRows = await db
