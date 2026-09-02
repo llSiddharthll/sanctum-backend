@@ -5,6 +5,7 @@ import { emailEmployeeReports } from './reports.js';
 import { sweepStaleTimers } from '../routes/timers.js';
 import { runMediaArchive } from './media-archive.js';
 import { sweepEndedMonths } from './archive.js';
+import { pullInvoices, refrensSyncEnabled, syncAgencyId } from './refrens-sync.js';
 import { env } from '../env.js';
 
 /** Previous calendar month as {from:'YYYY-MM-01', to:'YYYY-MM-<last>'} (UTC). */
@@ -99,5 +100,27 @@ export function startScheduler(): void {
         .catch((e) => console.error('[media-archive] run failed', e));
     });
     console.log('[scheduler] media archive scheduled (0 22 * * 0)');
+  }
+
+  // Every 15 min: pull invoices from Refrens (it has no webhooks, so polling is
+  // the only option). Off unless REFRENS_SYNC_ENABLED and credentials are set.
+  if (refrensSyncEnabled()) {
+    cron.schedule('*/15 * * * *', () => {
+      void (async () => {
+        const agencyId = await syncAgencyId();
+        if (!agencyId) {
+          console.warn('[refrens] skipped: could not resolve a single agency to sync into');
+          return;
+        }
+        const r = await pullInvoices(agencyId);
+        if (r.created || r.updated || r.errors.length) {
+          console.log(
+            `[refrens] pulled ${r.scanned}: +${r.created} new, ${r.updated} updated, ` +
+              `${r.paymentsAdded} payments, ${r.clientsCreated} clients, ${r.errors.length} errors`,
+          );
+        }
+      })().catch((e) => console.error('[refrens] sync failed', e));
+    });
+    console.log('[scheduler] Refrens invoice sync scheduled (*/15 * * * *)');
   }
 }

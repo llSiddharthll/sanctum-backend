@@ -22,6 +22,7 @@ import {
   mintClientPortalLogin,
   sendClientPortalLoginEmail,
 } from '../lib/client-portal-login.js';
+import { pushInvoice, refrensAutoPushEnabled } from '../services/refrens-sync.js';
 
 export const invoicesRouter = Router();
 invoicesRouter.use(requireAuth);
@@ -298,6 +299,14 @@ invoicesRouter.post('/', async (req, res) => {
     ip: req.ip,
   });
 
+  // Mirror the new invoice up to Refrens (the accounting system of record).
+  // Best-effort and awaited only long enough to capture the Refrens number:
+  // a Refrens outage records refrens_sync_error on the row instead of failing
+  // the user's request, and the poller/"Sync now" will retry it later.
+  if (refrensAutoPushEnabled()) {
+    await pushInvoice(ctx.agencyId, invoiceId).catch(() => undefined);
+  }
+
   const [row] = await db.select().from(invoices).where(eq(invoices.id, invoiceId));
   created(res, serializeInvoice(row!, { items: preparedItems as any }));
 });
@@ -411,10 +420,22 @@ invoicesRouter.patch('/:id/status', async (req, res) => {
   const invoiceId = param(req, 'id');
   const body = z.object({ status: z.enum(['draft', 'sent', 'cancelled', 'paid']) }).parse(req.body);
 
+  const [existing] = await db
+    .select({ id: invoices.id, refrensId: invoices.refrensId })
+    .from(invoices)
+    .where(and(eq(invoices.id, invoiceId), eq(invoices.agencyId, ctx.agencyId)))
+    .limit(1);
+  if (!existing) throw notFound('Invoice not found.');
+
   await db
     .update(invoices)
     .set({ status: body.status, updatedAt: new Date() })
     .where(and(eq(invoices.id, invoiceId), eq(invoices.agencyId, ctx.agencyId)));
+
+  // Two-way: mirror the new status onto the linked Refrens invoice.
+  if (existing.refrensId && refrensAutoPushEnabled()) {
+    await pushInvoice(ctx.agencyId, invoiceId).catch(() => undefined);
+  }
 
   ok(res, { status: body.status });
 });

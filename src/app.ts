@@ -42,6 +42,7 @@ import { pushRouter } from './routes/push.js';
 import { proposalsRouter } from './routes/proposals.js';
 import { agreementsRouter } from './routes/agreements.js';
 import { invoicesRouter } from './routes/invoices.js';
+import { refrensRouter } from './routes/refrens.js';
 import { intakeRouter } from './routes/intake.js';
 
 export function createApp() {
@@ -85,6 +86,7 @@ export function createApp() {
   api.use('/proposals', proposalsRouter);
   api.use('/agreements', agreementsRouter);
   api.use('/invoices', invoicesRouter);
+  api.use('/refrens', refrensRouter);
   // Logged-in client-portal (client role only; scoped to their brand + projects).
   api.use('/client', clientPortalRouter);
   api.use('/projects', projectsRouter);

@@ -266,6 +266,9 @@ export const clients = sqliteTable(
     billingState: text('billing_state'),
     billingCity: text('billing_city'),
     billingPincode: text('billing_pincode'),
+    // Refrens client key (billedTo.clientId) — set when a client is discovered
+    // from a synced Refrens invoice, so we never duplicate the brand.
+    refrensClientId: text('refrens_client_id'),
     relationshipHealth: text('relationship_health', {
       enum: ['excellent', 'good', 'at_risk', 'poor'],
     })
@@ -1119,6 +1122,14 @@ export const invoices = sqliteTable(
     bankDetails: text('bank_details'),
     // When this invoice was created from an uploaded document, the file URL.
     fileUrl: text('file_url'),
+    // ---- Refrens two-way sync ----
+    // refrensId: the Refrens `_id` this row mirrors / was pushed to.
+    // externalSource: 'refrens' when the invoice ORIGINATED in Refrens (pulled),
+    // null when it originated in Sanctum (and was pushed up).
+    refrensId: text('refrens_id'),
+    externalSource: text('external_source'),
+    refrensSyncedAt: ts('refrens_synced_at'),
+    refrensSyncError: text('refrens_sync_error'),
     createdBy: text('created_by').references(() => users.id, {
       onDelete: 'set null',
     }),
@@ -1130,6 +1141,8 @@ export const invoices = sqliteTable(
       tbl.agencyId,
       tbl.invoiceNumber,
     ),
+    // One Sanctum row per Refrens invoice — the upsert key for polling.
+    uniqueIndex('ux_invoices_agency_refrens').on(tbl.agencyId, tbl.refrensId),
     index('ix_invoices_agency').on(tbl.agencyId),
     index('ix_invoices_agency_status').on(tbl.agencyId, tbl.status),
     index('ix_invoices_agency_client').on(tbl.agencyId, tbl.clientId),
@@ -1187,6 +1200,8 @@ export const invoicePayments = sqliteTable(
       .default('bank_transfer'),
     reference: text('reference'),
     notes: text('notes'),
+    // Refrens payment `_id`, so re-polling an invoice never duplicates receipts.
+    refrensPaymentId: text('refrens_payment_id'),
     recordedBy: text('recorded_by').references(() => users.id, {
       onDelete: 'set null',
     }),
@@ -1198,6 +1213,10 @@ export const invoicePayments = sqliteTable(
       tbl.invoiceId,
     ),
     index('ix_invoice_payments_agency_paid').on(tbl.agencyId, tbl.paidAt),
+    uniqueIndex('ux_invoice_payments_agency_refrens').on(
+      tbl.agencyId,
+      tbl.refrensPaymentId,
+    ),
   ],
 );
 

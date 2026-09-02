@@ -109,6 +109,25 @@ const envSchema = z.object({
     .optional()
     .transform((v) => v === 'true'),
 
+  // ---- Refrens (billing/invoicing) two-way sync ----
+  // Credentials come from Refrens → Business Settings → Integrations. The
+  // private key is a PKCS8 EC P-256 PEM; in .env keep the newlines escaped as
+  // \n (the client un-escapes them). Sync is inert unless all three are set.
+  REFRENS_URL_KEY: z.string().optional(),
+  REFRENS_APP_ID: z.string().optional(),
+  REFRENS_PRIVATE_KEY: z.string().optional(),
+  // Master switch for the background poller + auto-push. Off by default so a
+  // missing/rotated key can never silently write to live books.
+  REFRENS_SYNC_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  // Push Sanctum-created invoices up to Refrens automatically on create.
+  REFRENS_AUTO_PUSH: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+
   // Email (SMTP). Optional: when absent, the email service logs instead of
   // sending (so dev works without creds). For Gmail use an App Password.
   EMAIL_USER: z.string().optional(),
