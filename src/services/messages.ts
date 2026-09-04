@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, lt, ne, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, inArray, isNotNull, lt, ne, or, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   clients,
@@ -93,6 +93,9 @@ export interface SerializedMessage {
   attachments: MessageAttachment[];
   createdAt: string | null;
   editedAt: string | null;
+  /** Set when this message is pinned to the client's overview. */
+  pinnedAt: string | null;
+  pinnedBy: string | null;
 }
 
 // ============================================================
@@ -322,6 +325,8 @@ function serializeMessageRow(row: {
   createdAt: Date | null;
   editedAt: Date | null;
   senderName: string | null;
+  pinnedAt?: Date | null;
+  pinnedBy?: string | null;
 }): SerializedMessage {
   return {
     id: row.id,
@@ -333,6 +338,8 @@ function serializeMessageRow(row: {
     attachments: parseAttachments(row.attachmentsJson),
     createdAt: toIso(row.createdAt),
     editedAt: toIso(row.editedAt),
+    pinnedAt: toIso(row.pinnedAt ?? null),
+    pinnedBy: row.pinnedBy ?? null,
   };
 }
 
@@ -581,6 +588,8 @@ export async function listMessages(
       createdAt: messages.createdAt,
       editedAt: messages.editedAt,
       senderName: users.fullName,
+      pinnedAt: messages.pinnedAt,
+      pinnedBy: messages.pinnedBy,
     })
     .from(messages)
     .leftJoin(users, eq(users.id, messages.senderId))
@@ -979,4 +988,106 @@ export async function unreadCount(
       ),
     );
   return Number(r?.c ?? 0);
+}
+
+// ============================================================
+//  Pinning
+// ============================================================
+
+/**
+ * Pin or unpin a message. Pinned messages surface on the client overview so a
+ * newcomer can read the few messages that actually explain the engagement.
+ * Any thread participant may pin — it is a shared, low-stakes bookmark.
+ */
+export async function setMessagePinned(
+  agencyId: string,
+  userId: string,
+  threadId: string,
+  messageId: string,
+  pinned: boolean,
+): Promise<SerializedMessage> {
+  await requireParticipant(agencyId, userId, threadId);
+
+  const [existing] = await db
+    .select()
+    .from(messages)
+    .where(and(eq(messages.id, messageId), eq(messages.threadId, threadId)))
+    .limit(1);
+  if (!existing) throw notFound('Message not found.');
+
+  await db
+    .update(messages)
+    .set({
+      pinnedAt: pinned ? new Date() : null,
+      pinnedBy: pinned ? userId : null,
+    })
+    .where(eq(messages.id, messageId));
+
+  const [row] = await db
+    .select({
+      id: messages.id,
+      threadId: messages.threadId,
+      senderId: messages.senderId,
+      body: messages.body,
+      attachmentsJson: messages.attachmentsJson,
+      createdAt: messages.createdAt,
+      editedAt: messages.editedAt,
+      senderName: users.fullName,
+      pinnedAt: messages.pinnedAt,
+      pinnedBy: messages.pinnedBy,
+    })
+    .from(messages)
+    .leftJoin(users, eq(users.id, messages.senderId))
+    .where(eq(messages.id, messageId));
+
+  return serializeMessageRow(row!);
+}
+
+export interface PinnedMessage extends SerializedMessage {
+  threadSubject: string | null;
+  projectId: string | null;
+}
+
+/**
+ * Every pinned message across a client's threads, newest pin first. Visible to
+ * anyone who can see the client — that is the point of the feature.
+ */
+export async function listPinnedForClient(
+  agencyId: string,
+  clientId: string,
+  limit = 50,
+): Promise<PinnedMessage[]> {
+  const rows = await db
+    .select({
+      id: messages.id,
+      threadId: messages.threadId,
+      senderId: messages.senderId,
+      body: messages.body,
+      attachmentsJson: messages.attachmentsJson,
+      createdAt: messages.createdAt,
+      editedAt: messages.editedAt,
+      senderName: users.fullName,
+      pinnedAt: messages.pinnedAt,
+      pinnedBy: messages.pinnedBy,
+      threadSubject: messageThreads.subject,
+      projectId: messageThreads.projectId,
+    })
+    .from(messages)
+    .innerJoin(messageThreads, eq(messageThreads.id, messages.threadId))
+    .leftJoin(users, eq(users.id, messages.senderId))
+    .where(
+      and(
+        eq(messageThreads.agencyId, agencyId),
+        eq(messageThreads.clientId, clientId),
+        isNotNull(messages.pinnedAt),
+      ),
+    )
+    .orderBy(desc(messages.pinnedAt))
+    .limit(limit);
+
+  return rows.map((r) => ({
+    ...serializeMessageRow(r),
+    threadSubject: r.threadSubject ?? null,
+    projectId: r.projectId ?? null,
+  }));
 }

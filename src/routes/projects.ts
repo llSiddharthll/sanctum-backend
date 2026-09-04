@@ -39,6 +39,10 @@ import { loadPermissions } from '../middleware/permissions.js';
 import { meetsLevel } from '../lib/permissions.js';
 import { getAuth, isPrivileged } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
+import {
+  MILESTONE_TEMPLATES,
+  CONTINUOUS_SERVICES,
+} from '../lib/project-milestone-templates.js';
 import { sweepEndedMonths, unarchiveTask } from '../services/archive.js';
 import { listProjectTimers, stopTimersForTask } from './timers.js';
 
@@ -838,6 +842,33 @@ const createSchema = z.object({
   currency: z.string().trim().max(8).optional(),
   startDate: z.coerce.date().optional(),
   deadline: z.coerce.date().optional(),
+  /**
+   * Milestones to create alongside the project. The UI prefills these from the
+   * service preset and lets the team edit them first, so we take exactly what
+   * was shown rather than re-deriving on the server. Omit for none.
+   */
+  milestones: z
+    .array(
+      z.object({
+        title: z.string().trim().min(1).max(200),
+        description: z.string().trim().max(1000).optional(),
+        dueDate: z.coerce.date().optional(),
+      }),
+    )
+    .max(30)
+    .optional(),
+});
+
+/**
+ * GET /projects/milestone-templates — the service→milestones presets, so the
+ * create form can prefill (and explain an intentionally empty preset).
+ * Registered before '/:id' so it is not read as a project id.
+ */
+projectsRouter.get('/milestone-templates', async (_req, res) => {
+  ok(res, {
+    continuousServices: CONTINUOUS_SERVICES,
+    templates: MILESTONE_TEMPLATES,
+  });
 });
 
 projectsRouter.post('/', async (req, res) => {
@@ -892,6 +923,21 @@ projectsRouter.post('/', async (req, res) => {
     role: 'owner',
   });
 
+  // Seed the milestones the UI showed at creation time (service preset, edited).
+  if (body.milestones?.length) {
+    await db.insert(projectMilestones).values(
+      body.milestones.map((m, i) => ({
+        id: newId('pms'),
+        agencyId: ctx.agencyId,
+        projectId: id,
+        title: m.title,
+        description: m.description ?? null,
+        dueDate: m.dueDate ?? null,
+        position: i,
+      })),
+    );
+  }
+
   await audit({
     agencyId: ctx.agencyId,
     actorType: ctx.role,
@@ -899,7 +945,11 @@ projectsRouter.post('/', async (req, res) => {
     action: 'project.create',
     entityType: 'project',
     entityId: id,
-    metadata: { projectId: id, name: body.name },
+    metadata: {
+      projectId: id,
+      name: body.name,
+      milestonesSeeded: body.milestones?.length ?? 0,
+    },
     ip: req.ip,
   });
 

@@ -1365,10 +1365,13 @@ export const messages = sqliteTable(
     body: text('body').notNull(),
     // JSON array of { url, type:'image'|'file', name, mime?, bytes? }.
     attachmentsJson: text('attachments_json'),
+    // Pinning: the handful of messages that explain the state of play.
+    pinnedAt: ts('pinned_at'),
+    pinnedBy: text('pinned_by').references(() => users.id, { onDelete: 'set null' }),
     createdAt: ts('created_at').notNull().default(now),
     editedAt: ts('edited_at'),
   },
-  (tbl) => [index('ix_messages_thread_created').on(tbl.threadId, tbl.createdAt)],
+  (tbl) => [index('ix_messages_thread_created').on(tbl.threadId, tbl.createdAt), index('ix_messages_thread_pinned').on(tbl.threadId, tbl.pinnedAt)],
 );
 
 // ============================================================

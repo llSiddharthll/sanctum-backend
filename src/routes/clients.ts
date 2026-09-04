@@ -35,6 +35,8 @@ import {
   assignedClientIds,
 } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
+import { listPinnedForClient } from '../services/messages.js';
+import { summarisePinnedConversation } from '../services/ai.js';
 import { sendPortalWelcome } from '../services/email.js';
 import { getFrontendOrigin } from '../lib/frontend-url.js';
 import {
@@ -616,9 +618,59 @@ clientsRouter.post(
   },
 );
 
+// GET /clients/:clientId/pinned — the messages the team pinned across this
+// client's threads. Visible to anyone who can see the client, so a newcomer can
+// read the few messages that actually explain the engagement.
+clientsRouter.get('/:clientId/pinned', async (req, res) => {
+  const ctx = getAuth(req);
+  const client = await requireClientAccess(ctx, param(req, 'clientId'));
+  const pinned = await listPinnedForClient(ctx.agencyId, client.id);
+  ok(res, pinned);
+});
+
+// POST /clients/:clientId/pinned/summary — AI catch-up brief over those pins.
+clientsRouter.post('/:clientId/pinned/summary', async (req, res) => {
+  const ctx = getAuth(req);
+  const client = await requireClientAccess(ctx, param(req, 'clientId'));
+  const pinned = await listPinnedForClient(ctx.agencyId, client.id);
+
+  if (!pinned.length) {
+    return ok(res, {
+      summary: null,
+      pinnedCount: 0,
+      message: 'Nothing pinned yet — pin the messages that explain this account.',
+    });
+  }
+
+  const summary = await summarisePinnedConversation({
+    clientName: client.name,
+    pinned: pinned
+      .slice()
+      .reverse() // oldest pin first reads better as a narrative
+      .map((p) => ({
+        body: p.body,
+        senderName: p.senderName,
+        threadSubject: p.threadSubject,
+        pinnedAt: p.pinnedAt,
+      })),
+  });
+
+  ok(res, {
+    summary,
+    pinnedCount: pinned.length,
+    // Null summary means AI is disabled — the client still renders the pins.
+    message: summary ? null : 'AI is not configured, showing the pinned messages instead.',
+  });
+});
+
 // GET /clients/:clientId/activity — audit feed across ALL the client's projects
 // (project create/update, task status changes, timers, milestones, etc.).
-clientsRouter.get('/:clientId/activity', async (req, res) => {
+clientsRouter.get(
+  '/:clientId/activity',
+  // Oversight feed: owner/admin + managers (projects:manage). Employees, who
+  // sit at projects:edit, don't get a log of their colleagues' every action.
+  requireModule('projects', 'manage'),
+  async (req, res) => {
   const ctx = getAuth(req);
   const client = await requireClientAccess(ctx, param(req, 'clientId'));
   const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 60));
@@ -686,7 +738,8 @@ clientsRouter.get('/:clientId/activity', async (req, res) => {
       };
     }),
   );
-});
+  },
+);
 
 // GET /clients/:clientId/portal-tokens — list (no hashes).
 clientsRouter.get('/:clientId/portal-tokens', async (req, res) => {

@@ -16,6 +16,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth, requireClientAccess } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
+import { broadcastPortalRefresh } from '../realtime/io.js';
 import { notifyMany, agencyOwners } from '../services/notifications.js';
 import { sendEmail } from '../services/email.js';
 import { getFrontendOrigin } from '../lib/frontend-url.js';
@@ -530,10 +531,24 @@ authRouter.delete('/:id', async (req, res) => {
     .where(and(eq(agreements.id, agreementId), eq(agreements.agencyId, ctx.agencyId)))
     .limit(1);
   if (!a) throw notFound('Agreement not found.');
-  if (a.status === 'signed' || a.status === 'active') {
-    throw badRequest('A signed or active agreement cannot be deleted.');
+  // Only an un-executed agreement may be removed. Once it has been signed it is
+  // a binding record (and `terminated`/`expired` are the history of one), so
+  // those are kept for the audit trail.
+  if (a.status !== 'draft' && a.status !== 'sent') {
+    throw badRequest(
+      `Only draft or unsigned agreements can be deleted — this one is ${a.status}.`,
+    );
   }
   await db.delete(agreements).where(eq(agreements.id, a.id));
+
+  // A 'sent' agreement is visible in the client portal, so tell any open portal
+  // session to refetch immediately rather than showing a document that is gone.
+  if (a.clientId) {
+    broadcastPortalRefresh(a.clientId, {
+      type: 'agreement.deleted',
+      agreementId: a.id,
+    });
+  }
   await audit({
     agencyId: ctx.agencyId,
     actorType: ctx.role,

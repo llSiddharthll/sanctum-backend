@@ -1860,3 +1860,55 @@ export async function enhanceTextWithAi(
   };
 }
 
+// ============================================================
+//  Pinned-conversation catch-up
+// ============================================================
+
+export interface PinnedDigestInput {
+  clientName: string;
+  pinned: Array<{
+    body: string;
+    senderName: string | null;
+    threadSubject: string | null;
+    pinnedAt: string | null;
+  }>;
+}
+
+/**
+ * Summarise a client's pinned messages into a short brief, so someone joining
+ * the account can get current in a minute. Returns null when AI is disabled, so
+ * callers fall back to simply listing the pins.
+ */
+export async function summarisePinnedConversation(
+  input: PinnedDigestInput,
+): Promise<string | null> {
+  if (!input.pinned.length) return null;
+
+  const transcript = input.pinned
+    .map((p, i) => {
+      const who = p.senderName ?? 'Someone';
+      const where = p.threadSubject ? ` (in "${p.threadSubject}")` : '';
+      const when = p.pinnedAt ? ` [pinned ${p.pinnedAt.slice(0, 10)}]` : '';
+      return `${i + 1}. ${who}${where}${when}: ${p.body}`;
+    })
+    .join('\n');
+
+  return callGeminiText({
+    system: [
+      'You brief a colleague who is joining an existing client account at a marketing agency.',
+      'You are given the messages the team explicitly PINNED as important.',
+      'Write a tight catch-up brief in Markdown with these sections, omitting any you have no evidence for:',
+      '**Where things stand** — 2-4 bullets on the current state.',
+      '**Decisions made** — what was agreed, and by whom if stated.',
+      '**Open items / watch-outs** — anything unresolved, blocked or risky.',
+      'Rules: rely ONLY on the pinned messages; never invent names, numbers or dates.',
+      'Be specific and short — under 200 words. No preamble, no sign-off.',
+    ].join('\n'),
+    contents: [
+      {
+        role: 'user',
+        text: `Client: ${input.clientName}\n\nPinned messages (oldest pin last):\n${transcript}`,
+      },
+    ],
+  });
+}

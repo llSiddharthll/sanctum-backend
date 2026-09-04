@@ -8,6 +8,7 @@ import {
   createMessage,
   createThread,
   deleteMessage,
+  setMessagePinned,
   deleteThread,
   editMessage,
   getThread,
@@ -182,6 +183,23 @@ messagesRouter.delete('/threads/:id/messages/:msgId', async (req, res) => {
     param(req, 'msgId'),
   );
   ok(res, { deleted: true });
+});
+
+// PATCH /messages/threads/:id/messages/:msgId/pin — pin/unpin for the client
+// overview. Any participant may pin; it is a shared bookmark, not an edit.
+const pinSchema = z.object({ pinned: z.boolean() });
+
+messagesRouter.patch('/threads/:id/messages/:msgId/pin', async (req, res) => {
+  const ctx = getAuth(req);
+  const body = pinSchema.parse(req.body);
+  const message = await setMessagePinned(
+    ctx.agencyId,
+    ctx.userId,
+    param(req, 'id'),
+    param(req, 'msgId'),
+    body.pinned,
+  );
+  ok(res, message);
 });
 
 // POST /messages/threads/:id/read

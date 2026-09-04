@@ -54,6 +54,46 @@ describe('agreement delete', () => {
     expect(got2.terms.sections[1].heading).toBe('Deliverables');
   });
 
+  it('deletes a SENT (unsigned) agreement — it is not binding yet', async () => {
+    const a = data(
+      await owner.post(`${BASE}/agreements`).send({
+        title: 'Sent MSA',
+        clientId,
+        terms: { scope: 'work', clauses: ['1. Clause'] },
+      }),
+    );
+    await owner
+      .post(`${BASE}/agreements/${a.id}/send`)
+      .send({ recipientEmail: 'client@example.com' });
+    const sent = data(await owner.get(`${BASE}/agreements/${a.id}`));
+    expect(sent.status).toBe('sent');
+
+    expect((await owner.delete(`${BASE}/agreements/${a.id}`)).status).toBe(200);
+    expect((await owner.get(`${BASE}/agreements/${a.id}`)).status).toBe(404);
+  });
+
+  it('refuses to delete terminated or expired agreements (executed history)', async () => {
+    for (const status of ['terminated', 'expired'] as const) {
+      const a = data(
+        await owner.post(`${BASE}/agreements`).send({
+          title: `${status} MSA`,
+          clientId,
+          terms: { scope: 'work', clauses: ['1. Clause'] },
+        }),
+      );
+      // Drive it into an executed state the API cannot set directly.
+      await owner.put(`${BASE}/agreements/${a.id}`).send({ title: `${status} MSA` });
+      const { db } = await import('../src/db/client.js');
+      const { agreements } = await import('../src/db/schema.js');
+      const { eq } = await import('drizzle-orm');
+      await db.update(agreements).set({ status }).where(eq(agreements.id, a.id));
+
+      const res = await owner.delete(`${BASE}/agreements/${a.id}`);
+      expect(res.status).toBe(400);
+      expect(String(res.body?.error?.message ?? '')).toMatch(new RegExp(status, 'i'));
+    }
+  });
+
   it('refuses to delete a signed agreement', async () => {
     const a = data(
       await owner.post(`${BASE}/agreements`).send({

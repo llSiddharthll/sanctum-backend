@@ -253,6 +253,13 @@
       "when": 1787351280808,
       "tag": "0035_refrens_sync",
       "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "6",
+      "when": 1788559926174,
+      "tag": "0036_message_pins",
+      "breakpoints": true
     }
   ]
 }
