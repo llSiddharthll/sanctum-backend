@@ -11,10 +11,23 @@ import { requireModuleRW } from '../middleware/permissions.js';
 import { getAuth } from '../middleware/tenant.js';
 import { getFrontendOrigin } from '../lib/frontend-url.js';
 import { publishCalendarSheet } from '../services/sheet-publish.js';
+import { fetchGoogleSheetCsv } from '../services/google-sheet.js';
 
 export const sheetsRouter = Router();
 sheetsRouter.use(requireAuth);
 sheetsRouter.use(requireModuleRW('sheets'));
+
+// ============================================================
+//  POST /sheets/import/google — read a shared Google Sheet as CSV.
+//  Declared before the /:id routes so 'import' is never taken as an id.
+// ============================================================
+const googleImportSchema = z.object({ url: z.string().min(1).max(2000) });
+
+sheetsRouter.post('/import/google', async (req, res) => {
+  const { url } = googleImportSchema.parse(req.body);
+  const { csv, spreadsheetId, gid } = await fetchGoogleSheetCsv(url);
+  ok(res, { csv, spreadsheetId, gid });
+});
 
 // POST /sheets/:id/publish — turn a content-calendar sheet into content posts +
 // assigned tasks (idempotent; skips already-published rows).

@@ -122,6 +122,69 @@ interface SheetColumn {
   index: number;
   label: string;
   type: string;
+  /** Stable identity — present on sheets built by the column picker. */
+  role?: string;
+}
+
+/**
+ * Map a calendar Format cell onto a post type. Managers write "Static" for a
+ * plain image, which has no postType of its own — it lands on 'post'.
+ */
+const FORMAT_TO_POST_TYPE: Record<string, (typeof POST_TYPES)[number]> = {
+  reel: 'reel',
+  story: 'story',
+  carousel: 'carousel',
+  post: 'post',
+  static: 'post',
+  image: 'post',
+  graphic: 'post',
+};
+
+/**
+ * Map a calendar Status cell onto a task status. The sheet shows board labels
+ * ("In review"), so normalise punctuation/spacing before matching. An empty or
+ * unrecognised cell defaults to 'todo'.
+ */
+const TASK_STATUSES = ['todo', 'in_progress', 'in_review', 'done'] as const;
+type TaskStatus = (typeof TASK_STATUSES)[number];
+
+function toTaskStatus(raw: unknown): TaskStatus {
+  const s = String(raw ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, '');
+  switch (s) {
+    case 'inprogress':
+    case 'doing':
+      return 'in_progress';
+    case 'inreview':
+    case 'review':
+      return 'in_review';
+    case 'completed':
+    case 'complete':
+    case 'done':
+      return 'done';
+    default:
+      // 'todo', 'backlog' (retired into To do), blank, or anything unknown.
+      return 'todo';
+  }
+}
+
+/**
+ * Split a multi-select cell into its choices. The grid stores several picks as
+ * a comma-separated string ("Instagram, LinkedIn") so CSV export and the
+ * formula engine keep seeing a plain value; single-select cells simply yield a
+ * one-element array.
+ */
+function splitMulti(raw: unknown): string[] {
+  const s = raw === null || raw === undefined ? '' : String(raw);
+  if (!s.trim()) return [];
+  const out: string[] = [];
+  for (const part of s.split(',')) {
+    const v = part.trim();
+    if (v && !out.includes(v)) out.push(v);
+  }
+  return out;
 }
 
 export interface PublishResult {
@@ -238,11 +301,31 @@ export async function publishCalendarSheet(
 
   const cols = data.columns;
   const find = (pred: (c: SheetColumn) => boolean) => cols.find(pred);
-  const dateCol = find((c) => c.type === 'date');
-  const assigneeCol = find((c) => c.type === 'assignee');
-  const captionCol = find((c) => c.type === 'text');
-  const typeCol = find((c) => c.type === 'select' && /type/i.test(c.label));
-  const platformCol = find((c) => c.type === 'select' && /platform/i.test(c.label));
+  /**
+   * Resolve a column by role first. Sheets built by the column picker carry
+   * roles, so a relabelled or reordered header still maps correctly; the
+   * predicate is only a fallback for calendars created before roles existed.
+   */
+  const byRole = (role: string, fallback: (c: SheetColumn) => boolean) =>
+    find((c) => c.role === role) ?? find((c) => !c.role && fallback(c));
+
+  const dateCol = byRole('date', (c) => c.type === 'date');
+  const assigneeCol = byRole('assignee', (c) => c.type === 'assignee');
+  const statusCol = byRole('status', (c) => c.type === 'status');
+  const typeCol = byRole(
+    'format',
+    (c) => c.type === 'select' && /type|format/i.test(c.label),
+  );
+  const platformCol = byRole(
+    'platform',
+    (c) => c.type === 'select' && /platform/i.test(c.label),
+  );
+  // The task gets the short Idea as its title; the post gets the long
+  // Copy/Script as its caption. Legacy sheets have one text column, which
+  // served both — so each falls back to the other, then to the first text col.
+  const firstText = find((c) => c.type === 'text');
+  const ideaCol = byRole('idea', (c) => c.type === 'text') ?? firstText;
+  const copyCol = byRole('copy', () => false) ?? ideaCol;
   if (!dateCol) {
     throw new AppError('VALIDATION_ERROR', 'The calendar has no Date column.');
   }
@@ -333,15 +416,28 @@ export async function publishCalendarSheet(
       result.skipped++;
       continue;
     }
-    const caption = String(val(row, captionCol) ?? '').trim() || 'Untitled post';
-    const rawType = String(val(row, typeCol) ?? '').trim().toLowerCase();
-    const postType = (POST_TYPES as readonly string[]).includes(rawType)
-      ? rawType
-      : 'post';
-    const platform = String(val(row, platformCol) ?? '').trim();
-    const platformsJson = JSON.stringify(platform ? [platform] : []);
-    let assignee = String(val(row, assigneeCol) ?? '').trim();
-    if (!assignee || !agencyUsers.has(assignee)) assignee = ctx.userId;
+    // Task title = the short Idea; post caption = the long Copy/Script. When a
+    // sheet carries only one of them, each stands in for the other.
+    const idea = String(val(row, ideaCol) ?? '').trim();
+    const copy = String(val(row, copyCol) ?? '').trim();
+    const title = idea || copy || 'Untitled post';
+    const caption = copy || idea || 'Untitled post';
+    const rawType = String(val(row, typeCol) ?? '')
+      .trim()
+      .toLowerCase();
+    const postType = FORMAT_TO_POST_TYPE[rawType] ?? 'post';
+    const taskStatus = toTaskStatus(val(row, statusCol));
+    // Platform + Assignee are multi-select in the grid: one cell can hold
+    // several comma-separated choices.
+    const platforms = splitMulti(val(row, platformCol));
+    const platformsJson = JSON.stringify(platforms);
+    const pickedAssignees = splitMulti(val(row, assigneeCol)).filter((u) =>
+      agencyUsers.has(u),
+    );
+    // The task's own assigneeId is single-valued, so the first pick owns it;
+    // every pick is written to the many-to-many task_assignees table.
+    const assignee = pickedAssignees[0] ?? ctx.userId;
+    const assignees = pickedAssignees.length ? pickedAssignees : [ctx.userId];
 
     // Already published? Via the durable table, or adopted from a legacy row.
     const existing = pubByRow.get(row);
@@ -367,11 +463,23 @@ export async function publishCalendarSheet(
           .where(and(eq(contentPosts.id, rec.postId), eq(contentPosts.agencyId, ctx.agencyId)));
         await db
           .update(projectTasks)
-          .set({ title: caption, assigneeId: assignee, dueDate: date })
+          .set({
+            title,
+            assigneeId: assignee,
+            dueDate: date,
+            status: taskStatus,
+          })
           .where(and(eq(projectTasks.id, rec.taskId), eq(projectTasks.agencyId, ctx.agencyId)));
         await db
           .insert(taskAssignees)
-          .values({ id: newId('tka'), agencyId: ctx.agencyId, taskId: rec.taskId, userId: assignee })
+          .values(
+            assignees.map((userId) => ({
+              id: newId('tka'),
+              agencyId: ctx.agencyId,
+              taskId: rec!.taskId,
+              userId,
+            })),
+          )
           .onConflictDoNothing();
         // Record it durably (adopts a legacy row into the table on first pass).
         if (!existing) {
@@ -411,15 +519,23 @@ export async function publishCalendarSheet(
         id: taskId,
         agencyId: ctx.agencyId,
         projectId,
-        title: caption,
+        title,
         assigneeId: assignee,
         dueDate: date,
         postId,
         priority: 'medium',
+        status: taskStatus,
       });
       await db
         .insert(taskAssignees)
-        .values({ id: newId('tka'), agencyId: ctx.agencyId, taskId, userId: assignee })
+        .values(
+          assignees.map((userId) => ({
+            id: newId('tka'),
+            agencyId: ctx.agencyId,
+            taskId,
+            userId,
+          })),
+        )
         .onConflictDoNothing();
       // 3) record the durable publication link for future re-publishes
       await db
@@ -434,11 +550,12 @@ export async function publishCalendarSheet(
         })
         .onConflictDoNothing();
 
-      // 4) notify the assignee
-      if (assignee !== ctx.userId) {
+      // 4) notify every assignee (never the publisher about their own row)
+      for (const userId of assignees) {
+        if (userId === ctx.userId) continue;
         await notify({
           agencyId: ctx.agencyId,
-          userId: assignee,
+          userId,
           type: 'task.assigned',
           title: `New task: ${caption}`,
           body: `Due ${date.toISOString().slice(0, 10)} · ${client.name}`,
