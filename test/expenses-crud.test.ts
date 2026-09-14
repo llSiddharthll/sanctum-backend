@@ -74,6 +74,30 @@ describe('expenses: full CRUD', () => {
     expect(nulled.status).toBe(422);
   });
 
+  it('creates with blank optional fields sent as null', async () => {
+    // The web form sends null for an empty description/receipt; this used to 422.
+    const res = await create({
+      description: null,
+      receiptUrl: null,
+      projectId: null,
+      clientId: null,
+      gstAmount: null,
+    });
+    expect(res.status).toBe(201);
+    const made = data(res);
+    expect(made.description).toBeNull();
+    expect(made.receiptUrl).toBeNull();
+  });
+
+  it('stores a YYYY-MM-DD date on that calendar day', async () => {
+    const made = data(await create({ expenseDate: '2026-07-01' }));
+    expect(made.expenseDate.slice(0, 10)).toBe('2026-07-01');
+    const july = data(await owner.get(`${BASE}/expenses?from=2026-07-01&to=2026-07-01`));
+    expect(july.some((e: any) => e.id === made.id)).toBe(true);
+    const june = data(await owner.get(`${BASE}/expenses?from=2026-06-01&to=2026-06-30`));
+    expect(june.some((e: any) => e.id === made.id)).toBe(false);
+  });
+
   it('validates amount, category and receipt URL', async () => {
     expect((await create({ amount: -1 })).status).toBe(422);
     expect((await create({ amount: 12.5 })).status).toBe(422);

@@ -151,6 +151,26 @@ const envSchema = z.object({
   // provider; present so older .env files keep validating.
   ANTHROPIC_API_KEY: z.string().optional(),
   ANTHROPIC_MODEL: z.string().default('claude-sonnet-4-5'),
+
+  // ---- Meta (Instagram + Facebook Pages) connect & auto-publish ----
+  // developers.facebook.com → your app → App settings → Basic. Social connect
+  // is inert unless both are set.
+  META_APP_ID: z.string().optional(),
+  META_APP_SECRET: z.string().optional(),
+  // Graph API version, pinned so Meta's version rollovers are a deliberate change.
+  META_GRAPH_VERSION: z.string().default('v23.0'),
+  // Facebook Login for Business configuration id. When set, the login dialog
+  // uses it instead of the built-in scope list.
+  META_LOGIN_CONFIG_ID: z.string().optional(),
+  // Redirect URI registered in the Meta app. Defaults to
+  // <this API's public origin>/api/v1/oauth/meta/callback.
+  META_REDIRECT_URI: z.string().url().optional(),
+  // Master switch for the auto-publish job (like REFRENS_SYNC_ENABLED): off by
+  // default so nothing reaches a live account until explicitly enabled.
+  SOCIAL_PUBLISH_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
 });
 
 const parsed = envSchema.safeParse(process.env);

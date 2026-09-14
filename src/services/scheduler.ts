@@ -7,6 +7,7 @@ import { runMediaArchive } from './media-archive.js';
 import { sweepEndedMonths } from './archive.js';
 import { pullInvoices, refrensSyncEnabled, syncAgencyId } from './refrens-sync.js';
 import { env } from '../env.js';
+import { runDuePublishing, socialPublishEnabled } from './social-publish.js';
 
 /** Previous calendar month as {from:'YYYY-MM-01', to:'YYYY-MM-<last>'} (UTC). */
 export function previousMonthRange(now: Date): { from: string; to: string } {
@@ -122,5 +123,23 @@ export function startScheduler(): void {
       })().catch((e) => console.error('[refrens] sync failed', e));
     });
     console.log('[scheduler] Refrens invoice sync scheduled (*/15 * * * *)');
+  }
+
+  // Every 5 min: publish approved/scheduled posts that came due to the client's
+  // connected Instagram / Facebook accounts. Off unless SOCIAL_PUBLISH_ENABLED
+  // and the Meta app credentials are set.
+  if (socialPublishEnabled()) {
+    cron.schedule('*/5 * * * *', () => {
+      void runDuePublishing()
+        .then((r) => {
+          if (r.published || r.failed || r.processing) {
+            console.log(
+              `[social] posts ${r.posts}: ${r.published} published, ${r.failed} failed, ${r.processing} processing`,
+            );
+          }
+        })
+        .catch((e) => console.error('[social] publish run failed', e));
+    });
+    console.log('[scheduler] social auto-publish scheduled (*/5 * * * *)');
   }
 }

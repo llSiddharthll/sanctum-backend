@@ -60,6 +60,9 @@ export default defineConfig({
       EMAIL_USER: '',
       EMAIL_PASS: '',
       GEMINI_API_KEY: '',
+      // Meta connect is exercised against a stubbed Graph API (test/social.test.ts).
+      META_APP_ID: 'test-meta-app',
+      META_APP_SECRET: 'test-meta-secret',
     },
   },
 });

@@ -22,6 +22,7 @@ import {
   invoices,
   invoiceItems,
   invoicePayments,
+  socialAccounts,
 } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
 import { badRequest, forbidden, notFound } from '../lib/errors.js';
@@ -663,12 +664,23 @@ async function scopedClientPost(
 }
 
 // GET /client/calendar — scheduled content for the client (non-draft), by date.
+function parseHandles(json: string | null): Record<string, string> | null {
+  try {
+    const v = json ? JSON.parse(json) : null;
+    return v && typeof v === 'object' && !Array.isArray(v) ? v : null;
+  } catch {
+    return null;
+  }
+}
+
 clientPortalRouter.get('/calendar', async (req, res) => {
   const ctx = getClientCtx(req);
   const [cli] = await db
     .select({
       visible: clients.portalVisibleStatuses,
       role: clients.portalRole,
+      logoUrl: clients.logoUrl,
+      handlesJson: clients.handlesJson,
     })
     .from(clients)
     .where(eq(clients.id, ctx.clientId))
@@ -707,6 +719,7 @@ clientPortalRouter.get('/calendar', async (req, res) => {
       width: number | null;
       height: number | null;
       position: number;
+      archived: boolean;
     }[]
   >();
   const commentCount = new Map<string, number>();
@@ -729,6 +742,7 @@ clientPortalRouter.get('/calendar', async (req, res) => {
         width: m.width,
         height: m.height,
         position: m.position,
+        archived: m.archived,
       });
       mediaByPost.set(m.postId, list);
     }
@@ -757,8 +771,32 @@ clientPortalRouter.get('/calendar', async (req, res) => {
       ),
     );
 
+  // The brand's real Instagram profile (when connected), so the grid shows the
+  // actual handle, avatar and follower count instead of a guess.
+  const [ig] = await db
+    .select({
+      username: socialAccounts.username,
+      avatarUrl: socialAccounts.avatarUrl,
+      followers: socialAccounts.followersCount,
+    })
+    .from(socialAccounts)
+    .where(
+      and(
+        eq(socialAccounts.agencyId, ctx.agencyId),
+        eq(socialAccounts.clientId, ctx.clientId),
+        eq(socialAccounts.platform, 'instagram'),
+        eq(socialAccounts.status, 'active'),
+      ),
+    )
+    .limit(1);
+
   ok(res, {
     canApprove: cli?.role !== 'reviewer',
+    brand: {
+      logoUrl: cli?.logoUrl ?? null,
+      handles: parseHandles(cli?.handlesJson ?? null),
+      instagram: ig ?? null,
+    },
     reservations: reservations.map((r) => ({
       id: r.id,
       date: toIso(r.date),

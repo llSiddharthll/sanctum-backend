@@ -495,6 +495,118 @@ export const postMedia = sqliteTable(
 );
 
 // ============================================================
+//  SOCIAL_ACCOUNTS (a client's connected Instagram / Facebook Page)
+// ============================================================
+export const socialAccounts = sqliteTable(
+  t('social_accounts'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    clientId: text('client_id')
+      .notNull()
+      .references(() => clients.id, { onDelete: 'cascade' }),
+    platform: text('platform', { enum: ['instagram', 'facebook'] }).notNull(),
+    // Instagram business account id, or the Facebook Page id.
+    externalId: text('external_id').notNull(),
+    // The Facebook Page this account is reached through (Instagram publishes via it).
+    pageId: text('page_id'),
+    username: text('username'),
+    displayName: text('display_name'),
+    avatarUrl: text('avatar_url'),
+    followersCount: integer('followers_count'),
+    // Page access token sealed with VAULT_ENC_KEY (vault.sealToString); '' once
+    // disconnected. Never serialized to clients.
+    accessTokenEnc: text('access_token_enc').notNull(),
+    // Meta user who granted access — matched by the deauthorize/data-deletion callbacks.
+    metaUserId: text('meta_user_id'),
+    status: text('status', { enum: ['active', 'expired', 'revoked', 'error'] })
+      .notNull()
+      .default('active'),
+    lastError: text('last_error'),
+    autoPublish: integer('auto_publish', { mode: 'boolean' }).notNull().default(true),
+    connectedBy: text('connected_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    lastSyncedAt: ts('last_synced_at'),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [
+    uniqueIndex('uq_social_account').on(
+      tbl.agencyId,
+      tbl.clientId,
+      tbl.platform,
+      tbl.externalId,
+    ),
+    index('ix_social_agency_client').on(tbl.agencyId, tbl.clientId),
+  ],
+);
+
+// ============================================================
+//  SOCIAL_CONNECT_SESSIONS (short-lived: Pages offered after a Meta login)
+// ============================================================
+export const socialConnectSessions = sqliteTable(t('social_connect_sessions'), {
+  id: text('id').primaryKey(),
+  agencyId: text('agency_id')
+    .notNull()
+    .references(() => agencies.id, { onDelete: 'cascade' }),
+  clientId: text('client_id')
+    .notNull()
+    .references(() => clients.id, { onDelete: 'cascade' }),
+  userId: text('user_id')
+    .notNull()
+    .references(() => users.id, { onDelete: 'cascade' }),
+  // Sealed JSON { metaUserId, pages: [{ id, name, accessToken, pictureUrl, instagram }] }.
+  payloadEnc: text('payload_enc').notNull(),
+  expiresAt: ts('expires_at').notNull(),
+  createdAt: ts('created_at').notNull().default(now),
+});
+
+// ============================================================
+//  POST_PUBLICATIONS (one post → one connected account)
+// ============================================================
+export const postPublications = sqliteTable(
+  t('post_publications'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    clientId: text('client_id')
+      .notNull()
+      .references(() => clients.id, { onDelete: 'cascade' }),
+    postId: text('post_id')
+      .notNull()
+      .references(() => contentPosts.id, { onDelete: 'cascade' }),
+    socialAccountId: text('social_account_id')
+      .notNull()
+      .references(() => socialAccounts.id, { onDelete: 'cascade' }),
+    platform: text('platform', { enum: ['instagram', 'facebook'] }).notNull(),
+    status: text('status', {
+      enum: ['publishing', 'processing', 'published', 'failed'],
+    })
+      .notNull()
+      .default('publishing'),
+    // Instagram media container — videos process asynchronously before publish.
+    containerId: text('container_id'),
+    externalPostId: text('external_post_id'),
+    permalink: text('permalink'),
+    error: text('error'),
+    attempts: integer('attempts').notNull().default(0),
+    publishedAt: ts('published_at'),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [
+    // One row per (post, account) is what makes publishing idempotent.
+    uniqueIndex('uq_publication_post_account').on(tbl.postId, tbl.socialAccountId),
+    index('ix_publications_agency_post').on(tbl.agencyId, tbl.postId),
+  ],
+);
+
+// ============================================================
 //  POST_COMMENTS (agency users OR a client via portal token)
 // ============================================================
 export const postComments = sqliteTable(

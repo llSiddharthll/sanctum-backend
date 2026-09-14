@@ -39,6 +39,30 @@ export function decryptSecret(sealed: {
   ]).toString('utf8');
 }
 
+/**
+ * Seal a secret into one compact string ("v1.<iv>.<tag>.<ciphertext>",
+ * base64url) for a TEXT column — used for OAuth tokens.
+ */
+export function sealToString(plaintext: string): string {
+  const s = encryptSecret(plaintext);
+  return [
+    `v${s.keyVersion}`,
+    s.iv.toString('base64url'),
+    s.authTag.toString('base64url'),
+    s.ciphertext.toString('base64url'),
+  ].join('.');
+}
+
+export function unsealString(sealed: string): string {
+  const [, iv, tag, ct] = sealed.split('.');
+  if (!iv || !tag || !ct) throw new Error('Malformed sealed secret');
+  return decryptSecret({
+    iv: Buffer.from(iv, 'base64url'),
+    authTag: Buffer.from(tag, 'base64url'),
+    ciphertext: Buffer.from(ct, 'base64url'),
+  });
+}
+
 /** Coerce a libSQL blob column (Buffer | Uint8Array | ArrayBuffer) to Buffer. */
 export function toBuffer(v: Buffer | Uint8Array | ArrayBuffer): Buffer {
   if (Buffer.isBuffer(v)) return v;

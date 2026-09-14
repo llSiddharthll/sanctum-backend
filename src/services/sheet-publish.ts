@@ -128,17 +128,17 @@ interface SheetColumn {
 
 /**
  * Map a calendar Format cell onto a post type. Managers write "Static" for a
- * plain image, which has no postType of its own — it lands on 'post'.
+ * plain image, which has no postType of its own — it lands on 'post'. Sheets
+ * spell reels many ways ("Reels", "IG Reel", "Video", "Shorts"); an exact-key
+ * lookup turned all of those into plain posts, so match loosely.
  */
-const FORMAT_TO_POST_TYPE: Record<string, (typeof POST_TYPES)[number]> = {
-  reel: 'reel',
-  story: 'story',
-  carousel: 'carousel',
-  post: 'post',
-  static: 'post',
-  image: 'post',
-  graphic: 'post',
-};
+export function toPostType(raw: string): (typeof POST_TYPES)[number] {
+  const v = raw.toLowerCase().replace(/[^a-z]/g, '');
+  if (/reel|video|short/.test(v)) return 'reel';
+  if (v.includes('stor')) return 'story';
+  if (/carousel|slide|album/.test(v)) return 'carousel';
+  return 'post';
+}
 
 /**
  * Map a calendar Status cell onto a task status. The sheet shows board labels
@@ -425,7 +425,7 @@ export async function publishCalendarSheet(
     const rawType = String(val(row, typeCol) ?? '')
       .trim()
       .toLowerCase();
-    const postType = FORMAT_TO_POST_TYPE[rawType] ?? 'post';
+    const postType = toPostType(rawType);
     const taskStatus = toTaskStatus(val(row, statusCol));
     // Platform + Assignee are multi-select in the grid: one cell can hold
     // several comma-separated choices.
@@ -455,7 +455,9 @@ export async function publishCalendarSheet(
         await db
           .update(contentPosts)
           .set({
-            postType: postType as (typeof POST_TYPES)[number],
+            // A blank Format cell keeps the post's current type (e.g. a reel
+            // fixed by hand) instead of resetting it to 'post' on re-publish.
+            ...(rawType ? { postType } : {}),
             caption,
             platformsJson,
             scheduledAt: date,

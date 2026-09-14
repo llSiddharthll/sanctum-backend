@@ -44,6 +44,8 @@ import { agreementsRouter } from './routes/agreements.js';
 import { invoicesRouter } from './routes/invoices.js';
 import { refrensRouter } from './routes/refrens.js';
 import { intakeRouter } from './routes/intake.js';
+import { socialRouter } from './routes/social.js';
+import { oauthRouter } from './routes/oauth.js';
 
 export function createApp() {
   const app = express();
@@ -102,6 +104,7 @@ export function createApp() {
   api.use('/clients/:clientId/posts/:postId', approvalsRouter);
   api.use('/clients/:clientId/reservations', reservationsRouter);
   api.use('/clients/:clientId/ai', aiRouter);
+  api.use('/clients/:clientId/social', socialRouter);
 
   // Agency-level AI assistant (documents, chat, task breakdown) — distinct
   // from the client-scoped '/clients/:clientId/ai' content-calendar router.
@@ -118,6 +121,9 @@ export function createApp() {
 
   // Public client portal (token-auth, no cookies).
   api.use('/portal', portalRouter);
+
+  // Public Meta login redirect + platform callbacks (state / signed_request auth).
+  api.use('/oauth', oauthRouter);
 
   app.use('/api/v1', api);
 

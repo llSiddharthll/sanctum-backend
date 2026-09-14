@@ -1,9 +1,9 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import path from 'node:path';
-import { and, eq, lt } from 'drizzle-orm';
+import { and, eq, gte, lt, ne } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { documents, postMedia, clients } from '../db/schema.js';
+import { documents, postMedia, clients, contentPosts } from '../db/schema.js';
 import { env } from '../env.js';
 import { deleteObjectLocal } from './local-storage.js';
 
@@ -140,8 +140,24 @@ export async function runMediaArchive(
     .select()
     .from(postMedia)
     .where(and(eq(postMedia.archived, false), lt(postMedia.createdAt, cutoff)));
+  // Never archive media a post still needs: auto-publish hands these URLs to
+  // Instagram / Facebook, so anything on a not-yet-posted post that is
+  // upcoming (or came due within the last day) stays on disk.
+  const pendingPosts = new Set(
+    (
+      await db
+        .select({ id: contentPosts.id })
+        .from(contentPosts)
+        .where(
+          and(
+            ne(contentPosts.status, 'posted'),
+            gte(contentPosts.scheduledAt, new Date(Date.now() - 86_400_000)),
+          ),
+        )
+    ).map((r) => r.id),
+  );
   for (const m of media) {
-    if (!isSelfHosted(m.secureUrl)) {
+    if (!isSelfHosted(m.secureUrl) || pendingPosts.has(m.postId)) {
       res.skipped++;
       continue;
     }

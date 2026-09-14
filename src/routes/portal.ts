@@ -235,6 +235,7 @@ portalRouter.get('/resolve', async (req, res) => {
         width: m.width,
         height: m.height,
         position: m.position,
+        archived: m.archived,
       })),
     });
   }
@@ -368,6 +369,7 @@ portalRouter.get('/posts/:postId', async (req, res) => {
       width: m.width,
       height: m.height,
       position: m.position,
+      archived: m.archived,
     })),
   });
 });

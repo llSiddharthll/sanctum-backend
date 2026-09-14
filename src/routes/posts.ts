@@ -134,7 +134,10 @@ postsRouter.get('/', async (req, res) => {
   // Attach a single hero thumbnail (first media by position) per post so the
   // calendar/list can render previews without a per-post detail fetch. Cheap:
   // one extra query scoped to just the listed posts.
-  const heroByPost = new Map<string, { secureUrl: string; resourceType: 'image' | 'video' }>();
+  const heroByPost = new Map<
+    string,
+    { secureUrl: string; resourceType: 'image' | 'video'; archived: boolean }
+  >();
   if (rows.length) {
     const mediaRows = await db
       .select({
@@ -142,6 +145,7 @@ postsRouter.get('/', async (req, res) => {
         secureUrl: postMedia.secureUrl,
         resourceType: postMedia.resourceType,
         position: postMedia.position,
+        archived: postMedia.archived,
       })
       .from(postMedia)
       .where(
@@ -160,6 +164,7 @@ postsRouter.get('/', async (req, res) => {
         heroByPost.set(m.postId, {
           secureUrl: m.secureUrl,
           resourceType: m.resourceType,
+          archived: m.archived,
         });
       }
     }
@@ -168,7 +173,17 @@ postsRouter.get('/', async (req, res) => {
   const serialized = rows.map((p) => {
     const hero = heroByPost.get(p.id);
     return hero
-      ? { ...serializePost(p), media: [{ secureUrl: hero.secureUrl, resourceType: hero.resourceType, position: 0 }] }
+      ? {
+          ...serializePost(p),
+          media: [
+            {
+              secureUrl: hero.secureUrl,
+              resourceType: hero.resourceType,
+              position: 0,
+              archived: hero.archived,
+            },
+          ],
+        }
       : serializePost(p);
   });
 
@@ -271,6 +286,7 @@ postsRouter.get('/:postId', async (req, res) => {
       width: m.width,
       height: m.height,
       position: m.position,
+      archived: m.archived,
     })),
   });
 });

@@ -166,17 +166,20 @@ const EXPENSE_TYPES = ['one_time', 'monthly_recurring'] as const;
 // an expense to 1970 and out of every current report. Require a real value.
 const strictDate = z.union([z.string().min(1), z.number(), z.date()]).pipe(z.coerce.date());
 
+// Optional fields accept an explicit null (= "not set"): the web form sends
+// null for a blank description/receipt, and rejecting it 422'd every create
+// that left either one empty.
 const createSchema = z.object({
   category: z.enum(EXPENSE_CATEGORIES).optional(),
   expenseType: z.enum(EXPENSE_TYPES).optional(),
   amount: z.number().int().min(0), // paise (required)
-  description: z.string().max(2000).optional(),
-  projectId: z.string().min(1).optional(),
-  clientId: z.string().min(1).optional(),
+  description: z.string().max(2000).nullable().optional(),
+  projectId: z.string().min(1).nullable().optional(),
+  clientId: z.string().min(1).nullable().optional(),
   expenseDate: strictDate.optional(),
-  receiptUrl: z.string().url().max(1000).optional(),
+  receiptUrl: z.string().url().max(1000).nullable().optional(),
   gstDeductible: z.boolean().optional(),
-  gstAmount: z.number().int().min(0).optional(), // paise
+  gstAmount: z.number().int().min(0).nullable().optional(), // paise
 });
 
 expensesRouter.post('/', async (req, res) => {
