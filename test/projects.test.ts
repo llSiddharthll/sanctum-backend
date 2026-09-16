@@ -59,6 +59,26 @@ describe('projects module', () => {
   // ----------------------------------------------------------------
   // 1. Project CRUD
   // ----------------------------------------------------------------
+  it('accepts the web form create payload (null scope + cleared dates)', async () => {
+    const res = await owner.post(`${BASE}/projects`).send({
+      name: 'Form Payload',
+      clientId,
+      scopeOfWork: null,
+      services: [],
+      type: 'fixed_price',
+      status: 'planning',
+      health: 'on_track',
+      currency: 'INR',
+      billingType: 'one_time',
+      startDate: null,
+      deadline: null,
+    });
+    expect(res.status).toBe(201);
+    expect(data(res).scopeOfWork).toBeNull();
+    expect(data(res).startDate).toBeNull();
+    expect(data(res).deadline).toBeNull();
+  });
+
   it('owner creates, lists, gets and patches a project', async () => {
     const create = await owner.post(`${BASE}/projects`).send({
       name: 'Brand Refresh',

@@ -830,8 +830,10 @@ projectsRouter.post('/tasks/:taskId/unarchive', async (req, res) => {
 const createSchema = z.object({
   name: z.string().min(1).max(160),
   clientId: z.string().min(1),
-  scopeOfWork: z.string().max(5000).optional(),
-  description: z.string().max(5000).optional(),
+  // The web form sends null for an empty scope / cleared dates — accept it
+  // (and keep null dates from being coerced to the 1970 epoch).
+  scopeOfWork: z.string().max(5000).nullable().optional(),
+  description: z.string().max(5000).nullable().optional(),
   services: z.array(z.string().max(60)).max(30).optional(),
   type: z.enum(PROJECT_TYPES).optional(),
   status: z.enum(PROJECT_STATUSES).optional(),
@@ -840,8 +842,8 @@ const createSchema = z.object({
   billingType: z.enum(['one_time', 'retainer']).optional(),
   recurringPaise: z.number().int().min(0).optional(),
   currency: z.string().trim().max(8).optional(),
-  startDate: z.coerce.date().optional(),
-  deadline: z.coerce.date().optional(),
+  startDate: z.coerce.date().nullable().optional(),
+  deadline: z.coerce.date().nullable().optional(),
   /**
    * Milestones to create alongside the project. The UI prefills these from the
    * service preset and lets the team edit them first, so we take exactly what
