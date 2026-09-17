@@ -63,12 +63,26 @@ async function transition(owner: Agent, clientId: string, postId: string, to: st
   expect(data(res).status).toBe(to);
 }
 
+/**
+ * Client approval through a share link (approve-capable link role). Staff can
+ * never set `approved` themselves; scheduling/posting requires it.
+ */
+async function approveViaPortal(owner: Agent, clientId: string, postId: string) {
+  await transition(owner, clientId, postId, 'pending_approval');
+  const token = await mintPortalToken(owner, clientId);
+  const res = await portal(token).post(`/posts/${postId}/decision`).send({ decision: 'approved' });
+  expect(res.status).toBe(200);
+}
+
 describe('content posts + portal workflow', () => {
   let owner: Agent;
+  let agencyId: string;
   let clientId: string;
 
   beforeAll(async () => {
-    owner = (await signupAgency()).agent;
+    const signup = await signupAgency();
+    owner = signup.agent;
+    agencyId = signup.agency.id;
     const c = await owner
       .post(`${BASE}/clients`)
       .send({ name: 'Aurora Cafe', contactEmail: 'hi@aurora.test' });
@@ -121,23 +135,27 @@ describe('content posts + portal workflow', () => {
     expect(before.media).toBeUndefined();
 
     // Register two assets at positions 1 and 0; the position-0 one is the hero.
-    const reg = (publicId: string, url: string, position: number) =>
+    // Assets must live under this agency + client's post folder on a configured
+    // storage base (test env: Cloudinary cloud 'test-cloud').
+    const key = (name: string) => `agency/${agencyId}/client/${clientId}/post/${postId}/${name}`;
+    const url = (name: string) => `https://res.cloudinary.com/test-cloud/image/upload/${key(name)}`;
+    const reg = (name: string, position: number) =>
       owner.post(`${BASE}/media/posts/${postId}`).send({
         clientId,
-        cloudinaryPublicId: publicId,
-        secureUrl: url,
+        cloudinaryPublicId: key(name),
+        secureUrl: url(name),
         resourceType: 'image',
         position,
       });
-    expect((await reg('sanctum/p/second', 'https://x.test/second.png', 1)).status).toBe(201);
-    expect((await reg('sanctum/p/hero', 'https://x.test/hero.png', 0)).status).toBe(201);
+    expect((await reg('second', 1)).status).toBe(201);
+    expect((await reg('hero', 0)).status).toBe(201);
 
     const withMedia = await owner.get(`${BASE}/clients/${clientId}/posts`);
     const row = data(withMedia).find((p: any) => p.id === postId);
     expect(Array.isArray(row.media)).toBe(true);
     // Exactly one hero thumbnail (the lowest-position media), not the full set.
     expect(row.media.length).toBe(1);
-    expect(row.media[0].secureUrl).toBe('https://x.test/hero.png');
+    expect(row.media[0].secureUrl).toBe(url('hero'));
     expect(row.media[0].resourceType).toBe('image');
     expect(row.media[0].position).toBe(0);
   });
@@ -146,8 +164,9 @@ describe('content posts + portal workflow', () => {
     const augId = await createPost(owner, clientId, {
       postType: 'story',
       scheduledAt: '2026-08-10T09:00:00.000Z',
-      status: 'scheduled',
     });
+    await approveViaPortal(owner, clientId, augId);
+    await transition(owner, clientId, augId, 'scheduled');
 
     const byMonth = await owner.get(`${BASE}/clients/${clientId}/posts?month=2026-08`);
     expect(byMonth.status).toBe(200);
@@ -178,24 +197,25 @@ describe('content posts + portal workflow', () => {
   // ---------------------------------------------------------------------------
   // 2. Status state machine
   // ---------------------------------------------------------------------------
-  it('drives a post through legal transitions draft -> pending_approval -> scheduled', async () => {
+  it('drives a post draft -> pending_approval -> (client approves) -> scheduled -> posted', async () => {
     const id = await createPost(owner, clientId);
-    await transition(owner, clientId, id, 'pending_approval');
+    await approveViaPortal(owner, clientId, id);
     await transition(owner, clientId, id, 'scheduled');
     await transition(owner, clientId, id, 'posted');
   });
 
-  it('rejects an illegal transition draft -> approved (409)', async () => {
+  it('staff cannot set the client-only "approved" status (403)', async () => {
     const id = await createPost(owner, clientId);
-    // 'approved' is a client-only status; staff cannot set it directly.
+    // 'approved' is a client decision (posts.approve is a client-only permission).
     const res = await owner
       .post(`${BASE}/clients/${clientId}/posts/${id}/transition`)
       .send({ to: 'approved' });
-    expect(res.status).toBe(409);
+    expect(res.status).toBe(403);
   });
 
   it('rejects any transition out of the terminal posted status (409)', async () => {
     const id = await createPost(owner, clientId);
+    await approveViaPortal(owner, clientId, id);
     await transition(owner, clientId, id, 'scheduled');
     await transition(owner, clientId, id, 'posted');
     const res = await owner
@@ -356,6 +376,59 @@ describe('content posts + portal workflow', () => {
       .post(`/posts/${id}/decision`)
       .send({ decision: 'approved' });
     expect(res.status).toBe(404);
+  });
+
+  it('decisions are only allowed while pending_approval (409 afterwards)', async () => {
+    const id = await createPost(owner, clientId);
+    await approveViaPortal(owner, clientId, id);
+    const token = await mintPortalToken(owner, clientId);
+    const again = await portal(token)
+      .post(`/posts/${id}/decision`)
+      .send({ decision: 'changes_requested' });
+    expect(again.status).toBe(409);
+  });
+
+  it('a review-only link cannot approve (403) but can comment; capabilities reflect it', async () => {
+    const id = await createPost(owner, clientId);
+    await transition(owner, clientId, id, 'pending_approval');
+    const roles = data(await owner.get(`${BASE}/roles`)) as Array<{ id: string; key: string | null }>;
+    const reviewerRole = roles.find((r) => r.key === 'share_link_reviewer')!;
+    const mint = await owner
+      .post(`${BASE}/clients/${clientId}/portal-tokens`)
+      .send({ label: 'review only', roleId: reviewerRole.id });
+    expect(mint.status).toBe(201);
+    const token = data(mint).token as string;
+
+    const resolved = data(await portal(token).get('/resolve'));
+    expect(resolved.portal.canApprove).toBe(false);
+    const row = resolved.posts.find((p: any) => p.id === id);
+    expect(row.capabilities['posts.approve']).toBe(false);
+    expect(row.capabilities['post_comments.create']).toBe(true);
+
+    const denied = await portal(token)
+      .post(`/posts/${id}/decision`)
+      .send({ decision: 'approved', actorLabel: 'The CEO' });
+    expect(denied.status).toBe(403);
+    const comment = await portal(token).post(`/posts/${id}/comments`).send({ body: 'Looks close' });
+    expect(comment.status).toBe(201);
+  });
+
+  it('POST /portal/session issues a link-bound session (not a synthetic user)', async () => {
+    const token = await mintPortalToken(owner, clientId);
+    const res = await portal(token).post('/session');
+    expect(res.status).toBe(200);
+    const { access, refresh } = data(res).tokens;
+    expect(typeof access).toBe('string');
+    expect(typeof refresh).toBe('string');
+    const auth = (path: string) =>
+      supertest(app).get(`${BASE}${path}`).set('Authorization', `Bearer ${access}`);
+    const me = await auth('/auth/me');
+    expect(me.status).toBe(200);
+    expect(data(me).user).toBeNull();
+    expect(data(me).authorization.actorType).toBe('portal_link');
+    // Link grants only: calendar yes, invoices no.
+    expect((await auth('/client/calendar')).status).toBe(200);
+    expect((await auth('/client/invoices')).status).toBe(403);
   });
 
   // ---------------------------------------------------------------------------

@@ -8,7 +8,8 @@ import {
 } from '../db/schema.js';
 import { gone, notFound, unauthenticated } from '../lib/errors.js';
 import { hashToken } from '../lib/ids.js';
-import type { AuthContext, PortalContext } from '../types/index.js';
+import type { AuthContext } from '../types/index.js';
+import { portalLinkActor } from '../authz/http.js';
 
 /** Pull the verified auth context off the request (throws if absent). */
 export function getAuth(req: Request): AuthContext {
@@ -59,8 +60,10 @@ export async function requireClientAccess(
 }
 
 /**
- * Portal middleware: resolve `Authorization: Bearer <rawToken>` (or :token
- * path param) to EXACTLY one { agencyId, clientId }. Populates req.portal.
+ * Share-link middleware (token-only /portal API): resolve
+ * `Authorization: Bearer <rawToken>` to a `portal_link` ACTOR (req.actor) whose
+ * grants come from the link's client role and whose project access is the
+ * link's. Unknown → 404, revoked/expired → 410. No session is created.
  */
 export async function requirePortalToken(
   req: Request,
@@ -69,27 +72,31 @@ export async function requirePortalToken(
 ): Promise<void> {
   try {
     const header = req.headers.authorization;
-    const bearer =
+    const raw =
       header && header.startsWith('Bearer ')
         ? header.slice('Bearer '.length)
         : undefined;
-    const raw = bearer ?? (req.params.token as string | undefined);
-
     if (!raw) throw unauthenticated('Portal token required.');
 
-    const tokenHash = hashToken(raw);
     const [tok] = await db
-      .select()
+      .select({
+        id: portalTokens.id,
+        agencyId: portalTokens.agencyId,
+        revoked: portalTokens.revoked,
+        expiresAt: portalTokens.expiresAt,
+      })
       .from(portalTokens)
-      .where(eq(portalTokens.tokenHash, tokenHash))
+      .where(eq(portalTokens.tokenHash, hashToken(raw)))
       .limit(1);
 
     if (!tok) throw notFound('Invalid link.');
-
     if (tok.revoked) throw gone('This link has been revoked.');
     if (tok.expiresAt && tok.expiresAt.getTime() <= Date.now()) {
       throw gone('This link has expired.');
     }
+
+    // Grants = the link role's grants (empty when the link has no role).
+    req.actor = await portalLinkActor(tok.id, tok.agencyId, null);
 
     // Best-effort touch of last-used.
     void db
@@ -98,12 +105,6 @@ export async function requirePortalToken(
       .where(eq(portalTokens.id, tok.id))
       .catch(() => undefined);
 
-    const portal: PortalContext = {
-      tokenId: tok.id,
-      agencyId: tok.agencyId,
-      clientId: tok.clientId,
-    };
-    req.portal = portal;
     next();
   } catch (err) {
     next(err);
