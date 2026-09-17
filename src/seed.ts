@@ -12,7 +12,7 @@
  *   then re-inserts. Safe to re-run.
  * - Prints a per-role credentials table, portal share links, and row counts.
  *
- * Treats "today" as 2026-08-14; all dates are offsets from that base.
+ * All dates are offsets from the real current date (see TODAY).
  *
  * Run:  npx --no-install tsc -p tsconfig.json  &&  node dist/seed.js
  */
@@ -93,7 +93,13 @@ const GB = 1024 * 1024 * 1024;
 const PERIOD = '2026-08';
 
 // "today"
-const TODAY = new Date('2026-08-14T09:00:00Z');
+// Relative to the real current date, so the demo calendar sits in the current
+// month (the month-end archive sweep would otherwise file away "past" content).
+const TODAY = (() => {
+  const d = new Date();
+  d.setUTCHours(9, 0, 0, 0);
+  return d;
+})();
 
 /** A UTC instant `offsetDays` from TODAY at the given hour/minute. */
 function at(offsetDays: number, hour = 10, minute = 0): Date {
@@ -282,7 +288,7 @@ async function main(): Promise<void> {
     name: 'Sanctum Studio',
     slug: 'sanctum-studio',
     logoUrl:
-      'https://res.cloudinary.com/dkqo3uz5o/image/upload/v1/demo/sanctum-studio-logo.png',
+      null,
     brandColor: '#6D28D9',
     status: 'active',
     createdAt: at(-200),
@@ -544,7 +550,7 @@ async function main(): Promise<void> {
       id,
       agencyId,
       name: c.name,
-      logoUrl: `https://res.cloudinary.com/dkqo3uz5o/image/upload/v1/demo/${c.key}-logo.png`,
+      logoUrl: null,
       brandColor: c.brandColor,
       handlesJson: JSON.stringify(c.handles),
       contactEmail: c.contactEmail,
@@ -1734,7 +1740,7 @@ async function main(): Promise<void> {
       category: 'design',
       clientId: clientIds.bloom,
       projectId: P.bloomLaunch,
-      fileUrl: 'https://res.cloudinary.com/dkqo3uz5o/image/upload/v1/demo/ad-creative-v2.png',
+      fileUrl: 'https://res.cloudinary.com/demo/image/upload/sample.jpg',
       publicId: 'demo/ad-creative-v2',
       resourceType: 'image',
       format: 'png',
@@ -1867,7 +1873,7 @@ async function main(): Promise<void> {
       clientId: m.clientId,
       postId: m.postId,
       cloudinaryPublicId: m.publicId,
-      secureUrl: 'https://res.cloudinary.com/dkqo3uz5o/image/upload/v1/demo/sample.jpg',
+      secureUrl: 'https://res.cloudinary.com/demo/image/upload/sample.jpg',
       resourceType: 'image',
       format: 'jpg',
       bytes: m.bytes,
