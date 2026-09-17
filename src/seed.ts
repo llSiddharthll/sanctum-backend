@@ -2233,10 +2233,10 @@ async function main(): Promise<void> {
   const credRows: Array<[string, string, string, string]> = [
     ['owner@sanctum.test', 'Sanctum@123', 'owner — Arjun Mehta', 'Full access (agency owner, immutable)'],
     ['admin@sanctum.test', 'Sanctum@123', 'admin — Priya Sharma', 'All modules incl. finance & settings'],
-    ['manager@sanctum.test', 'Sanctum@123', 'member + Manager role', 'Delivery; no finance/settings'],
-    ['emp1@sanctum.test', 'Sanctum@123', 'member + Employee role', 'Sneha Iyer — edit tasks/calendar/docs'],
-    ['emp2@sanctum.test', 'Sanctum@123', 'member + Employee role', 'Vikram Rao — edit tasks/calendar/docs'],
-    ['emp3@sanctum.test', 'Sanctum@123', 'member + Employee role', 'Ananya Gupta — edit tasks/calendar/docs'],
+    ['manager@sanctum.test', 'Sanctum@123', 'Manager role', 'Delivery; no finance/settings'],
+    ['emp1@sanctum.test', 'Sanctum@123', 'Employee role', 'Sneha Iyer — edit tasks/calendar/docs'],
+    ['emp2@sanctum.test', 'Sanctum@123', 'Employee role', 'Vikram Rao — edit tasks/calendar/docs'],
+    ['emp3@sanctum.test', 'Sanctum@123', 'Employee role', 'Ananya Gupta — edit tasks/calendar/docs'],
     ['client1@sanctum.test', 'Sanctum@123', 'client — Bloom Digital', 'Portal: ALL of Bloom’s projects'],
     ['client2@sanctum.test', 'Sanctum@123', 'client — Aurora Cafe', 'Portal: scoped to ONE project (Cafe Rebrand)'],
   ];

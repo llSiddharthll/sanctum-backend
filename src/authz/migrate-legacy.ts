@@ -22,6 +22,7 @@ import {
 } from '../db/schema.js';
 import {
   closeOverRequires,
+  EMPLOYEE_LEVELS,
   grantsFromLegacy,
   LEGACY_LEVELS,
   LEGACY_MODULES,
@@ -73,13 +74,22 @@ function parseRoleDefaults(raw: string | null | undefined): { admin: LevelMap; m
   }
 }
 
-/** Legacy resolvePermissions: user › custom role › agency default › manage; finance/business none for non-owners. */
-function effectiveLevels(role: LegacyRole, layers: LevelMap[]): Record<LegacyModule, LegacyLevel> {
+/**
+ * Legacy resolvePermissions: user › custom role › agency default › fallback;
+ * finance/business none for non-owners. The fallback is the legacy built-in
+ * `manage` unless a baseline is given (legacy members use the Employee baseline:
+ * "member" and "employee" are the same role in the new model).
+ */
+function effectiveLevels(
+  role: LegacyRole,
+  layers: LevelMap[],
+  baseline?: LevelMap,
+): Record<LegacyModule, LegacyLevel> {
   const out = {} as Record<LegacyModule, LegacyLevel>;
   for (const m of LEGACY_MODULES) {
     if (role === 'owner') out[m] = 'manage';
     else if (role === 'client') out[m] = 'none';
-    else out[m] = layers.find((l) => l[m] !== undefined)?.[m] ?? 'manage';
+    else out[m] = layers.find((l) => l[m] !== undefined)?.[m] ?? (baseline ? (baseline[m] ?? 'none') : 'manage');
   }
   if (role !== 'owner') {
     out.finance = 'none';
@@ -128,30 +138,15 @@ export async function migrateAgency(agencyId: string): Promise<void> {
   const usersWithProjectRows = new Set(clientProjectRows.map((r) => r.userId));
 
   const adminLevels = effectiveLevels('admin', [defaults.admin]);
-  const memberLevels = effectiveLevels('member', [defaults.member]);
+  // "Member" and "Employee" are one role: legacy members become Employees. The
+  // agency's customised member defaults (if any) shape its Employee role;
+  // modules it never set use the Employee baseline.
+  const employeeLevels = effectiveLevels('member', [defaults.member], EMPLOYEE_LEVELS);
   const adminGrants = closeOverRequires(grantsFromLegacy({ role: 'admin', levels: adminLevels }), 'staff');
-  const memberGrants = closeOverRequires(grantsFromLegacy({ role: 'member', levels: memberLevels }), 'staff');
+  const employeeGrants = closeOverRequires(grantsFromLegacy({ role: 'member', levels: employeeLevels }), 'staff');
 
   await db.transaction(async (tx) => {
-    const sys = await ensureSystemRoles(tx, agencyId, { admin: adminGrants });
-
-    // Legacy "member" defaults become a custom role so existing members keep access.
-    let memberRoleId: string | null = null;
-    const needsMemberRole = agencyUsers.some(
-      (u) => u.role === 'member' && !(u.customRoleId && custom.some((c) => c.id === u.customRoleId)),
-    );
-    if (needsMemberRole) {
-      memberRoleId = await createRole(tx, {
-        agencyId,
-        name: 'Member',
-        description: 'Migrated from the previous default member access.',
-        kind: 'custom',
-        actorType: 'staff',
-        colorToken: 'slate',
-        templateKey: 'legacy_member',
-        grants: memberGrants,
-      });
-    }
+    const sys = await ensureSystemRoles(tx, agencyId, { admin: adminGrants, employee: employeeGrants });
 
     const reserved = new Set(['owner', 'administrator', 'employee', 'member']);
     const customRoleIds = new Map<string, { id: string; grants: Grant[] }>();
@@ -214,19 +209,25 @@ export async function migrateAgency(agencyId: string): Promise<void> {
         roleId = sys.admin;
         roleGrants = adminGrants;
       } else {
-        roleId = memberRoleId!;
-        roleGrants = memberGrants;
+        roleId = sys.employee;
+        roleGrants = employeeGrants;
       }
       await assignRoles(tx, { agencyId, userId: u.id, roleIds: [roleId] });
       await tx.update(users).set({ kind: 'staff' }).where(eq(users.id, u.id));
 
       if (legacyRole !== 'owner' && u.permissionsJson) {
         const customRow = custom.find((c) => c.id === u.customRoleId);
-        const levels = effectiveLevels(legacyRole, [
-          parseLevels(u.permissionsJson),
-          parseLevels(customRow?.permissionsJson),
-          legacyRole === 'admin' ? defaults.admin : defaults.member,
-        ]);
+        const levels = effectiveLevels(
+          legacyRole,
+          [
+            parseLevels(u.permissionsJson),
+            parseLevels(customRow?.permissionsJson),
+            legacyRole === 'admin' ? defaults.admin : defaults.member,
+          ],
+          // Plain members are Employees: modules they never had set follow the
+          // Employee baseline, so only deliberate per-user settings become exceptions.
+          legacyRole === 'member' && !customRow ? EMPLOYEE_LEVELS : undefined,
+        );
         const expected = closeOverRequires(
           dedupeGrants(grantsFromLegacy({ role: legacyRole, levels })),
           'staff',

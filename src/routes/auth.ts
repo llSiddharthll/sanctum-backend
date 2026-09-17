@@ -617,7 +617,7 @@ authRouter.get('/me', authenticate, async (req, res) => {
 
   // ---- Legacy fields (old app builds). TODO(authz phase 10): remove. ----
   const persona = legacyPersona(actor, user.role);
-  const legacyRoleName = roleRows[0]?.name ?? 'Member';
+  const legacyRoleName = roleRows[0]?.name ?? 'Employee';
 
   ok(res, {
     user: {

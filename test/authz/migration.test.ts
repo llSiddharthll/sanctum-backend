@@ -105,14 +105,21 @@ describe('legacy RBAC → roles/grants migration', () => {
     expect(gs.has('invoices.view')).toBe(false);
   });
 
-  it('member gets the agency member defaults (clients view-only, everything else manage)', async () => {
+  it('members become Employees (no separate Member role); agency member defaults shape the Employee role', async () => {
     const gs = await grants(ids.member);
     expect(gs.has('clients.view')).toBe(true);
-    expect(gs.has('clients.update')).toBe(false);
-    expect(gs.has('projects.delete')).toBe(true);
-    expect(gs.has('users.invite')).toBe(false); // was owner/admin only
-    const roleRows = await db.select({ name: roles.name }).from(userRoles).innerJoin(roles, eq(roles.id, userRoles.roleId)).where(eq(userRoles.userId, ids.member));
-    expect(roleRows.map((r) => r.name)).toEqual(['Member']);
+    expect(gs.has('clients.update')).toBe(false); // agency default clients: view
+    expect(gs.has('tasks.create')).toBe(true); // Employee baseline
+    expect(gs.has('projects.delete')).toBe(false); // Employee baseline, not legacy "manage everything"
+    expect(gs.has('users.invite')).toBe(false);
+    const roleRows = await db
+      .select({ key: roles.key, name: roles.name })
+      .from(userRoles)
+      .innerJoin(roles, eq(roles.id, userRoles.roleId))
+      .where(eq(userRoles.userId, ids.member));
+    expect(roleRows).toEqual([{ key: 'employee', name: 'Employee' }]);
+    const memberRoles = await db.select({ id: roles.id }).from(roles).where(eq(roles.name, 'Member'));
+    expect(memberRoles).toEqual([]);
   });
 
   it('per-user overrides are preserved as exceptions, including the security fix for view-level tasks', async () => {
@@ -120,8 +127,8 @@ describe('legacy RBAC → roles/grants migration', () => {
     expect(gs.has('projects.view')).toBe(true);
     expect(gs.has('projects.update')).toBe(false);
     expect(gs.scopes('tasks.update').sort()).toEqual(['assigned', 'own']);
-    expect(gs.has('attendance.check_in')).toBe(false);
-    expect(gs.has('clients.view')).toBe(true); // still from member defaults
+    expect(gs.has('attendance.check_in')).toBe(false); // explicit attendance: none
+    expect(gs.has('clients.view')).toBe(true); // agency member defaults
   });
 
   it('custom roles become custom roles; finance never leaks through them', async () => {

@@ -845,7 +845,7 @@ For each agency:
 
 1. **Create system roles** from §F.2.
    - Administrator's grants are computed from the agency's stored admin role defaults. Legacy level → permissions are mapped with the table in `catalog.ts` (`legacy` field per permission; see J.2), then the admin-only privileges admins had through role checks are added.
-2. **Create the custom role "Member (migrated)"** from the agency's member defaults (unset ⇒ `manage`, faithfully reproducing today's default). Existing members keep exactly their access. New invites default to Employee.
+2. **Legacy members become Employees.** "Member" and "Employee" are the same role; there is no separate Member role. The agency's Employee system role is built from its stored member defaults, with unset modules taking the Employee baseline (not the legacy built-in `manage`). Deliberate per-user module settings become exceptions. New invites also default to Employee.
 3. **Migrate each `custom_roles` row** to a custom staff role. The grants come from its level map. If `baseRole=admin`, the admin-only privileges are also included. The role gets a `name` suffix only on collision.
 4. **Assign roles to users:**
 
@@ -853,7 +853,7 @@ For each agency:
    |---|---|
    | owner | Owner |
    | admin, no custom role | Administrator |
-   | member, no custom role | Member (migrated) |
+   | member, no custom role | Employee |
    | has a custom role | the migrated custom role |
    | client | `client_approver` or `client_reviewer`, from the brand's `portalRole` |
 

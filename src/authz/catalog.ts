@@ -1002,7 +1002,8 @@ const MANAGER_LEVELS: Partial<Record<LegacyModule, LegacyLevel>> = {
   attendance: 'manage', calendar: 'manage', messages: 'manage', documents: 'manage',
   sheets: 'manage', ai: 'manage',
 };
-const EMPLOYEE_LEVELS: Partial<Record<LegacyModule, LegacyLevel>> = {
+/** Employee baseline (legacy module levels); also the migration baseline for legacy members. */
+export const EMPLOYEE_LEVELS: Partial<Record<LegacyModule, LegacyLevel>> = {
   dashboard: 'view', clients: 'view', projects: 'edit', team: 'view',
   attendance: 'edit', calendar: 'edit', messages: 'edit', documents: 'edit',
   sheets: 'edit', ai: 'edit',
