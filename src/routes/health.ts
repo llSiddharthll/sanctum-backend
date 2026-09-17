@@ -1,6 +1,12 @@
 import { Router } from 'express';
 import { libsql } from '../db/client.js';
+import { emailEnabled } from '../env.js';
 
+/**
+ * Public liveness probe (unauthenticated by design). It reports only coarse
+ * status. The former `?test_smtp=1` SMTP verification was removed: it let
+ * anyone trigger outbound SMTP logins and leaked provider error messages.
+ */
 export const healthRouter = Router();
 
 healthRouter.get('/', async (_req, res) => {
@@ -11,29 +17,6 @@ healthRouter.get('/', async (_req, res) => {
   } catch {
     database = 'down';
   }
-  
-  const { emailEnabled, env } = await import('../env.js');
-  let smtpStatus = 'skip';
-  let smtpError = null;
-  if (_req.query.test_smtp === '1' && emailEnabled) {
-    try {
-      const nodemailer = await import('nodemailer');
-      const transporter = nodemailer.createTransport({
-        host: env.SMTP_HOST,
-        port: env.SMTP_PORT,
-        secure: env.SMTP_PORT === 465,
-        auth: {
-          user: env.EMAIL_USER,
-          pass: (env.EMAIL_PASS ?? '').replace(/\s+/g, ''),
-        },
-      });
-      await transporter.verify();
-      smtpStatus = 'ok';
-    } catch (err) {
-      smtpStatus = 'error';
-      smtpError = (err as Error)?.message || String(err);
-    }
-  }
 
   // Always 200 for liveness; report db status in the body.
   res.status(200).json({
@@ -42,8 +25,6 @@ healthRouter.get('/', async (_req, res) => {
     uptime: Math.floor(process.uptime()),
     db: database,
     email: emailEnabled,
-    smtp: smtpStatus,
-    smtpError,
     time: new Date().toISOString(),
   });
 });

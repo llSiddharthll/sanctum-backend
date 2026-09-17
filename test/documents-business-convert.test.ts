@@ -76,14 +76,17 @@ describe('documents → proposals / agreements / invoices', () => {
 
     // A document proposal has no review token, but the client can request
     // changes OR approve it in place from the portal (by id).
+    // A decided proposal can't be answered again, so accept a second upload.
     const reject = await clientPost(`/client/proposals/${propId}/reject`, { reason: 'Lower the price' });
     expect(reject.status).toBe(200);
     expect(data(await clientGet('/client/proposals')).find((p: any) => p.id === propId).status).toBe('rejected');
 
-    const accept = await clientPost(`/client/proposals/${propId}/accept`);
+    const doc2 = await uploadDoc(owner, { category: 'proposal', clientId, clientVisible: true });
+    const prop2 = doc2.converted.id;
+    const accept = await clientPost(`/client/proposals/${prop2}/accept`);
     expect(accept.status).toBe(200);
     const after = data(await clientGet('/client/proposals'));
-    expect(after.find((p: any) => p.id === propId).status).toBe('accepted');
+    expect(after.find((p: any) => p.id === prop2).status).toBe('accepted');
   });
 
   it('agreement upload (client-visible) → agency + client agreement tab', async () => {
@@ -106,7 +109,7 @@ describe('documents → proposals / agreements / invoices', () => {
     const sign = await clientPost(`/client/agreements/${agrId}/sign`, {
       signerName: 'Client Boss',
       signerEmail: 'boss@client.test',
-      signatureDataUrl: 'signed:Client Boss',
+      signatureDataUrl: 'data:image/png;base64,iVBORw0KGgo=',
     });
     expect(sign.status).toBe(200);
   });

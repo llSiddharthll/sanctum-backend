@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import supertest from 'supertest';
-import { app, BASE, signupAgency, data } from './helpers';
+import { app, BASE, signupAgency, data, systemRoleIdFor } from './helpers';
 
 /** Portal requests carry a Bearer token, not a session cookie. */
 function portalGet(token: string, path: string) {
@@ -71,9 +71,11 @@ describe('project documents — internal vs client-facing + portal exposure', ()
     ).toEqual(['Final Deliverable.pdf', 'Internal Brief.pdf']);
 
     // Portal resolve: only client-facing docs, never the internal one.
+    // A link role that can view documents (the default share-link role may not).
+    const roleId = await systemRoleIdFor(owner, 'client_approver');
     const tokRes = await owner
       .post(`${BASE}/clients/${clientId}/portal-tokens`)
-      .send({});
+      .send({ roleId });
     const token = data(tokRes).token as string;
     expect(typeof token).toBe('string');
 

@@ -13,8 +13,12 @@ import {
   sheetPublications,
 } from '../db/schema.js';
 import { newId } from '../lib/ids.js';
-import { AppError, notFound } from '../lib/errors.js';
+import { AppError, forbidden, notFound } from '../lib/errors.js';
 import { notify } from './notifications.js';
+import type { StaffActor } from '../authz/actor.js';
+import { canOrg, check, requirePermission, type ObjectFacts } from '../authz/engine.js';
+import { clientFacts, isAssignedToClient } from '../authz/policies/clients.js';
+import { isProjectMember, postFactsMany, taskFactsMany } from '../authz/policies/sheets.js';
 
 /**
  * Publish a "content calendar" sheet: each row with a date becomes a content
@@ -22,8 +26,6 @@ import { notify } from './notifications.js';
  * (due that date), linked by task.postId. The assignee is notified. Idempotent
  * — already-published rows (tracked in data.publishedRows) are skipped.
  */
-
-type Ctx = { agencyId: string; userId: string };
 
 function colLetter(n: number): string {
   let s = '';
@@ -202,11 +204,40 @@ interface PublishedRec {
   taskId: string;
 }
 
+/** One calendar row, resolved before any write (so authorization is all-or-nothing). */
+interface RowPlan {
+  row: number;
+  date: Date;
+  title: string;
+  caption: string;
+  rawType: string;
+  postType: (typeof POST_TYPES)[number];
+  taskStatus: TaskStatus;
+  platformsJson: string;
+  assignee: string;
+  assignees: string[];
+  rec?: PublishedRec;
+  /** true when `rec` came from the legacy in-JSON tracking (not yet in the table). */
+  adopted: boolean;
+}
+
+/**
+ * Publish a calendar sheet as `actor`. The caller authorized `sheets.publish`
+ * on the sheet; this function enforces the CROSS-MODULE permissions before any
+ * write (docs/authorization/README.md §G.2 "Sheets publish"):
+ *  - auto-creating the host project → projects.create
+ *  - creating posts → posts.create on the sheet's client (clientFacts)
+ *  - creating tasks → tasks.create on the host project
+ *  - re-publishing rows that overwrite existing posts/tasks → posts.update /
+ *    tasks.update on each of those objects
+ * Task assignees must be active staff; other picks are ignored.
+ */
 export async function publishCalendarSheet(
-  ctx: Ctx,
+  actor: StaffActor,
   sheetId: string,
   origin: string,
 ): Promise<PublishResult> {
+  const ctx = { agencyId: actor.agencyId, userId: actor.userId };
   const [sheet] = await db
     .select()
     .from(sheets)
@@ -235,22 +266,23 @@ export async function publishCalendarSheet(
       'Link this calendar to a client before publishing (it creates that client’s posts).',
     );
   }
+  const clientId = sheet.clientId;
 
   // Verify the client belongs to the agency.
   const [client] = await db
     .select({ id: clients.id, name: clients.name })
     .from(clients)
-    .where(and(eq(clients.id, sheet.clientId), eq(clients.agencyId, ctx.agencyId)))
+    .where(and(eq(clients.id, clientId), eq(clients.agencyId, ctx.agencyId)))
     .limit(1);
   if (!client) {
     throw new AppError('VALIDATION_ERROR', 'The linked client no longer exists.');
   }
 
-  // Resolve a project to host the tasks. A project is optional in the picker —
-  // many clients don't have one yet — so if none is linked (or the link is
-  // stale) we reuse the client's existing project, else auto-create a
-  // "Content Calendar" project and link it back to the sheet for next time.
-  let projectId = sheet.projectId;
+  // Resolve a project to host the tasks (no writes yet). A project is optional
+  // in the picker — many clients don't have one yet — so if none is linked (or
+  // the link is stale) we reuse the client's existing project, else a
+  // "Content Calendar" project is auto-created below.
+  let projectId: string | null = sheet.projectId;
   if (projectId) {
     const [project] = await db
       .select({ id: projects.id })
@@ -263,41 +295,11 @@ export async function publishCalendarSheet(
     const [existing] = await db
       .select({ id: projects.id })
       .from(projects)
-      .where(
-        and(eq(projects.agencyId, ctx.agencyId), eq(projects.clientId, sheet.clientId)),
-      )
+      .where(and(eq(projects.agencyId, ctx.agencyId), eq(projects.clientId, clientId)))
       .limit(1);
-    if (existing) {
-      projectId = existing.id;
-    } else {
-      projectId = newId('prj');
-      await db.insert(projects).values({
-        id: projectId,
-        agencyId: ctx.agencyId,
-        clientId: sheet.clientId,
-        name: (sheet.title || '').trim() || 'Content Calendar',
-        type: 'retainer',
-        status: 'active',
-        createdBy: ctx.userId,
-      });
-      // The publisher owns the auto-created project (so it's visible to them).
-      await db
-        .insert(projectMembers)
-        .values({
-          id: newId('prm'),
-          agencyId: ctx.agencyId,
-          projectId,
-          userId: ctx.userId,
-          role: 'owner',
-        })
-        .onConflictDoNothing();
-    }
-    // Link the resolved project back to the sheet for subsequent publishes.
-    await db
-      .update(sheets)
-      .set({ projectId, updatedAt: new Date() })
-      .where(eq(sheets.id, sheetId));
+    if (existing) projectId = existing.id;
   }
+  const createProject = !projectId;
 
   const cols = data.columns;
   const find = (pred: (c: SheetColumn) => boolean) => cols.find(pred);
@@ -366,7 +368,7 @@ export async function publishCalendarSheet(
   // re-publish reconciles the existing entries instead of duplicating them.
   const legacyRows = new Set<number>(data.publishedRows ?? []);
   const legacyByTitle = new Map<string, PublishedRec[]>();
-  if (pubByRow.size === 0 && legacyRows.size) {
+  if (projectId && pubByRow.size === 0 && legacyRows.size) {
     const projTasks = await db
       .select({ id: projectTasks.id, postId: projectTasks.postId, title: projectTasks.title })
       .from(projectTasks)
@@ -390,7 +392,7 @@ export async function publishCalendarSheet(
         .where(
           and(
             eq(calendarReservations.agencyId, ctx.agencyId),
-            eq(calendarReservations.clientId, sheet.clientId),
+            eq(calendarReservations.clientId, clientId),
           ),
         )
     )
@@ -398,13 +400,20 @@ export async function publishCalendarSheet(
       .filter((d): d is string => !!d),
   );
 
-  // Valid agency users cache for assignee validation.
-  const agencyUsers = new Set(
+  // Assignees must be ACTIVE STAFF of the agency (never client users).
+  const staffIds = new Set(
     (
-      await db.select({ id: users.id }).from(users).where(eq(users.agencyId, ctx.agencyId))
+      await db
+        .select({ id: users.id })
+        .from(users)
+        .where(
+          and(eq(users.agencyId, ctx.agencyId), eq(users.kind, 'staff'), eq(users.status, 'active')),
+        )
     ).map((u) => u.id),
   );
 
+  // ---- Pass 1: plan every row (no writes) ---------------------------------
+  const plans: RowPlan[] = [];
   for (let row = 1; row < totalRows; row++) {
     const date = parseDate(val(row, dateCol));
     if (!date) {
@@ -425,19 +434,10 @@ export async function publishCalendarSheet(
     const rawType = String(val(row, typeCol) ?? '')
       .trim()
       .toLowerCase();
-    const postType = toPostType(rawType);
-    const taskStatus = toTaskStatus(val(row, statusCol));
     // Platform + Assignee are multi-select in the grid: one cell can hold
     // several comma-separated choices.
     const platforms = splitMulti(val(row, platformCol));
-    const platformsJson = JSON.stringify(platforms);
-    const pickedAssignees = splitMulti(val(row, assigneeCol)).filter((u) =>
-      agencyUsers.has(u),
-    );
-    // The task's own assigneeId is single-valued, so the first pick owns it;
-    // every pick is written to the many-to-many task_assignees table.
-    const assignee = pickedAssignees[0] ?? ctx.userId;
-    const assignees = pickedAssignees.length ? pickedAssignees : [ctx.userId];
+    const pickedAssignees = splitMulti(val(row, assigneeCol)).filter((u) => staffIds.has(u));
 
     // Already published? Via the durable table, or adopted from a legacy row.
     const existing = pubByRow.get(row);
@@ -448,8 +448,106 @@ export async function publishCalendarSheet(
       rec = legacyByTitle.get(caption)?.shift();
     }
 
+    plans.push({
+      row,
+      date,
+      title,
+      caption,
+      rawType,
+      postType: toPostType(rawType),
+      taskStatus: toTaskStatus(val(row, statusCol)),
+      platformsJson: JSON.stringify(platforms),
+      // The task's own assigneeId is single-valued, so the first pick owns it;
+      // every pick is written to the many-to-many task_assignees table.
+      assignee: pickedAssignees[0] ?? ctx.userId,
+      assignees: pickedAssignees.length ? pickedAssignees : [ctx.userId],
+      rec,
+      adopted: !!rec && !existing,
+    });
+  }
+
+  // ---- Authorization: every target permission, before any write ------------
+  const creates = plans.filter((p) => !p.rec);
+  const updates = plans.filter((p): p is RowPlan & { rec: PublishedRec } => !!p.rec);
+
+  if (creates.length) {
+    const cf = await clientFacts(actor, clientId);
+    if (!check(actor, 'posts.create', cf)) {
+      throw forbidden("Publishing creates posts for this client; you don't have permission to create posts there.");
+    }
+    if (createProject) {
+      requirePermission(actor, 'projects.create', 'Publishing needs a project for its tasks; you don\'t have permission to create projects.');
+      // The publisher becomes a member of the auto-created project.
+      if (!canOrg(actor, 'tasks.create') && !actor.grants.hasScope('tasks.create', 'project')) {
+        throw forbidden("Publishing creates tasks; you don't have permission to create tasks.");
+      }
+    } else {
+      const facts: ObjectFacts = {
+        agencyId: ctx.agencyId,
+        projectId,
+        projectMember: await isProjectMember(actor, projectId!),
+      };
+      if (!check(actor, 'tasks.create', facts)) {
+        throw forbidden("Publishing creates tasks in this project; you don't have permission to create tasks there.");
+      }
+    }
+  }
+  if (updates.length) {
+    const postFacts = await postFactsMany(
+      actor,
+      updates.map((p) => p.rec.postId),
+      (cid) => isAssignedToClient(actor, cid),
+    );
+    const taskFacts = await taskFactsMany(actor, updates.map((p) => p.rec.taskId));
+    for (const f of postFacts.values()) {
+      if (!check(actor, 'posts.update', f)) {
+        throw forbidden("Re-publishing overwrites posts you don't have permission to edit.");
+      }
+    }
+    for (const f of taskFacts.values()) {
+      if (!check(actor, 'tasks.update', f)) {
+        throw forbidden("Re-publishing overwrites tasks you don't have permission to edit.");
+      }
+    }
+  }
+
+  // ---- Pass 2: writes -------------------------------------------------------
+  if (!projectId && creates.length) {
+    projectId = newId('prj');
+    await db.insert(projects).values({
+      id: projectId,
+      agencyId: ctx.agencyId,
+      clientId,
+      name: (sheet.title || '').trim() || 'Content Calendar',
+      type: 'retainer',
+      status: 'active',
+      createdBy: ctx.userId,
+    });
+    // The publisher owns the auto-created project (so it's visible to them).
+    await db
+      .insert(projectMembers)
+      .values({
+        id: newId('prm'),
+        agencyId: ctx.agencyId,
+        projectId,
+        userId: ctx.userId,
+        role: 'owner',
+      })
+      .onConflictDoNothing();
+  }
+  if (projectId && projectId !== sheet.projectId) {
+    // Link the resolved project back to the sheet for subsequent publishes.
+    await db
+      .update(sheets)
+      .set({ projectId, updatedAt: new Date() })
+      .where(and(eq(sheets.id, sheetId), eq(sheets.agencyId, ctx.agencyId)));
+  }
+
+  for (const p of plans) {
+    const { row, date, title, caption, rawType, postType, taskStatus, platformsJson, assignee, assignees } = p;
     try {
-      if (rec) {
+      if (p.rec) {
+        const rec = p.rec;
         // Update the existing post + task to match the (possibly edited) row —
         // this is what corrects a wrong date on re-publish.
         await db
@@ -478,13 +576,13 @@ export async function publishCalendarSheet(
             assignees.map((userId) => ({
               id: newId('tka'),
               agencyId: ctx.agencyId,
-              taskId: rec!.taskId,
+              taskId: rec.taskId,
               userId,
             })),
           )
           .onConflictDoNothing();
         // Record it durably (adopts a legacy row into the table on first pass).
-        if (!existing) {
+        if (p.adopted) {
           await db
             .insert(sheetPublications)
             .values({
@@ -506,8 +604,8 @@ export async function publishCalendarSheet(
       await db.insert(contentPosts).values({
         id: postId,
         agencyId: ctx.agencyId,
-        clientId: sheet.clientId,
-        postType: postType as (typeof POST_TYPES)[number],
+        clientId,
+        postType,
         caption,
         platformsJson,
         scheduledAt: date,
@@ -520,13 +618,14 @@ export async function publishCalendarSheet(
       await db.insert(projectTasks).values({
         id: taskId,
         agencyId: ctx.agencyId,
-        projectId,
+        projectId: projectId!,
         title,
         assigneeId: assignee,
         dueDate: date,
         postId,
         priority: 'medium',
         status: taskStatus,
+        createdBy: ctx.userId,
       });
       await db
         .insert(taskAssignees)
@@ -586,7 +685,7 @@ export async function publishCalendarSheet(
   await db
     .update(sheets)
     .set({ data: JSON.stringify(nextData), updatedAt: new Date() })
-    .where(eq(sheets.id, sheetId));
+    .where(and(eq(sheets.id, sheetId), eq(sheets.agencyId, ctx.agencyId)));
 
   return result;
 }

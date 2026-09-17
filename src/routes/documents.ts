@@ -1,6 +1,6 @@
-import { Router } from 'express';
+import { Router, type Request } from 'express';
 import { z } from 'zod';
-import { and, asc, desc, eq, isNull, like } from 'drizzle-orm';
+import { and, asc, desc, eq, isNull, like, type SQL } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   clients,
@@ -14,16 +14,49 @@ import {
 } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
-import { badRequest, notFound } from '../lib/errors.js';
-import { requireAuth } from '../middleware/auth.js';
-import { requireModuleRW } from '../middleware/permissions.js';
-import { getAuth } from '../middleware/tenant.js';
+import { badRequest, forbidden, notFound } from '../lib/errors.js';
 import { signDocumentUpload, deleteAsset } from '../services/storage.js';
 import { uploadOrigin } from '../services/local-storage.js';
+import { audit } from '../services/audit.js';
+import { authenticate, getActor, requires } from '../authz/http.js';
+import { authorize, requirePermission, type ObjectFacts } from '../authz/engine.js';
+import type { StaffActor } from '../authz/actor.js';
+import { requireInAgency } from '../authz/tenancy.js';
+import {
+  BUSINESS_CATEGORY_PERMISSION,
+  OWNER_ONLY_CATEGORIES,
+  assertDocumentStorage,
+  canViewProject,
+  documentCapabilities,
+  documentFactsFrom,
+  documentListFilter,
+  folderCapabilities,
+  folderFacts,
+  folderFactsFrom,
+  isAgencyStorageKey,
+  projectLinkFilter,
+  visibleDocument,
+} from '../authz/policies/documents.js';
 
+/**
+ * Documents hub + folders (staff surface; client-side access goes through the
+ * client portal routers).
+ *
+ * Permissions (docs/authorization/README.md §D.7, §G.2):
+ *  - documents.view (hidden docs also need documents.view_hidden; project-bound
+ *    docs need projects.view on the project)
+ *  - documents.upload; business categories (proposal/agreement/contract/nda/
+ *    invoice) additionally need proposals.create / agreements.create /
+ *    invoices.create (otherwise 403 — we REJECT rather than silently store a
+ *    plain document) and documents.hide_from_team (they are always hidden)
+ *  - documents.update / documents.delete (own = uploader, organization)
+ *  - documents.share_with_client to make a document/folder client-visible
+ *  - documents.hide_from_team to hide a document (or move it into a hidden category)
+ *  - folders.create / folders.update / folders.delete
+ *  - storage keys must live under sanctum/<agencyId>/ (cross-tenant delete fix)
+ */
 export const documentsRouter = Router();
-documentsRouter.use(requireAuth);
-documentsRouter.use(requireModuleRW('documents'));
+documentsRouter.use(authenticate);
 
 const DOCUMENT_CATEGORIES = [
   'contract',
@@ -38,17 +71,6 @@ const DOCUMENT_CATEGORIES = [
   'misc',
 ] as const;
 
-/**
- * Business/legal categories are OWNER-ONLY: any document tagged with one of
- * these auto-hides from the team, regardless of the manual toggle.
- */
-const OWNER_ONLY_CATEGORIES = new Set([
-  'proposal',
-  'agreement',
-  'contract',
-  'nda',
-  'invoice',
-]);
 /** Categories that spawn a Proposal record on upload. */
 const PROPOSAL_CATEGORIES = new Set(['proposal']);
 /** Categories that spawn an Agreement record on upload (needs a client). */
@@ -57,8 +79,16 @@ const AGREEMENT_CATEGORIES = new Set(['agreement', 'contract', 'nda']);
 const INVOICE_CATEGORIES = new Set(['invoice']);
 const RESOURCE_TYPES = ['image', 'raw', 'video'] as const;
 
+/** This router is the agency (staff) surface. */
+function staffActor(req: Request): StaffActor {
+  const a = getActor(req);
+  if (a.type !== 'staff') throw forbidden('Use the client portal for documents.');
+  return a;
+}
+
 const documentSelection = {
   id: documents.id,
+  agencyId: documents.agencyId,
   name: documents.name,
   category: documents.category,
   clientId: documents.clientId,
@@ -83,6 +113,7 @@ const documentSelection = {
 
 type DocumentRow = {
   id: string;
+  agencyId: string;
   name: string;
   category: string;
   clientId: string | null;
@@ -105,7 +136,7 @@ type DocumentRow = {
   uploadedByName: string | null;
 };
 
-function serializeDocument(d: DocumentRow) {
+function serializeDocument(actor: StaffActor, d: DocumentRow) {
   return {
     id: d.id,
     name: d.name,
@@ -128,55 +159,38 @@ function serializeDocument(d: DocumentRow) {
     uploadedByName: d.uploadedByName,
     createdAt: toIso(d.createdAt),
     updatedAt: toIso(d.updatedAt),
+    capabilities: documentCapabilities(actor, documentFactsFrom(d)),
   };
 }
 
-/** Verify a client belongs to the caller's agency, or throw 404. */
-async function requireAgencyClient(
-  ctx: ReturnType<typeof getAuth>,
-  clientId: string,
-): Promise<void> {
+/** Joined row for a document id already authorized for the actor. */
+async function loadDocumentRow(actor: StaffActor, documentId: string): Promise<DocumentRow> {
   const [row] = await db
-    .select({ id: clients.id })
-    .from(clients)
-    .where(and(eq(clients.id, clientId), eq(clients.agencyId, ctx.agencyId)))
+    .select(documentSelection)
+    .from(documents)
+    .leftJoin(clients, eq(clients.id, documents.clientId))
+    .leftJoin(projects, eq(projects.id, documents.projectId))
+    .leftJoin(users, eq(users.id, documents.uploadedBy))
+    .where(and(eq(documents.id, documentId), eq(documents.agencyId, actor.agencyId)))
     .limit(1);
-  if (!row) throw notFound('Client not found.');
+  if (!row) throw notFound('Document not found.');
+  return row as DocumentRow;
 }
 
-/** Verify a project belongs to the caller's agency, or throw 404. */
-async function requireAgencyProject(
-  ctx: ReturnType<typeof getAuth>,
-  projectId: string,
-): Promise<void> {
-  const [row] = await db
-    .select({ id: projects.id })
-    .from(projects)
-    .where(and(eq(projects.id, projectId), eq(projects.agencyId, ctx.agencyId)))
-    .limit(1);
-  if (!row) throw notFound('Project not found.');
+/** A document the actor can see, authorized for `permission` (404 when invisible). */
+async function authorizeDocument(actor: StaffActor, documentId: string, permission: string) {
+  const loaded = await visibleDocument(actor, documentId);
+  if (!loaded) throw notFound('Document not found.');
+  authorize(actor, permission, loaded.facts, { view: 'documents.view' });
+  return loaded;
 }
 
-/** Verify a folder belongs to the caller's agency, returning it, or throw 404. */
-async function requireAgencyFolder(
-  ctx: ReturnType<typeof getAuth>,
-  folderId: string,
-): Promise<typeof documentFolders.$inferSelect> {
-  const [row] = await db
-    .select()
-    .from(documentFolders)
-    .where(
-      and(
-        eq(documentFolders.id, folderId),
-        eq(documentFolders.agencyId, ctx.agencyId),
-      ),
-    )
-    .limit(1);
-  if (!row) throw notFound('Folder not found.');
-  return row;
+/** Project references require projects.view on that project (404 otherwise). */
+async function requireViewableProject(actor: StaffActor, projectId: string): Promise<void> {
+  if (!(await canViewProject(actor, projectId))) throw notFound('Project not found.');
 }
 
-function serializeFolder(f: typeof documentFolders.$inferSelect) {
+function serializeFolder(actor: StaffActor, f: typeof documentFolders.$inferSelect) {
   return {
     id: f.id,
     name: f.name,
@@ -187,7 +201,14 @@ function serializeFolder(f: typeof documentFolders.$inferSelect) {
     createdBy: f.createdBy,
     createdAt: toIso(f.createdAt),
     updatedAt: toIso(f.updatedAt),
+    capabilities: folderCapabilities(actor, folderFactsFrom(f)),
   };
+}
+
+async function requireFolder(actor: StaffActor, folderId: string) {
+  const loaded = await folderFacts(actor, folderId);
+  if (!loaded) throw notFound('Folder not found.');
+  return loaded;
 }
 
 /**
@@ -196,7 +217,7 @@ function serializeFolder(f: typeof documentFolders.$inferSelect) {
  * against a runaway loop with a depth cap.
  */
 async function wouldCreateCycle(
-  ctx: ReturnType<typeof getAuth>,
+  actor: StaffActor,
   folderId: string,
   parentId: string,
 ): Promise<boolean> {
@@ -209,7 +230,7 @@ async function wouldCreateCycle(
       .where(
         and(
           eq(documentFolders.id, cursor),
-          eq(documentFolders.agencyId, ctx.agencyId),
+          eq(documentFolders.agencyId, actor.agencyId),
         ),
       )
       .limit(1);
@@ -218,33 +239,12 @@ async function wouldCreateCycle(
   return false;
 }
 
-/** Fetch a document scoped to the caller's agency (with joins), or throw 404. */
-async function getScopedDocument(
-  ctx: ReturnType<typeof getAuth>,
-  documentId: string,
-  opts?: { allowHidden?: boolean },
-): Promise<DocumentRow> {
-  const [row] = await db
-    .select(documentSelection)
-    .from(documents)
-    .leftJoin(clients, eq(clients.id, documents.clientId))
-    .leftJoin(projects, eq(projects.id, documents.projectId))
-    .leftJoin(users, eq(users.id, documents.uploadedBy))
-    .where(
-      and(eq(documents.id, documentId), eq(documents.agencyId, ctx.agencyId)),
-    )
-    .limit(1);
-  if (!row) throw notFound('Document not found.');
-  const r = row as DocumentRow;
-  // Owner-only docs are invisible to staff on read/edit/delete too.
-  if (!opts?.allowHidden && r.hideFromTeam && ctx.role !== 'owner') {
-    throw notFound('Document not found.');
-  }
-  return r;
+function auditBase(actor: StaffActor, req: Request) {
+  return { agencyId: actor.agencyId, actorType: actor.type, actorId: actor.userId, ip: req.ip };
 }
 
 // ============================================================
-//  GET /documents?category=&clientId=&projectId=&search=
+//  GET /documents?category=&clientId=&projectId=&search= — documents.view
 // ============================================================
 const listQuery = z.object({
   category: z.enum(DOCUMENT_CATEGORIES).optional(),
@@ -261,13 +261,12 @@ function isRootFolderParam(v: string | undefined): boolean {
   return v === '' || v === 'root';
 }
 
-documentsRouter.get('/', async (req, res) => {
-  const ctx = getAuth(req);
+documentsRouter.get('/', requires('documents.view'), async (req, res) => {
+  const actor = staffActor(req);
   const q = listQuery.parse(req.query);
 
-  const filters = [eq(documents.agencyId, ctx.agencyId)];
-  // Owner-only docs (business/legal or manually hidden) are invisible to staff.
-  if (ctx.role !== 'owner') filters.push(eq(documents.hideFromTeam, false));
+  // Tenant + hidden (documents.view_hidden) + project visibility, in SQL.
+  const filters: SQL[] = await documentListFilter(actor);
   if (q.category) filters.push(eq(documents.category, q.category));
   if (q.clientId) filters.push(eq(documents.clientId, q.clientId));
   if (q.projectId) filters.push(eq(documents.projectId, q.projectId));
@@ -291,13 +290,13 @@ documentsRouter.get('/', async (req, res) => {
     .where(and(...filters))
     .orderBy(desc(documents.createdAt));
 
-  ok(res, (rows as DocumentRow[]).map(serializeDocument));
+  ok(res, (rows as DocumentRow[]).map((d) => serializeDocument(actor, d)));
 });
 
 // ============================================================
 //  FOLDERS — organize documents (nestable). client_visible mirrors the
 //  documents flag so a folder can be surfaced in the client portal. NOTE:
-//  these are a DB/UI construct only — Cloudinary paths are unaffected.
+//  these are a DB/UI construct only — storage paths are unaffected.
 // ============================================================
 const folderListQuery = z.object({
   parentId: z.string().optional(),
@@ -305,13 +304,16 @@ const folderListQuery = z.object({
   projectId: z.string().optional(),
 });
 
-// GET /documents/folders?parentId=&clientId=&projectId= — folders at a level.
+// GET /documents/folders?parentId=&clientId=&projectId= — documents.view
 // parentId omitted = every folder (e.g. a move picker); 'root'|'' = root level.
-documentsRouter.get('/folders', async (req, res) => {
-  const ctx = getAuth(req);
+documentsRouter.get('/folders', requires('documents.view'), async (req, res) => {
+  const actor = staffActor(req);
   const q = folderListQuery.parse(req.query);
 
-  const filters = [eq(documentFolders.agencyId, ctx.agencyId)];
+  const filters: SQL[] = [
+    eq(documentFolders.agencyId, actor.agencyId),
+    await projectLinkFilter(actor, documentFolders.projectId),
+  ];
   if (q.clientId) filters.push(eq(documentFolders.clientId, q.clientId));
   if (q.projectId) filters.push(eq(documentFolders.projectId, q.projectId));
   if (q.parentId !== undefined) {
@@ -328,33 +330,35 @@ documentsRouter.get('/folders', async (req, res) => {
     .where(and(...filters))
     .orderBy(asc(documentFolders.name));
 
-  ok(res, rows.map(serializeFolder));
+  ok(res, rows.map((f) => serializeFolder(actor, f)));
 });
+
+const boolish = z
+  .union([z.boolean(), z.literal(0), z.literal(1)])
+  .transform((v) => Boolean(v));
 
 const folderCreateSchema = z.object({
   name: z.string().min(1).max(120),
   parentId: z.string().min(1).nullable().optional(),
   clientId: z.string().min(1).nullable().optional(),
   projectId: z.string().min(1).nullable().optional(),
-  clientVisible: z
-    .union([z.boolean(), z.literal(0), z.literal(1)])
-    .transform((v) => Boolean(v))
-    .optional(),
+  clientVisible: boolish.optional(),
 });
 
-// POST /documents/folders — create a folder at a level.
-documentsRouter.post('/folders', async (req, res) => {
-  const ctx = getAuth(req);
+// POST /documents/folders — folders.create (+ documents.share_with_client when clientVisible)
+documentsRouter.post('/folders', requires('folders.create'), async (req, res) => {
+  const actor = staffActor(req);
   const body = folderCreateSchema.parse(req.body);
 
-  if (body.clientId) await requireAgencyClient(ctx, body.clientId);
-  if (body.projectId) await requireAgencyProject(ctx, body.projectId);
-  if (body.parentId) await requireAgencyFolder(ctx, body.parentId);
+  if (body.clientVisible === true) requirePermission(actor, 'documents.share_with_client');
+  if (body.clientId) await requireInAgency(clients, actor.agencyId, body.clientId, 'Client');
+  if (body.projectId) await requireViewableProject(actor, body.projectId);
+  if (body.parentId) await requireFolder(actor, body.parentId);
 
   const id = newId('folder');
   await db.insert(documentFolders).values({
     id,
-    agencyId: ctx.agencyId,
+    agencyId: actor.agencyId,
     name: body.name,
     parentId: body.parentId ?? null,
     clientId: body.clientId ?? null,
@@ -362,35 +366,36 @@ documentsRouter.post('/folders', async (req, res) => {
     ...(body.clientVisible !== undefined
       ? { clientVisible: body.clientVisible }
       : {}),
-    createdBy: ctx.userId,
+    createdBy: actor.userId,
   });
 
-  const row = await requireAgencyFolder(ctx, id);
-  created(res, serializeFolder(row));
+  const { row } = await requireFolder(actor, id);
+  created(res, serializeFolder(actor, row));
 });
 
 const folderUpdateSchema = z.object({
   name: z.string().min(1).max(120).optional(),
   parentId: z.string().min(1).nullable().optional(),
-  clientVisible: z
-    .union([z.boolean(), z.literal(0), z.literal(1)])
-    .transform((v) => Boolean(v))
-    .optional(),
+  clientVisible: boolish.optional(),
 });
 
-// PATCH /documents/folders/:id — rename, MOVE (parentId), toggle visibility.
-documentsRouter.patch('/folders/:id', async (req, res) => {
-  const ctx = getAuth(req);
+// PATCH /documents/folders/:id — folders.update (+ share_with_client to make it client-visible)
+documentsRouter.patch('/folders/:id', requires('folders.update'), async (req, res) => {
+  const actor = staffActor(req);
   const folderId = param(req, 'id');
-  await requireAgencyFolder(ctx, folderId);
+  const folder = await requireFolder(actor, folderId);
+  authorize(actor, 'folders.update', folder.facts, { view: 'documents.view' });
   const body = folderUpdateSchema.parse(req.body);
 
+  if (body.clientVisible === true && !folder.row.clientVisible) {
+    authorize(actor, 'documents.share_with_client', folder.facts, { view: 'documents.view' });
+  }
   if (body.parentId) {
     if (body.parentId === folderId) {
       throw badRequest('A folder cannot be its own parent.');
     }
-    await requireAgencyFolder(ctx, body.parentId);
-    if (await wouldCreateCycle(ctx, folderId, body.parentId)) {
+    await requireFolder(actor, body.parentId);
+    if (await wouldCreateCycle(actor, folderId, body.parentId)) {
       throw badRequest('Cannot move a folder into one of its own subfolders.');
     }
   }
@@ -408,27 +413,27 @@ documentsRouter.patch('/folders/:id', async (req, res) => {
     .where(
       and(
         eq(documentFolders.id, folderId),
-        eq(documentFolders.agencyId, ctx.agencyId),
+        eq(documentFolders.agencyId, actor.agencyId),
       ),
     );
 
-  const row = await requireAgencyFolder(ctx, folderId);
-  ok(res, serializeFolder(row));
+  const { row } = await requireFolder(actor, folderId);
+  ok(res, serializeFolder(actor, row));
 });
 
-// DELETE /documents/folders/:id — remove the folder WITHOUT touching its files.
-// Contained documents return to root (folderId=null) and child folders return
-// to root (parentId=null) so nothing is orphaned or hidden by the delete.
-documentsRouter.delete('/folders/:id', async (req, res) => {
-  const ctx = getAuth(req);
+// DELETE /documents/folders/:id — folders.delete. Removes the folder WITHOUT
+// touching its files: contained documents and child folders return to root.
+documentsRouter.delete('/folders/:id', requires('folders.delete'), async (req, res) => {
+  const actor = staffActor(req);
   const folderId = param(req, 'id');
-  await requireAgencyFolder(ctx, folderId);
+  const folder = await requireFolder(actor, folderId);
+  authorize(actor, 'folders.delete', folder.facts, { view: 'documents.view' });
 
   await db
     .update(documents)
     .set({ folderId: null, updatedAt: new Date() })
     .where(
-      and(eq(documents.folderId, folderId), eq(documents.agencyId, ctx.agencyId)),
+      and(eq(documents.folderId, folderId), eq(documents.agencyId, actor.agencyId)),
     );
 
   await db
@@ -437,7 +442,7 @@ documentsRouter.delete('/folders/:id', async (req, res) => {
     .where(
       and(
         eq(documentFolders.parentId, folderId),
-        eq(documentFolders.agencyId, ctx.agencyId),
+        eq(documentFolders.agencyId, actor.agencyId),
       ),
     );
 
@@ -446,15 +451,22 @@ documentsRouter.delete('/folders/:id', async (req, res) => {
     .where(
       and(
         eq(documentFolders.id, folderId),
-        eq(documentFolders.agencyId, ctx.agencyId),
+        eq(documentFolders.agencyId, actor.agencyId),
       ),
     );
 
+  await audit({
+    ...auditBase(actor, req),
+    action: 'folder.delete',
+    entityType: 'document_folder',
+    entityId: folderId,
+    metadata: { name: folder.row.name },
+  });
   ok(res, { deleted: true });
 });
 
 // ============================================================
-//  POST /documents/sign — Cloudinary signed direct-upload params
+//  POST /documents/sign — documents.upload. Signed direct-upload params.
 // ============================================================
 const signSchema = z.object({
   folder: z.string().trim().max(200).optional(),
@@ -462,15 +474,15 @@ const signSchema = z.object({
   contentType: z.string().optional(),
 });
 
-documentsRouter.post('/sign', async (req, res) => {
-  const ctx = getAuth(req);
+documentsRouter.post('/sign', requires('documents.upload'), async (req, res) => {
+  const actor = staffActor(req);
   const body = signSchema.parse(req.body ?? {});
 
   // Force a tenant-scoped folder so one agency cannot write into another's.
-  const folder = `sanctum/${ctx.agencyId}/documents`;
+  const folder = `sanctum/${actor.agencyId}/documents`;
 
   const signed = await signDocumentUpload({
-    agencyId: ctx.agencyId,
+    agencyId: actor.agencyId,
     folder,
     filename: body.filename,
     contentType: body.contentType,
@@ -483,7 +495,8 @@ documentsRouter.post('/sign', async (req, res) => {
 });
 
 // ============================================================
-//  POST /documents — save metadata for an uploaded asset
+//  POST /documents — documents.upload. Save metadata for an uploaded asset
+//  (publicId set) or an external link (no publicId).
 // ============================================================
 const createSchema = z.object({
   name: z.string().min(1).max(255),
@@ -497,36 +510,37 @@ const createSchema = z.object({
   format: z.string().max(40).optional(),
   mimeType: z.string().max(160).optional(),
   sizeBytes: z.number().int().min(0).optional(),
-  clientVisible: z
-    .union([z.boolean(), z.literal(0), z.literal(1)])
-    .transform((v) => Boolean(v))
-    .optional(),
-  hideFromTeam: z
-    .union([z.boolean(), z.literal(0), z.literal(1)])
-    .transform((v) => Boolean(v))
-    .optional(),
+  clientVisible: boolish.optional(),
+  hideFromTeam: boolish.optional(),
 });
 
-documentsRouter.post('/', async (req, res) => {
-  const ctx = getAuth(req);
+documentsRouter.post('/', requires('documents.upload'), async (req, res) => {
+  const actor = staffActor(req);
   const body = createSchema.parse(req.body);
-
-  if (body.clientId !== undefined) await requireAgencyClient(ctx, body.clientId);
-  if (body.projectId !== undefined)
-    await requireAgencyProject(ctx, body.projectId);
-  if (body.folderId) await requireAgencyFolder(ctx, body.folderId);
-
   const category = body.category ?? 'misc';
-  // Owner-only visibility: business/legal categories always hide from the team;
-  // otherwise only the OWNER may manually hide (staff uploads stay visible).
-  const hideFromTeam =
-    OWNER_ONLY_CATEGORIES.has(category) ||
-    (ctx.role === 'owner' && body.hideFromTeam === true);
+
+  // Cross-module + visibility permissions (all checked before any write).
+  const businessPermission = BUSINESS_CATEGORY_PERMISSION[category];
+  if (businessPermission) {
+    requirePermission(
+      actor,
+      businessPermission,
+      `Uploading a ${category} creates a business record and needs the ${businessPermission} permission.`,
+    );
+  }
+  if (body.clientVisible === true) requirePermission(actor, 'documents.share_with_client');
+  const hideFromTeam = OWNER_ONLY_CATEGORIES.has(category) || body.hideFromTeam === true;
+  if (hideFromTeam) requirePermission(actor, 'documents.hide_from_team');
+
+  assertDocumentStorage(actor.agencyId, body.fileUrl, body.publicId);
+  if (body.clientId !== undefined) await requireInAgency(clients, actor.agencyId, body.clientId, 'Client');
+  if (body.projectId !== undefined) await requireViewableProject(actor, body.projectId);
+  if (body.folderId) await requireFolder(actor, body.folderId);
 
   const id = newId('doc');
   await db.insert(documents).values({
     id,
-    agencyId: ctx.agencyId,
+    agencyId: actor.agencyId,
     name: body.name,
     ...(body.category !== undefined ? { category: body.category } : {}),
     clientId: body.clientId ?? null,
@@ -544,30 +558,39 @@ documentsRouter.post('/', async (req, res) => {
       ? { clientVisible: body.clientVisible }
       : {}),
     hideFromTeam,
-    uploadedBy: ctx.userId,
+    uploadedBy: actor.userId,
   });
 
-  // Convert proposal/agreement uploads into their respective Business records so
-  // they surface in the Proposals / Agreements tabs. Best-effort — a failed
-  // conversion must never fail the upload itself.
-  const conversion = await maybeConvertDocument(ctx, category, body).catch(
+  // Convert proposal/agreement/invoice uploads into their Business records so
+  // they surface in those tabs (permission verified above). Best-effort — a
+  // failed conversion must never fail the upload itself.
+  const conversion = await maybeConvertDocument(actor, category, body).catch(
     () => null,
   );
+  if (conversion) {
+    await audit({
+      ...auditBase(actor, req),
+      action: `document.convert_${conversion.type}`,
+      entityType: 'document',
+      entityId: id,
+      metadata: { recordId: conversion.id, clientVisible: body.clientVisible === true },
+    });
+  }
 
-  const row = await getScopedDocument(ctx, id, { allowHidden: true });
-  created(res, { ...serializeDocument(row), converted: conversion });
+  const row = await loadDocumentRow(actor, id);
+  created(res, { ...serializeDocument(actor, row), converted: conversion });
 });
 
 /**
  * When a document is uploaded as a proposal/agreement/invoice, spawn the
  * matching Business record carrying the file so it surfaces in that tab.
  * Agreements + invoices require a client, so if none is given we skip (the doc
- * still exists, owner-only). When the document is marked client-visible the
- * record is created as 'sent' so it also shows in the client's portal tab;
- * otherwise it stays 'draft' (agency-only). Returns a descriptor or null.
+ * still exists, hidden). When the document is marked client-visible the record
+ * is created as 'sent' so it also shows in the client's portal tab; otherwise
+ * it stays 'draft' (agency-only). Returns a descriptor or null.
  */
 async function maybeConvertDocument(
-  ctx: ReturnType<typeof getAuth>,
+  actor: StaffActor,
   category: string,
   body: z.infer<typeof createSchema>,
 ): Promise<{ type: 'proposal' | 'agreement' | 'invoice'; id: string } | null> {
@@ -578,14 +601,14 @@ async function maybeConvertDocument(
     const propId = newId('prop');
     await db.insert(proposals).values({
       id: propId,
-      agencyId: ctx.agencyId,
+      agencyId: actor.agencyId,
       clientId: body.clientId ?? null,
       title: body.name,
       status: toClient ? 'sent' : 'draft',
       sentAt: now,
       contentJson: JSON.stringify({ source: 'document', fileUrl: body.fileUrl }),
       fileUrl: body.fileUrl,
-      createdBy: ctx.userId,
+      createdBy: actor.userId,
     });
     return { type: 'proposal', id: propId };
   }
@@ -594,14 +617,14 @@ async function maybeConvertDocument(
     const agrId = newId('agr');
     await db.insert(agreements).values({
       id: agrId,
-      agencyId: ctx.agencyId,
+      agencyId: actor.agencyId,
       clientId: body.clientId,
       title: body.name,
       status: toClient ? 'sent' : 'draft',
       sentAt: now,
       termsJson: JSON.stringify({ source: 'document', fileUrl: body.fileUrl }),
       fileUrl: body.fileUrl,
-      createdBy: ctx.userId,
+      createdBy: actor.userId,
     });
     return { type: 'agreement', id: agrId };
   }
@@ -612,13 +635,13 @@ async function maybeConvertDocument(
     const invoiceNumber = `INV-${year}-${String(Date.now() % 10000).padStart(4, '0')}`;
     await db.insert(invoices).values({
       id: invId,
-      agencyId: ctx.agencyId,
+      agencyId: actor.agencyId,
       clientId: body.clientId,
       invoiceNumber,
       status: toClient ? 'sent' : 'draft',
       issueDate: new Date(),
       fileUrl: body.fileUrl,
-      createdBy: ctx.userId,
+      createdBy: actor.userId,
       // Money fields default to 0 — a document invoice carries the file, not
       // computed line items. The agency can add items later if needed.
     });
@@ -628,7 +651,10 @@ async function maybeConvertDocument(
 }
 
 // ============================================================
-//  PATCH /documents/:id
+//  PATCH /documents/:id — documents.update (own / organization)
+//    clientVisible false→true: documents.share_with_client
+//    hideFromTeam change, or moving into a hidden category: documents.hide_from_team
+//    projectId: projects.view on the project
 // ============================================================
 const updateSchema = z.object({
   name: z.string().min(1).max(255).optional(),
@@ -636,21 +662,37 @@ const updateSchema = z.object({
   clientId: z.string().min(1).nullable().optional(),
   projectId: z.string().min(1).nullable().optional(),
   folderId: z.string().min(1).nullable().optional(),
-  clientVisible: z
-    .union([z.boolean(), z.literal(0), z.literal(1)])
-    .transform((v) => Boolean(v))
-    .optional(),
+  clientVisible: boolish.optional(),
+  hideFromTeam: boolish.optional(),
 });
 
-documentsRouter.patch('/:id', async (req, res) => {
-  const ctx = getAuth(req);
+documentsRouter.patch('/:id', requires('documents.update'), async (req, res) => {
+  const actor = staffActor(req);
   const documentId = param(req, 'id');
-  await getScopedDocument(ctx, documentId);
+  const { row: doc, facts } = await authorizeDocument(actor, documentId, 'documents.update');
   const body = updateSchema.parse(req.body);
 
-  if (body.clientId) await requireAgencyClient(ctx, body.clientId);
-  if (body.projectId) await requireAgencyProject(ctx, body.projectId);
-  if (body.folderId) await requireAgencyFolder(ctx, body.folderId);
+  const check403 = (permission: string, f: ObjectFacts = facts) =>
+    authorize(actor, permission, f, { view: 'documents.view' });
+
+  if (body.clientVisible === true && !doc.clientVisible) check403('documents.share_with_client');
+
+  const nextCategory = body.category ?? doc.category;
+  const intoHiddenCategory = OWNER_ONLY_CATEGORIES.has(nextCategory) && !doc.hideFromTeam;
+  let nextHidden = doc.hideFromTeam;
+  if (intoHiddenCategory) {
+    check403('documents.hide_from_team');
+    nextHidden = true;
+  }
+  if (body.hideFromTeam !== undefined && body.hideFromTeam !== doc.hideFromTeam) {
+    check403('documents.hide_from_team');
+    // Business/legal categories are always hidden.
+    nextHidden = body.hideFromTeam || OWNER_ONLY_CATEGORIES.has(nextCategory);
+  }
+
+  if (body.clientId) await requireInAgency(clients, actor.agencyId, body.clientId, 'Client');
+  if (body.projectId) await requireViewableProject(actor, body.projectId);
+  if (body.folderId) await requireFolder(actor, body.folderId);
 
   const patch: Partial<typeof documents.$inferInsert> = {
     updatedAt: new Date(),
@@ -661,44 +703,74 @@ documentsRouter.patch('/:id', async (req, res) => {
   if (body.projectId !== undefined) patch.projectId = body.projectId;
   if (body.folderId !== undefined) patch.folderId = body.folderId;
   if (body.clientVisible !== undefined) patch.clientVisible = body.clientVisible;
+  if (nextHidden !== doc.hideFromTeam) patch.hideFromTeam = nextHidden;
 
   await db
     .update(documents)
     .set(patch)
     .where(
-      and(eq(documents.id, documentId), eq(documents.agencyId, ctx.agencyId)),
+      and(eq(documents.id, documentId), eq(documents.agencyId, actor.agencyId)),
     );
 
-  const row = await getScopedDocument(ctx, documentId);
-  ok(res, serializeDocument(row));
+  if (patch.clientVisible !== undefined && patch.clientVisible !== doc.clientVisible) {
+    await audit({
+      ...auditBase(actor, req),
+      action: patch.clientVisible ? 'document.share_with_client' : 'document.unshare_with_client',
+      entityType: 'document',
+      entityId: documentId,
+    });
+  }
+  if (patch.hideFromTeam !== undefined) {
+    await audit({
+      ...auditBase(actor, req),
+      action: patch.hideFromTeam ? 'document.hide_from_team' : 'document.unhide_from_team',
+      entityType: 'document',
+      entityId: documentId,
+    });
+  }
+
+  const row = await loadDocumentRow(actor, documentId);
+  ok(res, serializeDocument(actor, row));
 });
 
 // ============================================================
-//  DELETE /documents/:id — delete row + best-effort Cloudinary destroy
+//  DELETE /documents/:id — documents.delete (own / organization).
+//  Storage objects are deleted only for keys under this agency's prefix.
 // ============================================================
-documentsRouter.delete('/:id', async (req, res) => {
-  const ctx = getAuth(req);
+documentsRouter.delete('/:id', requires('documents.delete'), async (req, res) => {
+  const actor = staffActor(req);
   const documentId = param(req, 'id');
-  const doc = await getScopedDocument(ctx, documentId);
+  const { row: doc } = await authorizeDocument(actor, documentId, 'documents.delete');
 
   await db
     .delete(documents)
     .where(
-      and(eq(documents.id, documentId), eq(documents.agencyId, ctx.agencyId)),
+      and(eq(documents.id, documentId), eq(documents.agencyId, actor.agencyId)),
     );
 
-  // Best-effort: never fail the delete if the storage provider errors.
-  if (doc.publicId) {
+  // Best-effort: never fail the delete if the storage provider errors. Legacy
+  // rows may carry foreign keys (pre-validation) — those are never touched.
+  let storageDeleted = false;
+  if (doc.publicId && isAgencyStorageKey(actor.agencyId, doc.publicId)) {
     try {
       await deleteAsset({
         publicId: doc.publicId,
         secureUrl: doc.fileUrl,
         resourceType: doc.resourceType as 'image' | 'raw' | 'video',
+        agencyId: actor.agencyId,
       });
+      storageDeleted = true;
     } catch {
       // non-fatal — reconciliation can clean up later
     }
   }
 
+  await audit({
+    ...auditBase(actor, req),
+    action: 'document.delete',
+    entityType: 'document',
+    entityId: documentId,
+    metadata: { name: doc.name, category: doc.category, storageDeleted },
+  });
   ok(res, { deleted: true });
 });

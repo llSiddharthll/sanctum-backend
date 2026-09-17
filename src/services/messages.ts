@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNotNull, lt, ne, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, inArray, lt, ne, or, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   clients,
@@ -11,7 +11,10 @@ import {
 import { newId } from '../lib/ids.js';
 import { toIso } from '../lib/http.js';
 import { badRequest, forbidden, notFound } from '../lib/errors.js';
+import { requireActiveStaff } from '../authz/tenancy.js';
 import {
+  getIo,
+  userRoom,
   broadcastNewMessage,
   broadcastThreadCreated,
   broadcastThreadRead,
@@ -21,6 +24,12 @@ import {
 } from '../realtime/io.js';
 import { notify } from './notifications.js';
 
+/**
+ * Messaging service. AUTHORIZATION LIVES IN THE CALLER (routes/messages.ts,
+ * realtime/socket.ts): every function here receives already-authorized ids.
+ * `createMessage` / `markRead` keep a participation guard because they act on
+ * the caller's own participant row (and are shared with realtime).
+ */
 const PREVIEW_MAX = 140;
 
 export interface MessageAttachment {
@@ -81,6 +90,8 @@ export interface ThreadSummary {
   createdAt: string | null;
   participants: SerializedParticipant[];
   unreadCount: number;
+  /** Per-viewer capabilities (REST responses only; absent in broadcasts). */
+  capabilities?: Record<string, boolean>;
 }
 
 export interface SerializedMessage {
@@ -96,6 +107,8 @@ export interface SerializedMessage {
   /** Set when this message is pinned to the client's overview. */
   pinnedAt: string | null;
   pinnedBy: string | null;
+  /** Per-viewer capabilities (REST responses only; absent in broadcasts). */
+  capabilities?: Record<string, boolean>;
 }
 
 // ============================================================
@@ -193,48 +206,6 @@ async function participantsByThread(
     map.set(r.threadId, list);
   }
   return map;
-}
-
-/** Validate that all given user ids belong to the agency (else 400). */
-async function assertAgencyUsers(
-  agencyId: string,
-  userIds: string[],
-): Promise<void> {
-  if (userIds.length === 0) return;
-  const rows = await db
-    .select({ id: users.id })
-    .from(users)
-    .where(and(eq(users.agencyId, agencyId), inArray(users.id, userIds)));
-  const found = new Set(rows.map((r) => r.id));
-  for (const id of userIds) {
-    if (!found.has(id)) throw badRequest(`Unknown participant: ${id}`);
-  }
-}
-
-/** Validate a client belongs to the agency (else 400). */
-async function assertAgencyClient(
-  agencyId: string,
-  clientId: string,
-): Promise<void> {
-  const [row] = await db
-    .select({ id: clients.id })
-    .from(clients)
-    .where(and(eq(clients.id, clientId), eq(clients.agencyId, agencyId)))
-    .limit(1);
-  if (!row) throw badRequest('Unknown client.');
-}
-
-/** Validate a project belongs to the agency (else 400). */
-async function assertAgencyProject(
-  agencyId: string,
-  projectId: string,
-): Promise<void> {
-  const [row] = await db
-    .select({ id: projects.id })
-    .from(projects)
-    .where(and(eq(projects.id, projectId), eq(projects.agencyId, agencyId)))
-    .limit(1);
-  if (!row) throw badRequest('Unknown project.');
 }
 
 /** Build a single thread summary for a given viewer (computes unreadCount). */
@@ -351,18 +322,21 @@ export interface ListThreadsOptions {
   status?: 'open' | 'awaiting' | 'closed';
   search?: string;
   clientId?: string;
+  /**
+   * true = every thread in the agency (caller verified organization-scope
+   * `messages.view`); default = only threads the user participates in.
+   */
+  all?: boolean;
 }
 
-/** Threads the user participates in, newest activity first, with unread counts. */
+/** Threads for a viewer, newest activity first, with unread counts. */
 export async function listThreads(
   agencyId: string,
   userId: string,
   opts: ListThreadsOptions = {},
 ): Promise<ThreadSummary[]> {
-  const filters = [
-    eq(messageThreads.agencyId, agencyId),
-    eq(threadParticipants.userId, userId),
-  ];
+  const filters = [eq(messageThreads.agencyId, agencyId)];
+  if (!opts.all) filters.push(eq(threadParticipants.userId, userId));
   if (opts.status) filters.push(eq(messageThreads.status, opts.status));
   if (opts.clientId) filters.push(eq(messageThreads.clientId, opts.clientId));
   if (opts.search && opts.search.trim()) {
@@ -387,9 +361,12 @@ export async function listThreads(
       projectName: projects.name,
     })
     .from(messageThreads)
-    .innerJoin(
+    .leftJoin(
       threadParticipants,
-      eq(threadParticipants.threadId, messageThreads.id),
+      and(
+        eq(threadParticipants.threadId, messageThreads.id),
+        eq(threadParticipants.userId, userId),
+      ),
     )
     .leftJoin(clients, eq(clients.id, messageThreads.clientId))
     .leftJoin(projects, eq(projects.id, messageThreads.projectId))
@@ -426,13 +403,12 @@ export async function listThreads(
   return summaries;
 }
 
-/** Full thread summary for one viewer (403 if not a participant). */
+/** Full thread summary for one viewer (caller authorized `messages.view`). */
 export async function getThread(
   agencyId: string,
   userId: string,
   threadId: string,
 ): Promise<ThreadSummary> {
-  await requireParticipant(agencyId, userId, threadId);
   return buildSummary(agencyId, userId, threadId);
 }
 
@@ -444,7 +420,10 @@ export interface CreateThreadInput {
   body?: string | null;
 }
 
-/** Create a thread (+ participants, optional first message) and broadcast. */
+/**
+ * Create a thread (+ participants, optional first message) and broadcast.
+ * Caller authorized `threads.create` and any client/project link.
+ */
 export async function createThread(
   agencyId: string,
   creatorId: string,
@@ -457,9 +436,8 @@ export async function createThread(
   const ids = Array.from(
     new Set([creatorId, ...input.participantIds.filter(Boolean)]),
   );
-  await assertAgencyUsers(agencyId, ids);
-  if (input.clientId) await assertAgencyClient(agencyId, input.clientId);
-  if (input.projectId) await assertAgencyProject(agencyId, input.projectId);
+  // Participants are active staff only (never client users / disabled users).
+  await requireActiveStaff(agencyId, ids);
 
   const threadId = newId('thr');
   await db.insert(messageThreads).values({
@@ -540,15 +518,12 @@ export interface ListMessagesOptions {
   limit?: number;
 }
 
-/** Messages ascending by createdAt (403 if not a participant). Paginated. */
+/** Messages ascending by createdAt (caller authorized `messages.view`). Paginated. */
 export async function listMessages(
   agencyId: string,
-  userId: string,
   threadId: string,
   opts: ListMessagesOptions = {},
 ): Promise<SerializedMessage[]> {
-  await requireParticipant(agencyId, userId, threadId);
-
   const limit = Math.min(Math.max(opts.limit ?? 50, 1), 100);
   const filters = [
     eq(messages.agencyId, agencyId),
@@ -742,17 +717,15 @@ async function notifyMentions(
   }
 }
 
-/** Edit your own message (body only). Broadcasts 'message:updated'. */
+/** Edit a message body (caller authorized `messages.update`). Broadcasts 'message:updated'. */
 export async function editMessage(
   agencyId: string,
-  userId: string,
   threadId: string,
   messageId: string,
   body: string,
 ): Promise<SerializedMessage> {
   const trimmed = body.trim();
   if (!trimmed) throw badRequest('Message body is required.');
-  await requireParticipant(agencyId, userId, threadId);
 
   const [msg] = await db
     .select()
@@ -766,26 +739,25 @@ export async function editMessage(
     )
     .limit(1);
   if (!msg) throw notFound('Message not found.');
-  if (msg.senderId !== userId) {
-    throw forbidden('You can only edit your own messages.');
-  }
 
   const now = new Date();
   await db
     .update(messages)
     .set({ body: trimmed, editedAt: now })
-    .where(eq(messages.id, messageId));
+    .where(and(eq(messages.id, messageId), eq(messages.agencyId, agencyId)));
 
-  const [senderRow] = await db
-    .select({ name: users.fullName })
-    .from(users)
-    .where(eq(users.id, userId))
-    .limit(1);
+  const [senderRow] = msg.senderId
+    ? await db
+        .select({ name: users.fullName })
+        .from(users)
+        .where(eq(users.id, msg.senderId))
+        .limit(1)
+    : [];
 
   const message = serializeMessageRow({
     id: messageId,
     threadId,
-    senderId: userId,
+    senderId: msg.senderId,
     body: trimmed,
     attachmentsJson: msg.attachmentsJson,
     createdAt: msg.createdAt,
@@ -796,16 +768,12 @@ export async function editMessage(
   return message;
 }
 
-/** Delete a message — your own, or any if you're owner/admin. Broadcasts. */
+/** Delete a message (caller authorized `messages.delete`). Broadcasts. */
 export async function deleteMessage(
   agencyId: string,
-  userId: string,
-  role: string,
   threadId: string,
   messageId: string,
 ): Promise<void> {
-  await requireParticipant(agencyId, userId, threadId);
-
   const [msg] = await db
     .select({ senderId: messages.senderId })
     .from(messages)
@@ -818,11 +786,6 @@ export async function deleteMessage(
     )
     .limit(1);
   if (!msg) throw notFound('Message not found.');
-
-  const privileged = role === 'owner' || role === 'admin';
-  if (msg.senderId !== userId && !privileged) {
-    throw forbidden('You can only delete your own messages.');
-  }
 
   await db
     .delete(messages)
@@ -865,14 +828,36 @@ export interface UpdateThreadInput {
   removeParticipantIds?: string[];
 }
 
-/** Mutate a thread (subject/status/membership) and broadcast 'thread:updated'. */
+export interface UpdateThreadResult {
+  summary: ThreadSummary;
+  /** User ids actually added / removed (for room re-sync + audit). */
+  added: string[];
+  removed: string[];
+}
+
+/**
+ * Mutate a thread (subject/status/links/membership) and broadcast
+ * 'thread:updated'. The caller authorized every part of `input` (and validated
+ * client/project links). Invariants enforced here: added participants are
+ * active staff, and a thread can never be left without participants.
+ */
 export async function updateThread(
   agencyId: string,
   userId: string,
   threadId: string,
   input: UpdateThreadInput,
-): Promise<ThreadSummary> {
-  await requireParticipant(agencyId, userId, threadId);
+): Promise<UpdateThreadResult> {
+  const before = await participantUserIds(agencyId, threadId);
+  const add = Array.from(new Set((input.addParticipantIds ?? []).filter(Boolean))).filter(
+    (id) => !before.includes(id),
+  );
+  const removeReq = new Set((input.removeParticipantIds ?? []).filter(Boolean));
+  const remove = before.filter((id) => removeReq.has(id));
+  const after = [...before, ...add].filter((id) => !remove.includes(id));
+  if (after.length === 0) {
+    throw badRequest('A thread must keep at least one participant.');
+  }
+  if (add.length) await requireActiveStaff(agencyId, add);
 
   const patch: Partial<typeof messageThreads.$inferInsert> = {
     updatedAt: new Date(),
@@ -884,13 +869,11 @@ export async function updateThread(
   }
   if (input.status !== undefined) patch.status = input.status;
   if (input.clientId !== undefined) {
-    if (input.clientId) await assertAgencyClient(agencyId, input.clientId);
     patch.clientId = input.clientId; // null clears the link
     // Clearing the client also clears a now-orphaned project link.
     if (input.clientId === null) patch.projectId = null;
   }
   if (input.projectId !== undefined) {
-    if (input.projectId) await assertAgencyProject(agencyId, input.projectId);
     patch.projectId = input.projectId;
   }
 
@@ -904,34 +887,25 @@ export async function updateThread(
       ),
     );
 
-  // Add participants (validated, de-duped via UNIQUE(threadId,userId)).
-  if (input.addParticipantIds && input.addParticipantIds.length) {
-    const add = Array.from(new Set(input.addParticipantIds.filter(Boolean)));
-    await assertAgencyUsers(agencyId, add);
-    for (const uid of add) {
-      await db
-        .insert(threadParticipants)
-        .values({ id: newId('tpt'), agencyId, threadId, userId: uid })
-        .onConflictDoNothing();
-    }
+  for (const uid of add) {
+    await db
+      .insert(threadParticipants)
+      .values({ id: newId('tpt'), agencyId, threadId, userId: uid })
+      .onConflictDoNothing();
   }
-
-  // Remove participants.
-  if (input.removeParticipantIds && input.removeParticipantIds.length) {
-    const remove = Array.from(
-      new Set(input.removeParticipantIds.filter(Boolean)),
-    );
-    if (remove.length) {
-      await db
-        .delete(threadParticipants)
-        .where(
-          and(
-            eq(threadParticipants.agencyId, agencyId),
-            eq(threadParticipants.threadId, threadId),
-            inArray(threadParticipants.userId, remove),
-          ),
-        );
-    }
+  if (remove.length) {
+    await db
+      .delete(threadParticipants)
+      .where(
+        and(
+          eq(threadParticipants.agencyId, agencyId),
+          eq(threadParticipants.threadId, threadId),
+          inArray(threadParticipants.userId, remove),
+        ),
+      );
+    // Evicted users drop the thread from their list.
+    const io = getIo();
+    for (const uid of remove) io?.to(userRoom(uid)).emit('thread:removed', { threadId });
   }
 
   // Fan the updated summary to the (possibly new) participant set.
@@ -941,16 +915,18 @@ export async function updateThread(
     await buildSummaryForBroadcast(agencyId, threadId),
   );
 
-  return buildSummary(agencyId, userId, threadId);
+  return { summary: await buildSummary(agencyId, userId, threadId), added: add, removed: remove };
 }
 
-/** Delete a thread (participants + messages cascade). 403 if not a member. */
+/**
+ * Delete a thread (participants + messages cascade; caller authorized
+ * `threads.delete`). Returns the former participants (for room re-sync).
+ */
 export async function deleteThread(
   agencyId: string,
-  userId: string,
   threadId: string,
-): Promise<void> {
-  await requireParticipant(agencyId, userId, threadId);
+): Promise<string[]> {
+  const former = await participantUserIds(agencyId, threadId);
   await db
     .delete(messageThreads)
     .where(
@@ -959,6 +935,9 @@ export async function deleteThread(
         eq(messageThreads.agencyId, agencyId),
       ),
     );
+  const io = getIo();
+  for (const uid of former) io?.to(userRoom(uid)).emit('thread:deleted', { threadId });
+  return former;
 }
 
 /** Total unread messages across all threads the user participates in. */
@@ -997,7 +976,7 @@ export async function unreadCount(
 /**
  * Pin or unpin a message. Pinned messages surface on the client overview so a
  * newcomer can read the few messages that actually explain the engagement.
- * Any thread participant may pin — it is a shared, low-stakes bookmark.
+ * Caller authorized `messages.pin`.
  */
 export async function setMessagePinned(
   agencyId: string,
@@ -1006,12 +985,16 @@ export async function setMessagePinned(
   messageId: string,
   pinned: boolean,
 ): Promise<SerializedMessage> {
-  await requireParticipant(agencyId, userId, threadId);
-
   const [existing] = await db
     .select()
     .from(messages)
-    .where(and(eq(messages.id, messageId), eq(messages.threadId, threadId)))
+    .where(
+      and(
+        eq(messages.id, messageId),
+        eq(messages.threadId, threadId),
+        eq(messages.agencyId, agencyId),
+      ),
+    )
     .limit(1);
   if (!existing) throw notFound('Message not found.');
 
@@ -1021,7 +1004,7 @@ export async function setMessagePinned(
       pinnedAt: pinned ? new Date() : null,
       pinnedBy: pinned ? userId : null,
     })
-    .where(eq(messages.id, messageId));
+    .where(and(eq(messages.id, messageId), eq(messages.agencyId, agencyId)));
 
   const [row] = await db
     .select({
@@ -1041,53 +1024,4 @@ export async function setMessagePinned(
     .where(eq(messages.id, messageId));
 
   return serializeMessageRow(row!);
-}
-
-export interface PinnedMessage extends SerializedMessage {
-  threadSubject: string | null;
-  projectId: string | null;
-}
-
-/**
- * Every pinned message across a client's threads, newest pin first. Visible to
- * anyone who can see the client — that is the point of the feature.
- */
-export async function listPinnedForClient(
-  agencyId: string,
-  clientId: string,
-  limit = 50,
-): Promise<PinnedMessage[]> {
-  const rows = await db
-    .select({
-      id: messages.id,
-      threadId: messages.threadId,
-      senderId: messages.senderId,
-      body: messages.body,
-      attachmentsJson: messages.attachmentsJson,
-      createdAt: messages.createdAt,
-      editedAt: messages.editedAt,
-      senderName: users.fullName,
-      pinnedAt: messages.pinnedAt,
-      pinnedBy: messages.pinnedBy,
-      threadSubject: messageThreads.subject,
-      projectId: messageThreads.projectId,
-    })
-    .from(messages)
-    .innerJoin(messageThreads, eq(messageThreads.id, messages.threadId))
-    .leftJoin(users, eq(users.id, messages.senderId))
-    .where(
-      and(
-        eq(messageThreads.agencyId, agencyId),
-        eq(messageThreads.clientId, clientId),
-        isNotNull(messages.pinnedAt),
-      ),
-    )
-    .orderBy(desc(messages.pinnedAt))
-    .limit(limit);
-
-  return rows.map((r) => ({
-    ...serializeMessageRow(r),
-    threadSubject: r.threadSubject ?? null,
-    projectId: r.projectId ?? null,
-  }));
 }

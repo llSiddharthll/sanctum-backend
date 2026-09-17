@@ -43,11 +43,14 @@ describe('documents workflow', () => {
   });
 
   it('owner creates, lists, reads, renames and deletes a document', async () => {
+    const agencyId = data(await owner.get(`${BASE}/auth/me`)).agency.id;
+    const fileUrl = `https://res.cloudinary.com/test-cloud/raw/upload/sanctum/${agencyId}/documents/sow.pdf`;
     const create = await owner.post(`${BASE}/documents`).send({
       name: 'Statement of Work',
       category: 'contract',
-      fileUrl: 'https://res.cloudinary.com/test-cloud/raw/upload/sow.pdf',
-      publicId: 'sanctum/docs/sow',
+      fileUrl,
+      // Storage keys must live under this agency's prefix.
+      publicId: `sanctum/${agencyId}/documents/sow`,
       resourceType: 'raw',
     });
     expect(create.status).toBe(201);
@@ -55,9 +58,10 @@ describe('documents workflow', () => {
     expect(id).toMatch(/^doc_/);
     expect(data(create).name).toBe('Statement of Work');
     expect(data(create).category).toBe('contract');
-    expect(data(create).fileUrl).toBe(
-      'https://res.cloudinary.com/test-cloud/raw/upload/sow.pdf',
-    );
+    expect(data(create).fileUrl).toBe(fileUrl);
+    // Business/legal categories are always hidden from the team.
+    expect(data(create).hideFromTeam).toBe(true);
+    expect(data(create).capabilities['documents.update']).toBe(true);
 
     const list = await owner.get(`${BASE}/documents`);
     expect(list.status).toBe(200);
@@ -458,8 +462,8 @@ describe('messages workflow', () => {
       `${BASE}/messages/threads/${threadId}`,
     );
     expect([403, 404]).toContain(get.status);
-    // Service rule: thread exists in agency -> 403 (not a participant).
-    expect(get.status).toBe(403);
+    // Non-participants without moderation read cannot see the thread at all.
+    expect(get.status).toBe(404);
 
     const send = await memberB.agent
       .post(`${BASE}/messages/threads/${threadId}/messages`)
@@ -571,17 +575,25 @@ describe('messages: new endpoints', () => {
       .send({ subject: 'Attachment only', participantIds: [] });
     const threadId = data(create).id;
 
+    // Attachment URLs must come from this agency's storage.
+    const foreign = await owner
+      .post(`${BASE}/messages/threads/${threadId}/messages`)
+      .send({ attachments: [{ url: 'https://x.test/a.png', type: 'image', name: 'a.png' }] });
+    expect(foreign.status).toBe(400);
+
+    const agencyId = data(await owner.get(`${BASE}/auth/me`)).agency.id;
+    const url = `https://res.cloudinary.com/test-cloud/image/upload/sanctum/${agencyId}/documents/a.png`;
     const send = await owner
       .post(`${BASE}/messages/threads/${threadId}/messages`)
       .send({
         attachments: [
-          { url: 'https://x.test/a.png', type: 'image', name: 'a.png' },
+          { url, type: 'image', name: 'a.png' },
         ],
       });
     expect(send.status).toBe(201);
     expect(data(send).body).toBe('');
     expect(data(send).attachments.length).toBe(1);
-    expect(data(send).attachments[0].url).toBe('https://x.test/a.png');
+    expect(data(send).attachments[0].url).toBe(url);
     expect(data(send).attachments[0].type).toBe('image');
 
     // The thread preview shows a paperclip hint for attachment-only messages.
@@ -722,7 +734,7 @@ describe('messages: new endpoints', () => {
     expect(data(afterClear).projectId).toBeNull();
   });
 
-  it('PATCH /threads/:id rejects a project from another agency (400)', async () => {
+  it('PATCH /threads/:id rejects a project from another agency (404)', async () => {
     const create = await owner
       .post(`${BASE}/messages/threads`)
       .send({ subject: 'Bad project link', participantIds: [] });
@@ -736,7 +748,7 @@ describe('messages: new endpoints', () => {
     const res = await owner
       .patch(`${BASE}/messages/threads/${threadId}`)
       .send({ projectId: otherProject });
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(404);
   });
 
   // ----- @mentions -----
