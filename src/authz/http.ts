@@ -18,7 +18,7 @@ import {
   portalTokens,
   users,
 } from '../db/schema.js';
-import { unauthenticated } from '../lib/errors.js';
+import { forbidden, unauthenticated } from '../lib/errors.js';
 import type { Role } from '../lib/jwt.js';
 import {
   GrantSet,
@@ -237,9 +237,33 @@ export function getUserActor(req: Request) {
 export function getStaffActor(req: Request) {
   const a = getActor(req);
   if (a.type !== 'staff') {
-    throw unauthenticated('Staff session required.');
+    // Authenticated, but not a team member: 403 (a 401 would make clients
+    // discard a perfectly valid client/portal session).
+    throw forbidden('This API is only available to team members.');
   }
   return a;
+}
+
+/**
+ * Surface separation: the agency (staff) API is never served to client-side
+ * actors (client users, share links) — they use /client and /portal, whose
+ * responses are shaped for clients. Requests WITHOUT a token pass through so
+ * anonymous public-token routes inside staff routers keep working; the routers
+ * authenticate everything else themselves.
+ */
+export async function rejectClientSideActors(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  if (!readAccessToken(req)) return next();
+  await authenticate(req, res, (err?: unknown) => {
+    if (err) return next(err);
+    if (req.actor && req.actor.type !== 'staff') {
+      return next(forbidden('This API is only available to team members.'));
+    }
+    next();
+  });
 }
 
 /** Route guard: the actor must hold the permission at some scope. */

@@ -16,6 +16,7 @@ import { healthRouter } from './routes/health.js';
 import { authRouter } from './routes/auth.js';
 import { agenciesRouter } from './routes/agencies.js';
 import { rolesRouter, authzRouter } from './routes/roles.js';
+import { rejectClientSideActors } from './authz/http.js';
 import { usersRouter } from './routes/users.js';
 import { clientsRouter } from './routes/clients.js';
 import { leadsRouter } from './routes/leads.js';
@@ -80,6 +81,16 @@ export function createApp() {
 
   const api = express.Router();
   api.use(globalLimiter);
+
+  // Staff surfaces reject client users / share links (they use /client, /portal).
+  api.use(
+    [
+      '/agency', '/roles', '/team', '/clients', '/leads', '/proposals', '/agreements',
+      '/invoices', '/refrens', '/projects', '/timers', '/me', '/expenses', '/finance',
+      '/ai', '/media', '/analytics', '/messages', '/documents', '/sheets', '/attendance', '/crm',
+    ],
+    rejectClientSideActors,
+  );
 
   api.use('/auth', authRouter);
   api.use('/agency', agenciesRouter);

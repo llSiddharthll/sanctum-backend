@@ -54,6 +54,10 @@ export default defineConfig({
       JWT_REFRESH_SECRET: 'test-refresh-secret-0123456789-abcdefghij',
       // base64 of 32 bytes (0x41 * 32)
       VAULT_ENC_KEY: 'QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=',
+      // Pin everything a developer's local .env could override.
+      STORAGE_DRIVER: 'cloudinary',
+      MEDIA_DIR: './.test-data/media',
+      PORT: '8080',
       CLOUDINARY_CLOUD_NAME: 'test-cloud',
       CLOUDINARY_API_KEY: 'test-key',
       CLOUDINARY_API_SECRET: 'test-secret',

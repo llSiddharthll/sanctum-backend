@@ -1889,8 +1889,11 @@ async function main(): Promise<void> {
     label: 'Bloom Digital — client review link',
     createdBy: ownerId,
     revoked: false,
+    // Share links carry a client role (their only grants) and always expire.
+    roleId: await systemRoleId(agencyId, 'share_link'),
+    expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
   });
-  portalLinks.push({ client: 'Bloom Digital', rawToken: bloomToken.raw, url: `http://localhost:3000/portal/${bloomToken.raw}` });
+  portalLinks.push({ client: 'Bloom Digital', rawToken: bloomToken.raw, url: `${process.env.FRONTEND_ORIGIN ?? 'http://localhost:3000'}/portal/${bloomToken.raw}` });
 
   const auroraTokenId = newId('ptk');
   const auroraToken = newOpaqueToken();
@@ -1902,8 +1905,10 @@ async function main(): Promise<void> {
     label: 'Aurora Cafe — client review link',
     createdBy: ownerId,
     revoked: false,
+    roleId: await systemRoleId(agencyId, 'share_link_reviewer'),
+    expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
   });
-  portalLinks.push({ client: 'Aurora Cafe', rawToken: auroraToken.raw, url: `http://localhost:3000/portal/${auroraToken.raw}` });
+  portalLinks.push({ client: 'Aurora Cafe', rawToken: auroraToken.raw, url: `${process.env.FRONTEND_ORIGIN ?? 'http://localhost:3000'}/portal/${auroraToken.raw}` });
 
   console.log('Seeding post comments + approvals...');
   if (auroraApprovedPostId) {
