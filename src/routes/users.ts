@@ -16,6 +16,7 @@ import {
   projects,
   roles,
   timeLogs,
+  userPermissionOverrides,
   userRoles,
   users,
 } from '../db/schema.js';
@@ -476,6 +477,8 @@ const inviteSchema = z
     role: z.enum(['admin', 'member', 'client']).optional(),
     clientId: z.string().min(1).optional(),
     projectIds: z.array(z.string().min(1)).max(200).optional(),
+    /** Client invites: 'all' brand projects or only 'selected' (projectIds, non-empty). */
+    projectAccess: z.enum(['all', 'selected']).optional(),
     phone: z.string().trim().max(40).optional(),
     designation: z.string().trim().max(120).optional(),
     department: z.string().trim().max(120).optional(),
@@ -507,6 +510,10 @@ usersRouter.post('/invite', requiresAny('users.invite', 'client_users.invite'), 
       .where(eq(clients.id, body.clientId!))
       .limit(1);
     clientScopeProjectIds = await validateBrandProjects(actor.agencyId, body.clientId!, body.projectIds ?? []);
+    const wantsSelected = body.projectAccess === 'selected' || (body.projectAccess === undefined && clientScopeProjectIds.length > 0);
+    if (wantsSelected && clientScopeProjectIds.length === 0) {
+      throw badRequest('Select at least one project, or give access to all projects.');
+    }
     if (body.roleIds) {
       roleIds = (await loadAssignableRoles(actor.agencyId, body.roleIds, 'client')).map((r) => r.id);
     } else {
@@ -901,7 +908,7 @@ usersRouter.patch('/:userId', requiresAny('users.update', 'users.disable', 'user
 // ============================================================
 //  Authorization administration for a member
 // ============================================================
-usersRouter.get('/:userId/authorization', requires('users.view', 'roles.view'), async (req, res) => {
+usersRouter.get('/:userId/authorization', requires('users.view'), async (req, res) => {
   const actor = getStaffActor(req);
   const target = await loadTarget(actor.agencyId, param(req, 'userId'));
   const explained = await explainUser({ id: target.id, kind: target.kind });
@@ -919,6 +926,15 @@ usersRouter.get('/:userId/authorization', requires('users.view', 'roles.view'), 
     roles: await roleSummaries(target.id),
     grants: explained.grants,
     sources: explained.sources,
+    overrides: await db
+      .select({
+        permission: userPermissionOverrides.permission,
+        scope: userPermissionOverrides.scope,
+        effect: userPermissionOverrides.effect,
+        reason: userPermissionOverrides.reason,
+      })
+      .from(userPermissionOverrides)
+      .where(eq(userPermissionOverrides.userId, target.id)),
     manageable,
     actorIsOwner,
   });

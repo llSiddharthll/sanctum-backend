@@ -121,7 +121,7 @@ rolesRouter.get('/', requires('roles.view'), async (req, res) => {
         .select({ roleId: userRoles.roleId, n: count() })
         .from(userRoles)
         .innerJoin(users, eq(users.id, userRoles.userId))
-        .where(and(inArray(userRoles.roleId, rows.map((r) => r.id)), eq(users.status, 'active')))
+        .where(inArray(userRoles.roleId, rows.map((r) => r.id)))
         .groupBy(userRoles.roleId)
     : [];
   const byRole = new Map(counts.map((c) => [c.roleId, Number(c.n)]));

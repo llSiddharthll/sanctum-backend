@@ -8,6 +8,10 @@ import { hashPassword } from './password.js';
 import { newId } from './ids.js';
 import { badRequest, conflict } from './errors.js';
 import { sendEmail, basicHtml } from '../services/email.js';
+
+function escapeHtml(v: string): string {
+  return v.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
+}
 import { createPasswordReset } from '../services/password-reset.js';
 import { getFrontendOrigin } from './frontend-url.js';
 
@@ -194,11 +198,11 @@ export async function sendClientPortalLoginEmail(params: {
   const loginUrl = `${getFrontendOrigin(params.req)}/login`;
   const note = params.note?.trim();
   const intro = note
-    ? note
-    : `${params.agencyName} has set up your private client portal — follow your projects, view the content calendar, review proposals & agreements, see invoices, and download shared files, all in one place.`;
+    ? escapeHtml(note)
+    : `${escapeHtml(params.agencyName)} has set up your private client portal — follow your projects, view the content calendar, review proposals & agreements, see invoices, and download shared files, all in one place.`;
   const creds = params.password
-    ? `Sign in with these details:<br><br><strong>Email:</strong> ${params.email}<br><strong>Password:</strong> ${params.password}<br><br>Keep these private — you can change your password after signing in.`
-    : `Sign in with your email (<strong>${params.email}</strong>) and your existing password. Forgot it? Use "Forgot password" on the sign-in page.`;
+    ? `Sign in with these details:<br><br><strong>Email:</strong> ${escapeHtml(params.email)}<br><strong>Password:</strong> ${escapeHtml(params.password)}<br><br>Keep these private — you can change your password after signing in.`
+    : `Sign in with your email (<strong>${escapeHtml(params.email)}</strong>) and your existing password. Forgot it? Use "Forgot password" on the sign-in page.`;
 
   await sendEmail({
     to: params.to,
@@ -207,7 +211,7 @@ export async function sendClientPortalLoginEmail(params: {
       : `Your ${params.agencyName} client portal login`,
     html: basicHtml({
       heading: note ? 'A new document is ready' : 'Your secure portal login',
-      bodyHtml: `Hi ${params.clientName}, ${intro}<br><br>${creds}`,
+      bodyHtml: `Hi ${escapeHtml(params.clientName)}, ${intro}<br><br>${creds}`,
       buttonLabel: 'Sign in to your portal',
       buttonUrl: loginUrl,
       preheader: note ?? `Your ${params.agencyName} portal login details inside.`,

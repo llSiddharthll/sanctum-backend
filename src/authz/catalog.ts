@@ -1194,7 +1194,9 @@ export function validateGrantSet(grants: Grant[], actor: ActorType): string[] {
         const reqScopes = scopesForActor(reqDef, actor);
         // Same-resource requirements (x.update → x.view) must cover the scope;
         // cross-resource requirements (threads.create → messages.view) need any scope.
-        const comparable = reqDef.resource === p.resource && reqScopes.includes(s);
+        // Create has no target object, so any scope of the view permission suffices.
+        const comparable =
+          reqDef.resource === p.resource && p.action !== 'create' && reqScopes.includes(s);
         if (comparable && !have.some((h) => scopeCovers(h, s))) {
           problems.push(`"${key}" at scope "${s}" requires "${req}" at the same or a broader scope.`);
         }
@@ -1219,7 +1221,7 @@ export function closeOverRequires(grants: Grant[], actor: ActorType): Grant[] {
         const r = BY_KEY.get(req)!;
         if (!r.actors.includes(actor)) continue;
         const rs = scopesForActor(r, actor);
-        const same = r.resource === p.resource && rs.includes(gr.scope);
+        const same = r.resource === p.resource && p.action !== 'create' && rs.includes(gr.scope);
         const scope: Scope = same ? gr.scope : broadestScope(r, actor)!;
         if (!has(req, same ? gr.scope : undefined)) {
           out.push(g(req, scope));
