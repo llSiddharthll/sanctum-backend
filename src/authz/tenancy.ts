@@ -45,10 +45,14 @@ export async function requireActiveStaff(agencyId: string, userIds: string[]): P
 }
 
 /** Storage keys / URLs must be under this agency's prefix. */
+export function isAgencyStorageKey(agencyId: string, keyOrUrl: string | null | undefined): boolean {
+  if (!keyOrUrl || keyOrUrl.includes('..')) return false;
+  return keyOrUrl.includes(`sanctum/${agencyId}/`) || keyOrUrl.includes(`agency/${agencyId}/`);
+}
+
 export function assertAgencyStorageKey(agencyId: string, keyOrUrl: string | null | undefined): void {
   if (!keyOrUrl) return;
-  const needle = `sanctum/${agencyId}/`;
-  if (!keyOrUrl.includes(needle)) {
+  if (!isAgencyStorageKey(agencyId, keyOrUrl)) {
     throw badRequest('That file does not belong to this workspace.');
   }
 }

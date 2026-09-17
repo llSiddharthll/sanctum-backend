@@ -120,6 +120,7 @@ ALTER TABLE `sanctum_agencies` ADD `authz_migrated_at` integer;--> statement-bre
 ALTER TABLE `sanctum_portal_tokens` ADD `role_id` text REFERENCES sanctum_roles(id);--> statement-breakpoint
 ALTER TABLE `sanctum_portal_tokens` ADD `project_access` text DEFAULT 'all' NOT NULL;--> statement-breakpoint
 ALTER TABLE `sanctum_project_tasks` ADD `created_by` text REFERENCES sanctum_users(id);--> statement-breakpoint
+ALTER TABLE `sanctum_post_media` ADD `uploaded_by` text REFERENCES sanctum_users(id);--> statement-breakpoint
 ALTER TABLE `sanctum_users` ADD `kind` text DEFAULT 'staff' NOT NULL;--> statement-breakpoint
 ALTER TABLE `sanctum_users` ADD `authz_version` integer DEFAULT 1 NOT NULL;--> statement-breakpoint
 ALTER TABLE `sanctum_users` ADD `client_project_access` text;--> statement-breakpoint

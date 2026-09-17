@@ -115,10 +115,9 @@ export function authorize(
     throw notFound();
   }
   if (!check(actor, permission, facts)) {
-    if (opts.view && opts.view !== permission && !check(actor, opts.view, facts)) {
-      throw notFound();
-    }
-    if (!opts.view && permission.endsWith('.view')) throw notFound();
+    // Existence is never leaked: if the actor can't even see the object → 404.
+    const viewPermission = opts.view ?? (permission.endsWith('.view') ? permission : null);
+    if (viewPermission && !check(actor, viewPermission, facts)) throw notFound();
     throw forbidden(opts.message ?? "You don't have permission to do that.");
   }
   if (opts.condition) {

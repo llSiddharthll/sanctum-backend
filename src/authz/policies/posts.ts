@@ -236,7 +236,7 @@ export async function mediaFacts(
   if (!hit || hit.post.clientId !== hit.media.clientId) return null;
   const c = await clientFacts(actor, hit.media.clientId);
   if (!c) return null;
-  return { row: hit.media, post: hit.post, facts: childFacts(c, [hit.post.createdBy]) };
+  return { row: hit.media, post: hit.post, facts: childFacts(c, [hit.media.uploadedBy ?? hit.post.createdBy]) };
 }
 
 /** Storage prefix every content-post asset of this client lives under (storage.ts / cloudinary.ts). */

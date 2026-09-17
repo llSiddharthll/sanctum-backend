@@ -49,7 +49,7 @@ agenciesRouter.post('/storage/archive', requires('storage.archive'), async (req,
   const actor = getStaffActor(req);
   assertPlatformAgency(actor);
   const body = archiveSchema.parse(req.body ?? {});
-  const result = await runMediaArchive({ dryRun: body.dryRun, retentionDays: body.olderThanDays });
+  const result = await runMediaArchive({ dryRun: body.dryRun, retentionDays: body.olderThanDays, agencyId: actor.agencyId });
   await audit({
     agencyId: actor.agencyId,
     actorType: 'staff',

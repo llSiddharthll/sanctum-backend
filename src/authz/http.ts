@@ -164,6 +164,16 @@ export async function actorFromSessionId(sessionId: string): Promise<{ actor: Ac
   return { actor: await userActor(u, session.id), legacyRole: u.role };
 }
 
+/**
+ * Actor for a user id WITHOUT a session (server-side flows that must re-check a
+ * specific user's current authority, e.g. an OAuth callback). Validates status.
+ */
+export async function actorForUser(userId: string, agencyId: string): Promise<Actor> {
+  const u = await loadUser(userId, agencyId);
+  if (!u) throw unauthenticated('Session is no longer valid.');
+  return userActor(u, null);
+}
+
 /** Legacy (session-less) token principal. TODO(authz phase 10): remove. */
 export async function actorFromLegacyUser(userId: string, agencyId: string): Promise<{ actor: Actor; legacyRole: Role | null }> {
   const u = await loadUser(userId, agencyId);

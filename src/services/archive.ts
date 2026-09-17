@@ -98,11 +98,19 @@ export async function unarchiveTask(
 export async function unarchivePost(
   agencyId: string,
   postId: string,
+  clientId: string,
 ): Promise<boolean> {
   const r = await db
     .update(contentPosts)
     .set({ archivedAt: null, archivedMonth: null, updatedAt: new Date() })
-    .where(and(eq(contentPosts.agencyId, agencyId), eq(contentPosts.id, postId)))
+    .where(
+      and(
+        eq(contentPosts.agencyId, agencyId),
+        eq(contentPosts.id, postId),
+        eq(contentPosts.clientId, clientId),
+        isNotNull(contentPosts.archivedAt),
+      ),
+    )
     .returning({ id: contentPosts.id });
   return r.length > 0;
 }

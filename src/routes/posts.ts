@@ -548,7 +548,7 @@ postsRouter.post('/:id/unarchive', requires('posts.restore'), async (req, res) =
   const clientId = param(req, 'clientId');
   const { row: post, facts } = await authorizePost(actor, clientId, param(req, 'id'), 'posts.restore');
   if (!post.archivedAt) throw notFound('Archived post not found.');
-  const restored = await unarchivePost(actor.agencyId, post.id);
+  const restored = await unarchivePost(actor.agencyId, post.id, post.clientId);
   if (!restored) throw notFound('Archived post not found.');
   await audit({
     agencyId: actor.agencyId,

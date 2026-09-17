@@ -492,6 +492,8 @@ export const postMedia = sqliteTable(
     postId: text('post_id')
       .notNull()
       .references(() => contentPosts.id, { onDelete: 'cascade' }),
+    // Uploader: enables the `own` scope for media.delete (NULL for legacy rows).
+    uploadedBy: text('uploaded_by').references(() => users.id, { onDelete: 'set null' }),
     cloudinaryPublicId: text('cloudinary_public_id').notNull(),
     secureUrl: text('secure_url').notNull(),
     resourceType: text('resource_type', {

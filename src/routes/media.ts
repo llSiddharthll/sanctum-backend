@@ -87,6 +87,7 @@ mediaRouter.post('/posts/:postId', requires('media.upload'), async (req, res) =>
     agencyId: actor.agencyId,
     clientId: body.clientId,
     postId: post.id,
+    uploadedBy: actor.userId,
     cloudinaryPublicId: body.cloudinaryPublicId,
     secureUrl: body.secureUrl,
     resourceType: body.resourceType,

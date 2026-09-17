@@ -24,7 +24,7 @@ import {
   verifyOAuthState,
   type ConnectSessionPayload,
 } from '../services/social-oauth.js';
-import { actorFromLegacyUser } from '../authz/http.js';
+import { actorForUser } from '../authz/http.js';
 import { check } from '../authz/engine.js';
 import { clientFacts } from '../authz/policies/clients.js';
 
@@ -44,7 +44,7 @@ function backToApp(clientId: string, params: Record<string, string>): string {
  */
 async function initiatorMayConnect(agencyId: string, userId: string, clientId: string): Promise<boolean> {
   try {
-    const { actor } = await actorFromLegacyUser(userId, agencyId);
+    const actor = await actorForUser(userId, agencyId);
     if (actor.type !== 'staff') return false;
     return check(actor, 'social_accounts.manage', await clientFacts(actor, clientId));
   } catch {

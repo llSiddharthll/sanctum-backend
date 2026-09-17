@@ -116,6 +116,10 @@ const envSchema = z.object({
   // Tenant that owns the (single, server-wide) Refrens credentials. Sync/push is
   // refused for every other agency (prevents cross-tenant invoice imports).
   REFRENS_AGENCY_ID: z.string().optional(),
+  // Purpose-specific signing secrets (fall back to a key derived from
+  // JWT_ACCESS_SECRET so tokens for different purposes are never interchangeable).
+  OAUTH_STATE_SECRET: z.string().min(32).optional(),
+  UPLOAD_TOKEN_SECRET: z.string().min(32).optional(),
   // Tenant whose staff may view/operate host-level storage (local disk archive).
   // Unset = nobody (storage endpoints are platform operations, not per agency).
   PLATFORM_AGENCY_ID: z.string().optional(),

@@ -34,7 +34,7 @@ function safeKey(key: string): string {
  * an upload signature is never interchangeable with any other token.
  */
 const UPLOAD_KEY = crypto
-  .createHmac('sha256', process.env.UPLOAD_TOKEN_SECRET || env.JWT_ACCESS_SECRET)
+  .createHmac('sha256', env.UPLOAD_TOKEN_SECRET || env.JWT_ACCESS_SECRET)
   .update('upload')
   .digest();
 

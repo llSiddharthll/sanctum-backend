@@ -15,7 +15,7 @@ import type { MetaPage } from './meta.js';
  * access-token secret — derived, so a state can never verify as another token.
  */
 const STATE_KEY = crypto
-  .createHmac('sha256', process.env.OAUTH_STATE_SECRET || env.JWT_ACCESS_SECRET)
+  .createHmac('sha256', env.OAUTH_STATE_SECRET || env.JWT_ACCESS_SECRET)
   .update('oauth-state')
   .digest();
 const STATE_AUD = 'sanctum:meta-oauth';
