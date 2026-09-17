@@ -2,15 +2,15 @@
  * Tenant-binding helpers for input references (design §G.2 "Foreign keys in
  * input"). Every id a caller supplies must exist in the actor's agency.
  */
-import { and, eq, inArray, type AnyColumn } from 'drizzle-orm';
-import type { SQLiteTable } from 'drizzle-orm/sqlite-core';
+import { and, eq, inArray } from 'drizzle-orm';
+import type { SQLiteColumn, SQLiteTable } from 'drizzle-orm/sqlite-core';
 import { db } from '../db/client.js';
 import { users } from '../db/schema.js';
 import { notFound, badRequest } from '../lib/errors.js';
 
 /** Throw 404 unless the row `id` exists in `table` for `agencyId`. */
 export async function requireInAgency(
-  table: SQLiteTable & { id: AnyColumn; agencyId: AnyColumn },
+  table: SQLiteTable & { id: SQLiteColumn; agencyId: SQLiteColumn },
   agencyId: string,
   id: string,
   label = 'Resource',
