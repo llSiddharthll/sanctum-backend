@@ -20,10 +20,15 @@ export function isAllowedOrigin(
       host === 'thecreativemonk.in' ||
       host.endsWith('.thecreativemonk.in') ||
       host === 'creativemonk.in' ||
-      host.endsWith('.creativemonk.in') ||
-      host.endsWith('.netlify.app') ||
-      host.endsWith('.vercel.app')
+      host.endsWith('.creativemonk.in')
     ) {
+      return true;
+    }
+    // Shared hosting platforms: anyone can deploy a site there, so a credentialed
+    // wildcard would let third-party pages act as the signed-in user. Previews
+    // are allowed only outside production (allowPrivateLan is dev-only).
+    // Production previews must be added explicitly to FRONTEND_ORIGIN.
+    if (allowPrivateLan && (host.endsWith('.netlify.app') || host.endsWith('.vercel.app'))) {
       return true;
     }
   } catch {
