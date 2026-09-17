@@ -13,9 +13,10 @@ import {
  * Timers module. Mirrors test/clients.test.ts conventions.
  *
  * Notes from reading src/routes/projects.ts + src/routes/timers.ts:
- *  - The module gate is requireModuleRW('projects'): GET needs `view`, any
- *    mutation needs `manage`. Access is purely permission-based — being a
- *    projectMember does NOT widen/narrow module access.
+ *  - Authorization is the authz engine (src/authz): per-route catalog
+ *    permissions + object checks. Project membership is the `assigned` /
+ *    `project` scope (e.g. an Employee creates tasks only in projects they
+ *    belong to). Scenario coverage lives in test/authz/projects.test.ts.
  *  - A project REQUIRES a clientId, so each suite creates a client first.
  *  - Zod validation failures => 422; not-found => 404; forbidden => 403;
  *    conflict => 409.
@@ -459,24 +460,33 @@ describe('projects module', () => {
 
     const add = await owner
       .post(`${BASE}/projects/${projectId}/members`)
-      .send({ userId: member.id, role: 'contributor' });
+      .send({ userId: member.id, role: 'member' });
     expect(add.status).toBe(201);
     expect(data(add).userId).toBe(member.id);
-    expect(data(add).role).toBe('contributor');
+    expect(data(add).role).toBe('member');
 
     const list = await owner.get(`${BASE}/projects/${projectId}/members`);
     expect(list.status).toBe(200);
-    // Owner is auto-added as 'owner' on creation; the teammate is now present too.
+    // Owner is auto-added as 'lead' on creation; the teammate is now present too.
     expect(data(list).some((m: any) => m.userId === member.id)).toBe(true);
-    expect(data(list).some((m: any) => m.role === 'owner')).toBe(true);
+    expect(data(list).some((m: any) => m.role === 'lead')).toBe(true);
   });
 
-  it('returns 404 assigning a member that is not an agency user', async () => {
+  it('rejects adding a member that is not an active staff user (400)', async () => {
     const projectId = await makeProject(owner, clientId);
     const res = await owner
       .post(`${BASE}/projects/${projectId}/members`)
       .send({ userId: 'usr_outsider' });
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects a free-text project member role (422)', async () => {
+    const projectId = await makeProject(owner, clientId);
+    const { user: member } = await createMemberSession(owner, {});
+    const res = await owner
+      .post(`${BASE}/projects/${projectId}/members`)
+      .send({ userId: member.id, role: 'owner' });
+    expect(res.status).toBe(422);
   });
 
   it('lets a member with default (manage) access see and act on projects', async () => {
@@ -752,20 +762,29 @@ describe('projects permissions', () => {
     expect(create.status).toBe(403);
   });
 
-  it('lets a projects:view member read AND create a task (auto-assigned to them)', async () => {
+  it('lets a projects:view member read, and create a task only in projects they belong to', async () => {
     const { agent, user } = await createMemberSession(owner, {
       permissions: { projects: 'view' },
     });
     const get = await agent.get(`${BASE}/projects/${projectId}`);
     expect(get.status).toBe(200);
 
-    // Members may add tasks to any project they can view; the task auto-assigns
-    // to the creator so it lands on their board.
+    // tasks.create is project-scoped: not a member yet → 403.
+    const denied = await agent
+      .post(`${BASE}/projects/${projectId}/tasks`)
+      .send({ title: 'Member task', priority: 'high' });
+    expect(denied.status).toBe(403);
+
+    await owner
+      .post(`${BASE}/projects/${projectId}/members`)
+      .send({ userId: user.id });
+    // As a member the task auto-assigns to the creator so it lands on their board.
     const create = await agent
       .post(`${BASE}/projects/${projectId}/tasks`)
       .send({ title: 'Member task', priority: 'high' });
     expect(create.status).toBe(201);
     expect(create.body.data.assigneeId).toBe(user.id);
+    expect(create.body.data.createdBy).toBe(user.id);
   });
 
   // Timers are gated by the projects module: a projects:none member is denied
@@ -790,10 +809,13 @@ describe('projects permissions', () => {
   });
 
   it('lets a projects:view member delete their OWN task but not others', async () => {
-    const { agent } = await createMemberSession(owner, {
+    const { agent, user } = await createMemberSession(owner, {
       permissions: { projects: 'view' },
     });
-    // Member self-creates a task (auto-assigned to them) and can delete it.
+    await owner
+      .post(`${BASE}/projects/${projectId}/members`)
+      .send({ userId: user.id });
+    // Member self-creates a task (they are its creator) and can delete it.
     const own = data(
       await agent
         .post(`${BASE}/projects/${projectId}/tasks`)

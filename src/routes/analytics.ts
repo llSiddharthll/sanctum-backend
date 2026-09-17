@@ -23,21 +23,19 @@ import {
   leaveRequests,
 } from '../db/schema.js';
 import { ok } from '../lib/http.js';
-import { requireAuth } from '../middleware/auth.js';
-import { requireModuleRW, requireModule } from '../middleware/permissions.js';
-import { getAuth } from '../middleware/tenant.js';
+import { authenticate, getActor, requires } from '../authz/http.js';
+import { canOrg } from '../authz/engine.js';
 
 export const analyticsRouter = Router();
-analyticsRouter.use(requireAuth);
+analyticsRouter.use(authenticate);
 
 // GET /analytics/summary — agency-wide counts by status + client/post totals.
-// Gated on the Dashboard module (view), so members see the overview too — it's
-// agency content stats, consistent with members seeing all clients.
+// reports.view_dashboard (organization-only aggregate).
 analyticsRouter.get(
   '/summary',
-  requireModuleRW('dashboard'),
+  requires('reports.view_dashboard'),
   async (req, res) => {
-    const ctx = getAuth(req);
+    const ctx = getActor(req);
 
     const byStatus = await db
       .select({ status: contentPosts.status, n: count() })
@@ -72,13 +70,13 @@ analyticsRouter.get(
 );
 
 // GET /analytics/team-overview — projects (by status/health) + tasks (by status)
-// + team size, for the Manager dashboard. Gated on the Projects module (view),
-// which the Manager preset grants.
+// + team size, for the Manager dashboard. reports.view_team_overview
+// (organization-only aggregate).
 analyticsRouter.get(
   '/team-overview',
-  requireModuleRW('projects'),
+  requires('reports.view_team_overview'),
   async (req, res) => {
-    const ctx = getAuth(req);
+    const ctx = getActor(req);
     const toMap = <T extends { n: number }>(rows: T[], key: keyof T) =>
       rows.reduce<Record<string, number>>((acc, r) => {
         acc[String(r[key])] = Number(r.n);
@@ -103,7 +101,7 @@ analyticsRouter.get(
     const [members] = await db
       .select({ n: count() })
       .from(users)
-      .where(and(eq(users.agencyId, ctx.agencyId), ne(users.role, 'client')));
+      .where(and(eq(users.agencyId, ctx.agencyId), eq(users.kind, 'staff')));
     const [activeProjects] = await db
       .select({ n: count() })
       .from(projects)
@@ -168,11 +166,13 @@ function weekdaysBetween(from: Date, toExclusive: Date): number {
 
 analyticsRouter.get(
   '/leaderboard',
-  // Owner/admin + managers only (projects:manage) — employees (projects:edit)
-  // can't see the ranking of their peers.
-  requireModule('projects', 'manage'),
+  // reports.view_leaderboard. Attendance/leave-derived components additionally
+  // need attendance.view_reports; without it they are omitted from the response
+  // and do not influence the score (neutral weight).
+  requires('reports.view_leaderboard'),
   async (req, res) => {
-    const ctx = getAuth(req);
+    const ctx = getActor(req);
+    const withAttendance = canOrg(ctx, 'attendance.view_reports');
     const now = new Date();
 
     // Month = ?month=YYYY-MM, default current month (UTC).
@@ -206,7 +206,7 @@ analyticsRouter.get(
       ineligible: [] as unknown[],
     };
 
-    // Employees = active member-tier users (owner/admin/client excluded).
+    // Ranked people = active staff accounts (client accounts excluded).
     const employees = await db
       .select({
         id: users.id,
@@ -217,7 +217,7 @@ analyticsRouter.get(
       .where(
         and(
           eq(users.agencyId, ctx.agencyId),
-          eq(users.role, 'member'),
+          eq(users.kind, 'staff'),
           eq(users.status, 'active'),
         ),
       );
@@ -304,7 +304,7 @@ analyticsRouter.get(
     }
 
     // Attendance for the month.
-    const att = await db
+    const att = !withAttendance ? [] : await db
       .select({
         userId: attendanceRecords.userId,
         status: attendanceRecords.status,
@@ -320,7 +320,7 @@ analyticsRouter.get(
       );
 
     // Approved leaves overlapping the month (reduce expected working days).
-    const leaves = await db
+    const leaves = !withAttendance ? [] : await db
       .select({
         userId: leaveRequests.userId,
         startDay: leaveRequests.startDay,
@@ -488,7 +488,9 @@ analyticsRouter.get(
         throughput: Math.round(throughput * 100),
         pointsPerDay: Math.round(r.pointsPerDay * 100) / 100,
         timeEfficiency: r.timeEff === null ? null : Math.round(r.timeEff * 100),
-        attendance: r.attendance === null ? null : Math.round(r.attendance * 100),
+        ...(withAttendance
+          ? { attendance: r.attendance === null ? null : Math.round(r.attendance * 100) }
+          : {}),
         estimateCoverage: Math.round(r.estimateCoverage * 100),
         overdueOpen: r.overdue,
         eligible: r.completed >= MIN_COMPLETED,

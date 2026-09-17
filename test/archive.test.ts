@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll } from 'vitest';
-import { BASE, signupAgency, data, type Agent } from './helpers';
+import { eq } from 'drizzle-orm';
+import { BASE, signupAgency, data, db, schema, type Agent } from './helpers';
 import { sweepEndedMonths } from '../src/services/archive';
 
 /**
@@ -82,26 +83,30 @@ describe('month-end archive sweep', () => {
   });
 
   it('archives unposted past-month content posts and hides them from the calendar', async () => {
-    // A past-month post (unposted) + a past-month posted one.
+    // A past-month post (unposted draft) + a past-month posted one. New posts
+    // always start as drafts through the API (posts state machine), so the
+    // already-posted fixture is seeded directly.
     const p1 = data(
       await owner.post(`${BASE}/clients/${clientId}/posts`).send({
         postType: 'reel',
         caption: 'Old draft reel',
         scheduledAt: '2026-06-10T09:00:00.000Z',
-        status: 'scheduled',
       }),
     );
-    const p2 = data(
-      await owner.post(`${BASE}/clients/${clientId}/posts`).send({
-        postType: 'post',
-        caption: 'Old posted',
-        scheduledAt: '2026-06-12T09:00:00.000Z',
-        status: 'scheduled',
-      }),
-    );
-    await owner
-      .post(`${BASE}/clients/${clientId}/posts/${p2.id}/transition`)
-      .send({ to: 'posted' });
+    const [client] = await db
+      .select({ agencyId: schema.clients.agencyId })
+      .from(schema.clients)
+      .where(eq(schema.clients.id, clientId));
+    const p2 = { id: `post_seed_${Date.now()}` };
+    await db.insert(schema.contentPosts).values({
+      id: p2.id,
+      agencyId: client!.agencyId,
+      clientId,
+      postType: 'post',
+      caption: 'Old posted',
+      scheduledAt: new Date('2026-06-12T09:00:00.000Z'),
+      status: 'posted',
+    });
 
     await sweepEndedMonths(new Date('2026-08-05T00:00:00Z'));
 

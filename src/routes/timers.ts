@@ -10,13 +10,9 @@ import {
   users,
   attendancePolicy,
 } from '../db/schema.js';
-import { ok, created, toIso } from '../lib/http.js';
+import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { notFound, conflict, forbidden } from '../lib/errors.js';
-import { requireAuth } from '../middleware/auth.js';
-import { loadPermissions } from '../middleware/permissions.js';
-import { meetsLevel } from '../lib/permissions.js';
-import { getAuth } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
 import {
   resolvePolicy,
@@ -24,75 +20,60 @@ import {
   minutesIntoDayInTz,
   type ResolvedPolicy,
 } from '../lib/attendance.js';
+import { authenticate, getActor, requires } from '../authz/http.js';
+import { authorize, check } from '../authz/engine.js';
+import {
+  actorAuditId,
+  actorUserId,
+  systemActor,
+  type Actor,
+} from '../authz/actor.js';
+import {
+  projectFacts,
+  taskFacts,
+  timeLogFacts,
+  timerScopeFilter,
+} from '../authz/policies/projects.js';
 
 export const timersRouter = Router();
-timersRouter.use(requireAuth);
-// Timers track work on projects/tasks → part of the Projects module. Starting/
-// stopping a timer is the caller's OWN work-tracking (always keyed to
-// ctx.userId), so any member with projects:VIEW may do it — otherwise an
-// employee (projects:view) couldn't clock their own time. Editing time logs
-// keeps the edit ceiling. A projects:none member is still blocked (needs view).
-timersRouter.use(async (req, _res, next) => {
-  try {
-    const level = (await loadPermissions(req)).projects;
-    if (!meetsLevel(level, 'view')) {
-      return next(forbidden("You don't have permission to view Projects."));
-    }
-    const isWrite = !['GET', 'HEAD', 'OPTIONS'].includes(req.method);
-    if (isWrite && req.path.includes('/logs') && !meetsLevel(level, 'edit')) {
-      return next(forbidden("You don't have permission to edit Projects."));
-    }
-    next();
-  } catch (err) {
-    next(err);
-  }
-});
-
-type Ctx = ReturnType<typeof getAuth>;
-
-// ---- Helpers (exported — also used by the project-scoped routes) ----
-
-/** Verify a project belongs to the caller's agency; return {id,name} or 404. */
-async function requireAgencyProject(
-  ctx: Ctx,
-  projectId: string,
-): Promise<{ id: string; name: string }> {
-  const [row] = await db
-    .select({ id: projects.id, name: projects.name })
-    .from(projects)
-    .where(
-      and(eq(projects.id, projectId), eq(projects.agencyId, ctx.agencyId)),
-    )
-    .limit(1);
-  if (!row) throw notFound('Project not found.');
-  return row;
-}
+// Every route declares its permission; timers.use is own-only self-service
+// (start/stop/read the caller's own timer). Editing a time log is authorized
+// on the log itself (time_logs.update: own or organization).
+timersRouter.use(authenticate);
 
 /**
- * Verify a task belongs to the agency (and, if a project is given, to that
- * project). Returns {id,title} or throws 404/409.
+ * Who performed a timer write, for auditing. Accepts an engine Actor or the
+ * legacy `{ agencyId, userId, role }` context still passed by un-migrated
+ * callers (attendance check-out). TODO(authz phase 10): Actor only.
  */
-async function requireAgencyTask(
-  ctx: Ctx,
-  taskId: string,
-  projectId?: string,
-): Promise<{ id: string; title: string }> {
-  const [row] = await db
-    .select({
-      id: projectTasks.id,
-      title: projectTasks.title,
-      projectId: projectTasks.projectId,
-    })
-    .from(projectTasks)
-    .where(
-      and(eq(projectTasks.id, taskId), eq(projectTasks.agencyId, ctx.agencyId)),
-    )
-    .limit(1);
-  if (!row) throw notFound('Task not found.');
-  if (projectId && row.projectId !== projectId) {
-    throw conflict('Task does not belong to the given project.');
+export type TimerPrincipal = Actor | { agencyId: string; userId: string; role?: string };
+
+function isActor(p: TimerPrincipal): p is Actor {
+  return 'type' in p && 'grants' in p;
+}
+
+function principalAudit(p: TimerPrincipal): {
+  agencyId: string;
+  actorType: Actor['type'];
+  actorId: string;
+  userId: string | null;
+} {
+  if (isActor(p)) {
+    return { agencyId: p.agencyId, actorType: p.type, actorId: actorAuditId(p), userId: actorUserId(p) };
   }
-  return { id: row.id, title: row.title };
+  return { agencyId: p.agencyId, actorType: 'staff', actorId: p.userId, userId: p.userId };
+}
+
+/** The staff user behind a timer request (timers are per user). */
+function requireUserId(actor: Actor): string {
+  const uid = actorUserId(actor);
+  if (!uid || actor.type !== 'staff') throw forbidden('Only team members track time.');
+  return uid;
+}
+
+/** System principal that closes timers it does not own (explicit minimal grants). */
+function timerSystemActor(job: string, agencyId: string) {
+  return systemActor(job, agencyId, [{ permission: 'time_logs.create', scope: 'organization' }]);
 }
 
 /** Whole minutes elapsed since `startedAt` (floored at 0). */
@@ -146,9 +127,9 @@ function serializeRunning(r: RunningTimerRow) {
   };
 }
 
-/** Fetch the current user's single running timer (joined), or null. */
+/** Fetch a user's single running timer (joined), or null. */
 async function fetchRunningTimer(
-  ctx: Ctx,
+  agencyId: string,
   userId: string,
 ): Promise<RunningTimerRow | null> {
   const [row] = await db
@@ -157,7 +138,7 @@ async function fetchRunningTimer(
     .leftJoin(projects, eq(projects.id, timers.projectId))
     .leftJoin(projectTasks, eq(projectTasks.id, timers.taskId))
     .leftJoin(users, eq(users.id, timers.userId))
-    .where(and(eq(timers.agencyId, ctx.agencyId), eq(timers.userId, userId)))
+    .where(and(eq(timers.agencyId, agencyId), eq(timers.userId, userId)))
     .limit(1);
   return (row as RunningTimerRow | undefined) ?? null;
 }
@@ -168,7 +149,7 @@ async function fetchRunningTimer(
  * timeout) must NOT break starting/stopping a timer — degrade to null instead.
  */
 async function taskTitleFor(
-  ctx: Ctx,
+  agencyId: string,
   taskId: string | null,
 ): Promise<string | null> {
   if (!taskId) return null;
@@ -176,12 +157,7 @@ async function taskTitleFor(
     const [row] = await db
       .select({ title: projectTasks.title })
       .from(projectTasks)
-      .where(
-        and(
-          eq(projectTasks.id, taskId),
-          eq(projectTasks.agencyId, ctx.agencyId),
-        ),
-      )
+      .where(and(eq(projectTasks.id, taskId), eq(projectTasks.agencyId, agencyId)))
       .limit(1);
     return row?.title ?? null;
   } catch {
@@ -190,19 +166,21 @@ async function taskTitleFor(
 }
 
 /**
- * Stop a raw running timer row: write a time_log, delete the timer, audit it.
- * Returns the inserted minutes + timeLog id. Used by /stop and implicitly by
- * /start (auto-stop the previous timer).
+ * Stop a raw running timer row: write a time_log for the timer's OWNER, delete
+ * the timer, audit it as `principal` (the owner themself, or a system actor
+ * when closing someone else's timer). Returns the inserted minutes + log id.
  */
 async function stopTimerRow(
-  ctx: Ctx,
+  principal: TimerPrincipal,
   timer: typeof timers.$inferSelect,
   taskTitle: string | null,
   ip?: string,
   /** Cap the billed time at this instant (e.g. checkout / shift end) instead of
    * "now" — used to auto-close forgotten timers without runaway hours. */
   endAt?: Date,
+  extraMeta: Record<string, unknown> = {},
 ): Promise<{ minutes: number; timeLogId: string }> {
+  const who = principalAudit(principal);
   const minutes =
     endAt && timer.startedAt
       ? Math.max(
@@ -213,7 +191,7 @@ async function stopTimerRow(
   const timeLogId = newId('tlg');
   await db.insert(timeLogs).values({
     id: timeLogId,
-    agencyId: ctx.agencyId,
+    agencyId: timer.agencyId,
     userId: timer.userId,
     projectId: timer.projectId,
     taskId: timer.taskId ?? null,
@@ -221,12 +199,14 @@ async function stopTimerRow(
     workDate: timer.startedAt,
     note: timer.note ?? null,
   });
-  await db.delete(timers).where(eq(timers.id, timer.id));
+  await db
+    .delete(timers)
+    .where(and(eq(timers.id, timer.id), eq(timers.agencyId, timer.agencyId)));
 
   await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+    agencyId: timer.agencyId,
+    actorType: who.actorType,
+    actorId: who.actorId,
     action: 'timer.stop',
     entityType: 'timer',
     entityId: timer.id,
@@ -235,6 +215,8 @@ async function stopTimerRow(
       taskId: timer.taskId,
       taskTitle,
       minutes,
+      ...(timer.userId !== who.userId ? { timerUserId: timer.userId } : {}),
+      ...extraMeta,
     },
     ip,
   });
@@ -244,41 +226,57 @@ async function stopTimerRow(
 
 /**
  * Stop EVERY running timer attached to a task (across all users) — used when a
- * task is marked complete, so nobody keeps logging time against finished work.
- * Each timer is committed to a time_log for its own owner. Returns how many
- * were stopped.
+ * task is marked complete. The caller's own timer is stopped as the caller;
+ * other users' timers are closed by a SYSTEM actor (audited with actorType
+ * 'system' and the triggering principal recorded), never as the caller.
+ * Each timer is committed to a time_log for its own owner.
  */
 export async function stopTimersForTask(
-  ctx: Ctx,
+  actor: Actor,
   taskId: string,
   taskTitle: string | null,
 ): Promise<number> {
   const running = await db
     .select()
     .from(timers)
-    .where(and(eq(timers.agencyId, ctx.agencyId), eq(timers.taskId, taskId)));
+    .where(and(eq(timers.agencyId, actor.agencyId), eq(timers.taskId, taskId)));
+  const uid = actorUserId(actor);
+  const sys = timerSystemActor('task_completion', actor.agencyId);
+  let stopped = 0;
   for (const timer of running) {
-    await stopTimerRow(ctx, timer, taskTitle);
+    if (timer.userId === uid) {
+      await stopTimerRow(actor, timer, taskTitle);
+    } else {
+      if (!check(sys, 'time_logs.create', { agencyId: timer.agencyId, ownerIds: [timer.userId] })) continue;
+      await stopTimerRow(sys, timer, taskTitle, undefined, undefined, {
+        reason: 'task_completed',
+        triggeredBy: actorAuditId(actor),
+      });
+    }
+    stopped += 1;
   }
-  return running.length;
+  return stopped;
 }
 
 /**
  * Stop every running timer for a user, billing each only up to `endAt` (their
  * checkout instant). Called on check-out so a timer left running doesn't keep
- * accruing after the person has gone home.
+ * accruing after the person has gone home. Self only: the principal must be
+ * the timer owner (otherwise nothing is stopped).
  */
 export async function stopTimersForUser(
-  ctx: Ctx,
+  principal: TimerPrincipal,
   userId: string,
   endAt: Date,
 ): Promise<number> {
+  const who = principalAudit(principal);
+  if (who.userId !== userId) return 0;
   const running = await db
     .select()
     .from(timers)
-    .where(and(eq(timers.agencyId, ctx.agencyId), eq(timers.userId, userId)));
+    .where(and(eq(timers.agencyId, who.agencyId), eq(timers.userId, userId)));
   for (const timer of running) {
-    await stopTimerRow(ctx, timer, null, undefined, endAt);
+    await stopTimerRow(principal, timer, null, undefined, endAt);
   }
   return running.length;
 }
@@ -287,7 +285,7 @@ export async function stopTimersForUser(
  * Shift-end safety sweep (cron): auto-close any timer still running past its
  * start-day's shift end — for people who forgot to stop it AND to check out.
  * Each timer is billed only up to the shift end, so an overnight / runaway
- * timer can never corrupt the totals. Best-effort per timer.
+ * timer can never corrupt the totals. Runs as a per-agency SYSTEM actor.
  */
 export async function sweepStaleTimers(): Promise<number> {
   const running = await db.select().from(timers);
@@ -333,13 +331,8 @@ export async function sweepStaleTimers(): Promise<number> {
           : Math.min(elapsed, policy.fullDayMinutes); // started after hours
       const endAt = new Date(timer.startedAt.getTime() + capMinutes * 60000);
 
-      // Attribute the auto-close to the timer's own owner.
-      const ctx = {
-        agencyId: timer.agencyId,
-        userId: timer.userId,
-        role: 'member',
-      } as unknown as Ctx;
-      await stopTimerRow(ctx, timer, null, undefined, endAt);
+      const sys = timerSystemActor('timer_sweep', timer.agencyId);
+      await stopTimerRow(sys, timer, null, undefined, endAt, { reason: 'shift_end' });
       closed += 1;
     } catch {
       /* keep sweeping the rest */
@@ -349,10 +342,10 @@ export async function sweepStaleTimers(): Promise<number> {
 }
 
 /**
- * List ALL running timers for a project (who's working now). Exported so the
- * project-scoped routes + overview can reuse it.
+ * Running timers for a project that the actor may see (own always; others via
+ * timers.view scope). Exported for the project-scoped routes + overview.
  */
-export async function listProjectTimers(ctx: Ctx, projectId: string) {
+export async function listProjectTimers(actor: Actor, projectId: string) {
   const rows = await db
     .select({
       userId: timers.userId,
@@ -365,7 +358,11 @@ export async function listProjectTimers(ctx: Ctx, projectId: string) {
     .leftJoin(users, eq(users.id, timers.userId))
     .leftJoin(projectTasks, eq(projectTasks.id, timers.taskId))
     .where(
-      and(eq(timers.agencyId, ctx.agencyId), eq(timers.projectId, projectId)),
+      and(
+        eq(timers.agencyId, actor.agencyId),
+        eq(timers.projectId, projectId),
+        timerScopeFilter(actor),
+      ),
     )
     .orderBy(desc(timers.startedAt));
 
@@ -380,7 +377,8 @@ export async function listProjectTimers(ctx: Ctx, projectId: string) {
 }
 
 // ============================================================
-//  POST /timers/start
+//  POST /timers/start — timers.use (own). The project (projects.view) and
+//  task (tasks.view) must be visible to the caller.
 // ============================================================
 const startSchema = z.object({
   projectId: z.string().min(1),
@@ -388,35 +386,47 @@ const startSchema = z.object({
   note: z.string().trim().max(2000).optional(),
 });
 
-timersRouter.post('/start', async (req, res) => {
-  const ctx = getAuth(req);
+timersRouter.post('/start', requires('timers.use'), async (req, res) => {
+  const actor = getActor(req);
+  const uid = requireUserId(actor);
   const body = startSchema.parse(req.body);
 
-  const project = await requireAgencyProject(ctx, body.projectId);
+  const pf = await projectFacts(actor, body.projectId);
+  authorize(actor, 'projects.view', pf);
+  const [project] = await db
+    .select({ id: projects.id, name: projects.name })
+    .from(projects)
+    .where(and(eq(projects.id, body.projectId), eq(projects.agencyId, actor.agencyId)))
+    .limit(1);
+  if (!project) throw notFound('Project not found.');
+
   let task: { id: string; title: string } | null = null;
   if (body.taskId) {
-    task = await requireAgencyTask(ctx, body.taskId, body.projectId);
+    const tf = await taskFacts(actor, body.taskId);
+    authorize(actor, 'tasks.view', tf);
+    if (tf!.task.projectId !== body.projectId) {
+      throw conflict('Task does not belong to the given project.');
+    }
+    task = { id: tf!.task.id, title: tf!.task.title };
   }
 
   // One running timer per user: stop any existing one first (writes its log).
   const [existing] = await db
     .select()
     .from(timers)
-    .where(
-      and(eq(timers.agencyId, ctx.agencyId), eq(timers.userId, ctx.userId)),
-    )
+    .where(and(eq(timers.agencyId, actor.agencyId), eq(timers.userId, uid)))
     .limit(1);
   if (existing) {
-    const prevTitle = await taskTitleFor(ctx, existing.taskId);
-    await stopTimerRow(ctx, existing, prevTitle, req.ip);
+    const prevTitle = await taskTitleFor(actor.agencyId, existing.taskId);
+    await stopTimerRow(actor, existing, prevTitle, req.ip);
   }
 
   const id = newId('tmr');
   const startedAt = new Date();
   await db.insert(timers).values({
     id,
-    agencyId: ctx.agencyId,
-    userId: ctx.userId,
+    agencyId: actor.agencyId,
+    userId: uid,
     projectId: body.projectId,
     taskId: body.taskId ?? null,
     startedAt,
@@ -424,9 +434,9 @@ timersRouter.post('/start', async (req, res) => {
   });
 
   await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+    agencyId: actor.agencyId,
+    actorType: actor.type,
+    actorId: actorAuditId(actor),
     action: 'timer.start',
     entityType: 'timer',
     entityId: id,
@@ -438,7 +448,7 @@ timersRouter.post('/start', async (req, res) => {
     ip: req.ip,
   });
 
-  const running = await fetchRunningTimer(ctx, ctx.userId);
+  const running = await fetchRunningTimer(actor.agencyId, uid);
   created(
     res,
     running
@@ -449,7 +459,7 @@ timersRouter.post('/start', async (req, res) => {
           projectName: project.name,
           taskId: body.taskId ?? null,
           taskTitle: task?.title ?? null,
-          userId: ctx.userId,
+          userId: uid,
           userName: null,
           startedAt: toIso(startedAt),
           note: body.note ?? null,
@@ -459,27 +469,21 @@ timersRouter.post('/start', async (req, res) => {
 });
 
 // ============================================================
-//  POST /timers/stop — stop the CURRENT user's running timer
+//  POST /timers/stop — timers.use: stop the CURRENT user's running timer
 // ============================================================
-timersRouter.post('/stop', async (req, res) => {
-  const ctx = getAuth(req);
+timersRouter.post('/stop', requires('timers.use'), async (req, res) => {
+  const actor = getActor(req);
+  const uid = requireUserId(actor);
 
   const [timer] = await db
     .select()
     .from(timers)
-    .where(
-      and(eq(timers.agencyId, ctx.agencyId), eq(timers.userId, ctx.userId)),
-    )
+    .where(and(eq(timers.agencyId, actor.agencyId), eq(timers.userId, uid)))
     .limit(1);
   if (!timer) throw notFound('No running timer.');
 
-  const taskTitle = await taskTitleFor(ctx, timer.taskId);
-  const { minutes, timeLogId } = await stopTimerRow(
-    ctx,
-    timer,
-    taskTitle,
-    req.ip,
-  );
+  const taskTitle = await taskTitleFor(actor.agencyId, timer.taskId);
+  const { minutes, timeLogId } = await stopTimerRow(actor, timer, taskTitle, req.ip);
 
   // Re-read the inserted time-log (with project name) for the response.
   const [log] = await db
@@ -494,7 +498,7 @@ timersRouter.post('/stop', async (req, res) => {
     })
     .from(timeLogs)
     .leftJoin(projects, eq(projects.id, timeLogs.projectId))
-    .where(eq(timeLogs.id, timeLogId))
+    .where(and(eq(timeLogs.id, timeLogId), eq(timeLogs.agencyId, actor.agencyId)))
     .limit(1);
 
   ok(res, {
@@ -514,51 +518,48 @@ timersRouter.post('/stop', async (req, res) => {
 });
 
 // ============================================================
-//  GET /timers/active — current user's running timer (or null)
+//  GET /timers/active — timers.use: current user's running timer (or null)
 // ============================================================
-timersRouter.get('/active', async (req, res) => {
-  const ctx = getAuth(req);
-  const running = await fetchRunningTimer(ctx, ctx.userId);
+timersRouter.get('/active', requires('timers.use'), async (req, res) => {
+  const actor = getActor(req);
+  const uid = requireUserId(actor);
+  const running = await fetchRunningTimer(actor.agencyId, uid);
   ok(res, running ? serializeRunning(running) : null);
 });
 
 // ============================================================
-//  PATCH /timers/logs/:logId — edit a logged entry's note
-//  (tenant-scoped; lets a user annotate a time log after stopping).
+//  PATCH /timers/logs/:logId — edit a logged entry's note.
+//  time_logs.update on the log (own, or organization).
 // ============================================================
 const editLogSchema = z.object({
   note: z.string().trim().max(2000).nullable(),
 });
 
-timersRouter.patch('/logs/:logId', async (req, res) => {
-  const ctx = getAuth(req);
-  const logId = req.params.logId;
+timersRouter.patch('/logs/:logId', requires('time_logs.update'), async (req, res) => {
+  const actor = getActor(req);
+  const logId = param(req, 'logId');
+  const facts = await timeLogFacts(actor, logId);
+  authorize(actor, 'time_logs.update', facts, { view: 'time_logs.view' });
+  const existing = facts!.log;
   const body = editLogSchema.parse(req.body);
 
-  const [existing] = await db
-    .select({
-      id: timeLogs.id,
-      projectId: timeLogs.projectId,
-      taskId: timeLogs.taskId,
-    })
-    .from(timeLogs)
-    .where(and(eq(timeLogs.id, logId), eq(timeLogs.agencyId, ctx.agencyId)))
-    .limit(1);
-  if (!existing) throw notFound('Time log not found.');
-
   const note = body.note && body.note.length > 0 ? body.note : null;
-  await db.update(timeLogs).set({ note }).where(eq(timeLogs.id, logId));
+  await db
+    .update(timeLogs)
+    .set({ note })
+    .where(and(eq(timeLogs.id, logId), eq(timeLogs.agencyId, actor.agencyId)));
 
   await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+    agencyId: actor.agencyId,
+    actorType: actor.type,
+    actorId: actorAuditId(actor),
     action: 'timer.log.edit',
     entityType: 'time_log',
     entityId: logId,
     metadata: {
       projectId: existing.projectId,
       taskId: existing.taskId,
+      ...(existing.userId !== actorUserId(actor) ? { logUserId: existing.userId } : {}),
     },
     ip: req.ip,
   });

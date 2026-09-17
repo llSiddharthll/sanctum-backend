@@ -10,15 +10,15 @@ import {
   timeLogs,
 } from '../db/schema.js';
 import { ok, toIso } from '../lib/http.js';
-import { requireAuth } from '../middleware/auth.js';
-import { requireModule } from '../middleware/permissions.js';
-import { getAuth } from '../middleware/tenant.js';
+import { authenticate, getStaffActor, requires } from '../authz/http.js';
+import { check } from '../authz/engine.js';
+import { taskScopeFilter, timeLogScopeFilter } from '../authz/policies/projects.js';
 
 // Current-user ("/me") aggregates that span every project in the agency, as a
 // counterpart to the per-project routes under '/projects/:id'. Read-only.
+// Rows are the caller's own assignments AND within their tasks.view scope.
 export const meRouter = Router();
-meRouter.use(requireAuth);
-meRouter.use(requireModule('projects', 'view'));
+meRouter.use(authenticate);
 
 const TASK_STATUSES = [
   'backlog',
@@ -65,8 +65,9 @@ type MyTaskRow = {
   archivedMonth: string | null;
 };
 
-meRouter.get('/tasks', async (req, res) => {
-  const ctx = getAuth(req);
+meRouter.get('/tasks', requires('tasks.view'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const ctx = { agencyId: actor.agencyId, userId: actor.userId };
   const q = listTasksQuery.parse(req.query);
 
   // Task ids the caller is on via the M:N join (the primary `assigneeId`
@@ -92,6 +93,7 @@ meRouter.get('/tasks', async (req, res) => {
       eq(projectTasks.assigneeId, ctx.userId),
       inArray(projectTasks.id, assignedTaskIds),
     )!,
+    taskScopeFilter(actor, 'tasks.view'),
   ];
 
   if (q.status) {
@@ -132,8 +134,9 @@ meRouter.get('/tasks', async (req, res) => {
 
 // GET /me/overview — headline numbers for the "My day" (employee) dashboard:
 // my open/overdue/due-today task counts + minutes logged today + this week.
-meRouter.get('/overview', async (req, res) => {
-  const ctx = getAuth(req);
+meRouter.get('/overview', requires('tasks.view'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const ctx = { agencyId: actor.agencyId, userId: actor.userId };
   const now = new Date();
   const startOfToday = new Date(
     now.getFullYear(),
@@ -167,6 +170,7 @@ meRouter.get('/overview', async (req, res) => {
       and(
         eq(projectTasks.agencyId, ctx.agencyId),
         mine,
+        taskScopeFilter(actor, 'tasks.view'),
         isNull(projectTasks.archivedAt),
         ne(projectTasks.status, 'done'),
       ),
@@ -180,23 +184,31 @@ meRouter.get('/overview', async (req, res) => {
     else if (d < startOfTomorrow.getTime()) dueTodayTasks++;
   }
 
-  const [wk] = await db
+  // Own minutes need time_logs.view on own rows; otherwise they are omitted (null).
+  const canSeeOwnTime = check(actor, 'time_logs.view', {
+    agencyId: actor.agencyId,
+    ownerIds: [actor.userId],
+  });
+  const timeScope = timeLogScopeFilter(actor, 'time_logs.view');
+  const [wk] = !canSeeOwnTime ? [] : await db
     .select({ v: sum(timeLogs.minutes) })
     .from(timeLogs)
     .where(
       and(
         eq(timeLogs.agencyId, ctx.agencyId),
         eq(timeLogs.userId, ctx.userId),
+        timeScope,
         gte(timeLogs.workDate, startOfWeek),
       ),
     );
-  const [td] = await db
+  const [td] = !canSeeOwnTime ? [] : await db
     .select({ v: sum(timeLogs.minutes) })
     .from(timeLogs)
     .where(
       and(
         eq(timeLogs.agencyId, ctx.agencyId),
         eq(timeLogs.userId, ctx.userId),
+        timeScope,
         gte(timeLogs.workDate, startOfToday),
       ),
     );
@@ -205,7 +217,7 @@ meRouter.get('/overview', async (req, res) => {
     openTasks: openRows.length,
     overdueTasks,
     dueTodayTasks,
-    todayMinutes: Number(td?.v ?? 0),
-    weekMinutes: Number(wk?.v ?? 0),
+    todayMinutes: canSeeOwnTime ? Number(td?.v ?? 0) : null,
+    weekMinutes: canSeeOwnTime ? Number(wk?.v ?? 0) : null,
   });
 });

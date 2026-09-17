@@ -1,9 +1,12 @@
 import { describe, it, expect, beforeAll } from 'vitest';
+import { eq } from 'drizzle-orm';
 import {
   BASE,
   signupAgency,
   createMemberSession,
   data,
+  db,
+  schema,
   type Agent,
 } from './helpers';
 
@@ -424,13 +427,23 @@ describe('platform: analytics', () => {
   });
 
   it('returns agency-wide summary counts for the owner (200)', async () => {
-    // Seed one draft and one scheduled post so the breakdown is non-empty.
+    // Seed one draft (API) and one scheduled post so the breakdown is non-empty.
+    // New posts always start as drafts through the API (posts state machine),
+    // so the scheduled fixture is seeded directly.
     await owner
       .post(`${BASE}/clients/${clientId}/posts`)
       .send({ postType: 'post', status: 'draft' });
-    await owner
-      .post(`${BASE}/clients/${clientId}/posts`)
-      .send({ postType: 'reel', status: 'scheduled' });
+    const [client] = await db
+      .select({ agencyId: schema.clients.agencyId })
+      .from(schema.clients)
+      .where(eq(schema.clients.id, clientId));
+    await db.insert(schema.contentPosts).values({
+      id: `post_seed_${Date.now()}`,
+      agencyId: client!.agencyId,
+      clientId,
+      postType: 'reel',
+      status: 'scheduled',
+    });
 
     const res = await owner.get(`${BASE}/analytics/summary`);
     expect(res.status).toBe(200);

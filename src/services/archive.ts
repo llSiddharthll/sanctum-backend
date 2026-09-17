@@ -26,10 +26,14 @@ function firstOfCurrentMonthUTC(now: Date): Date {
 export async function sweepEndedMonths(
   now: Date = new Date(),
   agencyId?: string,
+  /** Which halves to sweep (callers authorize each: tasks.archive / posts.archive). */
+  opts: { tasks?: boolean; posts?: boolean } = {},
 ): Promise<SweepResult> {
   const cutoff = firstOfCurrentMonthUTC(now);
+  const doTasks = opts.tasks ?? true;
+  const doPosts = opts.posts ?? true;
 
-  const taskRows = await db
+  const taskRows = !doTasks ? [] : await db
     .update(projectTasks)
     .set({
       archivedAt: now,
@@ -47,7 +51,7 @@ export async function sweepEndedMonths(
     )
     .returning({ id: projectTasks.id });
 
-  const postRows = await db
+  const postRows = !doPosts ? [] : await db
     .update(contentPosts)
     .set({
       archivedAt: now,
@@ -68,7 +72,10 @@ export async function sweepEndedMonths(
   return { tasks: taskRows.length, posts: postRows.length };
 }
 
-/** Restore an archived task to the active board (owner/admin/manager). */
+/**
+ * Restore an ARCHIVED task to the active board. Returns false when the task is
+ * not in the agency or is not archived. Callers authorize `tasks.restore`.
+ */
 export async function unarchiveTask(
   agencyId: string,
   taskId: string,
@@ -77,7 +84,11 @@ export async function unarchiveTask(
     .update(projectTasks)
     .set({ archivedAt: null, archivedMonth: null, updatedAt: new Date() })
     .where(
-      and(eq(projectTasks.agencyId, agencyId), eq(projectTasks.id, taskId)),
+      and(
+        eq(projectTasks.agencyId, agencyId),
+        eq(projectTasks.id, taskId),
+        isNotNull(projectTasks.archivedAt),
+      ),
     )
     .returning({ id: projectTasks.id });
   return r.length > 0;

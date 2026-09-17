@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, type Request } from 'express';
 import { z } from 'zod';
 import {
   and,
@@ -9,8 +9,11 @@ import {
   isNotNull,
   isNull,
   like,
+  ne,
+  notInArray,
   or,
   sql,
+  type SQL,
 } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
@@ -34,10 +37,6 @@ import { broadcastPortalRefresh } from '../realtime/io.js';
 import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { AppError, notFound, conflict, forbidden } from '../lib/errors.js';
-import { requireAuth } from '../middleware/auth.js';
-import { loadPermissions } from '../middleware/permissions.js';
-import { meetsLevel } from '../lib/permissions.js';
-import { getAuth, isPrivileged } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
 import {
   MILESTONE_TEMPLATES,
@@ -45,42 +44,52 @@ import {
 } from '../lib/project-milestone-templates.js';
 import { sweepEndedMonths, unarchiveTask } from '../services/archive.js';
 import { listProjectTimers, stopTimersForTask } from './timers.js';
+import { authenticate, getActor, requires } from '../authz/http.js';
+import {
+  authorize,
+  can,
+  canOrg,
+  capabilities,
+  check,
+  type ObjectFacts,
+} from '../authz/engine.js';
+import {
+  actorAuditId,
+  actorUserId,
+  systemActor,
+  type Actor,
+} from '../authz/actor.js';
+import { requireActiveStaff, requireInAgency } from '../authz/tenancy.js';
+import { clientFacts } from '../authz/policies/clients.js';
+import {
+  assignedTaskIdSet,
+  commentFacts,
+  memberProjectIds,
+  projectFacts,
+  projectFactsFromRow,
+  projectScopeFilter,
+  requireLabelsInProject,
+  requireMilestoneInProject,
+  requireTaskInProject,
+  taskFacts,
+  taskFactsFromRow,
+  taskScopeFilter,
+  timeLogScopeFilter,
+  timerScopeFilter,
+  visibleTaskIdsSq,
+  type ProjectFacts,
+  type TaskFacts,
+} from '../authz/policies/projects.js';
 
 // mergeParams keeps any parent params available (none today, but consistent
 // with the other nested routers).
+//
+// Authorization (src/authz/README.md): every route declares its permission
+// with `requires(...)`; object routes authorize the project / task / comment /
+// time log through the facts loaders in authz/policies/projects.ts; lists are
+// filtered in SQL by scope.
 export const projectsRouter = Router({ mergeParams: true });
-projectsRouter.use(requireAuth);
-// Projects module gate. Everyone needs at least VIEW. Working on TASKS is core
-// work for any project participant (employees/members self-create tasks, track
-// time, and manage their own tasks), so ALL task writes — create, update, AND
-// delete — are allowed at VIEW; the per-route handlers still enforce scope
-// (getScopedProject membership for structure, task ownership for delete).
-// Project-STRUCTURE changes (project settings, members, milestones, project
-// labels, create/delete project) keep the normal edit/manage ceiling.
-projectsRouter.use(async (req, _res, next) => {
-  try {
-    const perms = await loadPermissions(req);
-    const level = perms.projects;
-    if (!meetsLevel(level, 'view')) {
-      throw forbidden("You don't have permission to view Projects.");
-    }
-    const isWrite = !['GET', 'HEAD', 'OPTIONS'].includes(req.method);
-    if (isWrite) {
-      const isTaskWork = req.path.includes('/tasks');
-      if (!isTaskWork) {
-        const needed = req.method === 'DELETE' ? 'manage' : 'edit';
-        if (!meetsLevel(level, needed)) {
-          throw forbidden(
-            `You don't have permission to ${needed} Projects.`,
-          );
-        }
-      }
-    }
-    next();
-  } catch (err) {
-    next(err);
-  }
-});
+projectsRouter.use(authenticate);
 
 const PROJECT_TYPES = [
   'fixed_price',
@@ -114,6 +123,99 @@ const LABEL_COLORS = [
   'violet',
   'slate',
 ] as const;
+/** Project member roles (design §G.2: an enum, not free text). */
+const PROJECT_MEMBER_ROLES = ['lead', 'member'] as const;
+
+/** Capabilities returned on project objects. */
+const PROJECT_CAPS = [
+  'projects.update',
+  'projects.delete',
+  'projects.manage_members',
+  'project_milestones.manage',
+  'projects.view_financials',
+];
+/** Capabilities returned on task objects. */
+const TASK_CAPS = [
+  'tasks.update',
+  'tasks.delete',
+  'tasks.assign',
+  'task_comments.create',
+];
+
+// ---- Actor helpers ----------------------------------------------------------
+
+/** The staff user id behind a write (tasks/comments/members are per user). */
+function staffUserId(actor: Actor): string {
+  const uid = actorUserId(actor);
+  if (!uid || actor.type !== 'staff') {
+    throw forbidden("You don't have permission to do that.");
+  }
+  return uid;
+}
+
+/** Business audit event attributed to the actor (actorType = actor.type). */
+function auditAs(
+  actor: Actor,
+  req: Request | null,
+  e: {
+    action: string;
+    entityType: string;
+    entityId: string;
+    metadata?: Record<string, unknown>;
+  },
+): Promise<void> {
+  return audit({
+    agencyId: actor.agencyId,
+    actorType: actor.type,
+    actorId: actorAuditId(actor),
+    action: e.action,
+    entityType: e.entityType,
+    entityId: e.entityId,
+    metadata: e.metadata,
+    ip: req?.ip,
+  });
+}
+
+/**
+ * Load a project's facts and authorize `permission` on it. Throws 404 when the
+ * project is not in the tenant or the actor cannot view it, 403 otherwise.
+ */
+async function authorizeProject(
+  actor: Actor,
+  projectId: string,
+  permission: string,
+  message?: string,
+): Promise<ProjectFacts> {
+  const facts = await projectFacts(actor, projectId);
+  authorize(
+    actor,
+    permission,
+    facts,
+    permission === 'projects.view' ? {} : { view: 'projects.view', message },
+  );
+  return facts!;
+}
+
+/**
+ * Load a task bound to the URL project and authorize `permission` on it
+ * (404 when not in the project/tenant or not visible via tasks.view).
+ */
+async function authorizeTask(
+  actor: Actor,
+  projectId: string,
+  taskId: string,
+  permission: string,
+  message?: string,
+): Promise<TaskFacts> {
+  const facts = await taskFacts(actor, taskId, { projectId });
+  authorize(
+    actor,
+    permission,
+    facts,
+    permission === 'tasks.view' ? {} : { view: 'tasks.view', message },
+  );
+  return facts!;
+}
 
 // ---- Correlated count subqueries (tenant-implied via project FK) ----
 const tasksTotalSq = sql<number>`(
@@ -195,90 +297,6 @@ type ProjectRow = {
   memberCount: number;
 };
 
-/**
- * True when the caller may see project MONEY (contract value). Gated on the
- * finance module (owner/admin have it; the Manager/Employee presets are
- * finance:none) so rates never leak to delivery roles.
- */
-async function canSeeProjectFinance(req: import('express').Request): Promise<boolean> {
-  const perms = await loadPermissions(req);
-  return meetsLevel(perms.finance, 'view');
-}
-
-/**
- * True when the caller may see EVERY project in the agency. Owner/admin always
- * can; a member needs the 'manage' tier on projects (the Manager preset). A
- * plain member (Employee tier = projects:edit/view) is scoped to the projects
- * they belong to or have a task assigned on.
- */
-async function canSeeAllProjects(req: import('express').Request): Promise<boolean> {
-  const ctx = getAuth(req);
-  if (isPrivileged(ctx.role)) return true;
-  const perms = await loadPermissions(req);
-  return meetsLevel(perms.projects, 'manage');
-}
-
-/**
- * READ visibility: any member with projects:view may BROWSE every project
- * (view-only directory). Writes stay membership-gated via canSeeAllProjects —
- * this only widens what a member can look at, never what they can change.
- */
-async function canViewAllProjects(req: import('express').Request): Promise<boolean> {
-  const ctx = getAuth(req);
-  if (isPrivileged(ctx.role)) return true;
-  const perms = await loadPermissions(req);
-  return meetsLevel(perms.projects, 'view');
-}
-
-/**
- * The set of project ids a SCOPED member may see: projects they're a member of,
- * plus projects that hold a task assigned to them (primary `assigneeId` or a
- * `taskAssignees` row). Only call this for callers where canSeeAllProjects is
- * false.
- */
-async function visibleProjectIds(
-  ctx: ReturnType<typeof getAuth>,
-): Promise<string[]> {
-  const memberRows = await db
-    .select({ projectId: projectMembers.projectId })
-    .from(projectMembers)
-    .where(
-      and(
-        eq(projectMembers.agencyId, ctx.agencyId),
-        eq(projectMembers.userId, ctx.userId),
-      ),
-    );
-
-  const primaryTaskRows = await db
-    .select({ projectId: projectTasks.projectId })
-    .from(projectTasks)
-    .where(
-      and(
-        eq(projectTasks.agencyId, ctx.agencyId),
-        eq(projectTasks.assigneeId, ctx.userId),
-      ),
-    );
-
-  const assignedTaskRows = await db
-    .select({ projectId: projectTasks.projectId })
-    .from(taskAssignees)
-    .innerJoin(projectTasks, eq(projectTasks.id, taskAssignees.taskId))
-    .where(
-      and(
-        eq(taskAssignees.agencyId, ctx.agencyId),
-        eq(taskAssignees.userId, ctx.userId),
-      ),
-    );
-
-  return [
-    ...new Set([
-      ...memberRows.map((r) => r.projectId),
-      ...primaryTaskRows.map((r) => r.projectId),
-      ...assignedTaskRows.map((r) => r.projectId),
-    ]),
-  ];
-}
-
 /** Parse a stored JSON string array (services), tolerating bad data. */
 function safeStringArray(s: string | null): string[] {
   if (!s) return [];
@@ -292,7 +310,13 @@ function safeStringArray(s: string | null): string[] {
   }
 }
 
-function serializeProject(p: ProjectRow, showFinance = true) {
+/**
+ * Serialize a project for `actor`. Money (contract value, billing type,
+ * recurring amount) is included only with projects.view_financials on THIS
+ * project; otherwise those fields are null.
+ */
+function serializeProject(p: ProjectRow, actor: Actor, facts: ObjectFacts) {
+  const showFinance = check(actor, 'projects.view_financials', facts);
   return {
     id: p.id,
     clientId: p.clientId,
@@ -304,9 +328,8 @@ function serializeProject(p: ProjectRow, showFinance = true) {
     type: p.type,
     status: p.status,
     health: p.health,
-    // Money is finance-gated: null for non-finance roles (managers/employees).
     contractValue: showFinance ? (p.contractValue ?? 0) : null,
-    billingType: p.billingType,
+    billingType: showFinance ? p.billingType : null,
     recurringPaise: showFinance ? (p.recurringPaise ?? 0) : null,
     currency: p.currency,
     startDate: toIso(p.startDate),
@@ -319,7 +342,20 @@ function serializeProject(p: ProjectRow, showFinance = true) {
     createdBy: p.createdBy,
     createdAt: toIso(p.createdAt),
     updatedAt: toIso(p.updatedAt),
+    capabilities: capabilities(actor, facts, PROJECT_CAPS),
   };
+}
+
+/** Load the project row (with counts) for serialization; 404 when missing. */
+async function loadProjectRow(actor: Actor, projectId: string): Promise<ProjectRow> {
+  const [row] = await db
+    .select(projectSelection)
+    .from(projects)
+    .leftJoin(clients, eq(clients.id, projects.clientId))
+    .where(and(eq(projects.id, projectId), eq(projects.agencyId, actor.agencyId)))
+    .limit(1);
+  if (!row) throw notFound('Project not found.');
+  return row as ProjectRow;
 }
 
 function serializeTask(tk: typeof projectTasks.$inferSelect) {
@@ -340,6 +376,7 @@ function serializeTask(tk: typeof projectTasks.$inferSelect) {
     position: tk.position,
     archivedAt: toIso(tk.archivedAt),
     archivedMonth: tk.archivedMonth,
+    createdBy: tk.createdBy,
     createdAt: toIso(tk.createdAt),
     updatedAt: toIso(tk.updatedAt),
   };
@@ -371,6 +408,24 @@ type EnrichedTask = SerializedTask & {
   blockedByCount: number;
   commentCount: number;
 };
+
+/**
+ * Fold per-task `capabilities` onto serialized task rows for `actor` (one
+ * membership query + one assignment query for the whole batch).
+ */
+async function withTaskCapabilities<
+  T extends Pick<SerializedTask, 'id' | 'projectId' | 'createdBy' | 'assigneeId'>,
+>(actor: Actor, tasks: T[]): Promise<(T & { capabilities: Record<string, boolean> })[]> {
+  if (!tasks.length) return [];
+  const [members, assigned] = await Promise.all([
+    memberProjectIds(actor),
+    assignedTaskIdSet(actor, tasks.map((t) => t.id)),
+  ]);
+  return tasks.map((t) => ({
+    ...t,
+    capabilities: capabilities(actor, taskFactsFromRow(actor, t, assigned, members), TASK_CAPS),
+  }));
+}
 
 /**
  * Bulk-load the assignees for a set of tasks and fold them onto each row as an
@@ -416,7 +471,8 @@ async function attachAssignees<T extends { id: string }>(
  * Replace the assignee set for a task with `userIds` (deduped) inside the
  * caller's agency: clears existing rows then inserts the new ones. Used by the
  * create + update handlers to keep the join table in sync with the primary
- * `assigneeId` mirror.
+ * `assigneeId` mirror. Callers authorize (tasks.assign) and validate the ids
+ * (requireActiveStaff) first.
  */
 async function syncTaskAssignees(
   agencyId: string,
@@ -441,6 +497,46 @@ async function syncTaskAssignees(
       userId,
     })),
   );
+}
+
+/** Current assignee user ids of a task (join rows ∪ primary mirror). */
+async function currentAssigneeIds(
+  agencyId: string,
+  task: { id: string; assigneeId: string | null },
+): Promise<string[]> {
+  const rows = await db
+    .select({ userId: taskAssignees.userId })
+    .from(taskAssignees)
+    .where(and(eq(taskAssignees.agencyId, agencyId), eq(taskAssignees.taskId, task.id)));
+  const set = new Set(rows.map((r) => r.userId));
+  if (task.assigneeId) set.add(task.assigneeId);
+  return [...set];
+}
+
+function sameSet(a: string[], b: string[]): boolean {
+  const sa = new Set(a);
+  const sb = new Set(b);
+  return sa.size === sb.size && [...sa].every((x) => sb.has(x));
+}
+
+/**
+ * Assignment rule (design §G.2): setting assignees to anything other than
+ * exactly [actor] requires tasks.assign on the task/project; every assignee
+ * must be an active staff member of the agency (never a client user).
+ */
+async function authorizeAssignees(
+  actor: Actor,
+  facts: ObjectFacts,
+  nextIds: string[],
+): Promise<void> {
+  const uid = actorUserId(actor);
+  const selfOnly = nextIds.length === 1 && nextIds[0] === uid;
+  if (!selfOnly) {
+    authorize(actor, 'tasks.assign', facts, {
+      message: "You don't have permission to assign tasks to other people.",
+    });
+  }
+  await requireActiveStaff(actor.agencyId, nextIds);
 }
 
 /**
@@ -606,92 +702,11 @@ function serializeMilestone(m: typeof projectMilestones.$inferSelect) {
   };
 }
 
-/**
- * Fetch a project (with computed counts) scoped to the caller's agency AND to
- * their visibility: owner/admin/managers reach every project; a plain member
- * only reaches projects they belong to or have a task assigned on. A member who
- * asks for a project outside their scope gets a 404 (existence is not leaked).
- */
-async function getScopedProject(
-  req: import('express').Request,
-  projectId: string,
-): Promise<ProjectRow> {
-  const ctx = getAuth(req);
-  const [row] = await db
-    .select(projectSelection)
-    .from(projects)
-    .leftJoin(clients, eq(clients.id, projects.clientId))
-    .where(
-      and(eq(projects.id, projectId), eq(projects.agencyId, ctx.agencyId)),
-    )
-    .limit(1);
-  if (!row) throw notFound('Project not found.');
-
-  const isRead = req.method === 'GET';
-  const isTaskWrite = !isRead && req.path.includes('/tasks');
-
-  // (a) BROWSE [GET] and (b) TASK work [writes on a /tasks route] are open to
-  // any member with projects:view — browse any project, add tasks, and edit the
-  // tasks they can see (their own). Scoped members otherwise fall back to the
-  // projects they belong to / have a task on.
-  if (isRead || isTaskWrite) {
-    if (await canViewAllProjects(req)) return row as ProjectRow;
-    const ids = await visibleProjectIds(ctx);
-    if (!ids.includes(projectId)) throw notFound('Project not found.');
-    return row as ProjectRow;
-  }
-
-  // Project-STRUCTURE writes (settings, members, milestones, project labels)
-  // require projects:manage OR ACTUAL project membership. A task merely assigned
-  // in the project does NOT grant structure-edit — otherwise a view member who
-  // added a task could then edit the whole project.
-  if (await canSeeAllProjects(req)) return row as ProjectRow;
-  const [mem] = await db
-    .select({ id: projectMembers.id })
-    .from(projectMembers)
-    .where(
-      and(
-        eq(projectMembers.agencyId, ctx.agencyId),
-        eq(projectMembers.projectId, projectId),
-        eq(projectMembers.userId, ctx.userId),
-      ),
-    )
-    .limit(1);
-  if (!mem) throw notFound('Project not found.');
-  return row as ProjectRow;
-}
-
-/** Verify a client belongs to the caller's agency, or throw 404. */
-async function requireAgencyClient(
-  ctx: ReturnType<typeof getAuth>,
-  clientId: string,
-): Promise<void> {
-  const [row] = await db
-    .select({ id: clients.id })
-    .from(clients)
-    .where(and(eq(clients.id, clientId), eq(clients.agencyId, ctx.agencyId)))
-    .limit(1);
-  if (!row) throw notFound('Client not found.');
-}
-
-/** Verify a user belongs to the caller's agency, or throw 404. */
-async function requireAgencyUser(
-  ctx: ReturnType<typeof getAuth>,
-  userId: string,
-): Promise<void> {
-  const [row] = await db
-    .select({ id: users.id })
-    .from(users)
-    .where(and(eq(users.id, userId), eq(users.agencyId, ctx.agencyId)))
-    .limit(1);
-  if (!row) throw notFound('User not found.');
-}
-
 // ============================================================
 //  PROJECTS
 // ============================================================
 
-// GET /projects?status=&health=&clientId=&search=
+// GET /projects?status=&health=&clientId=&search=   — projects.view (SQL scope)
 const listQuery = z.object({
   status: z.enum(PROJECT_STATUSES).optional(),
   health: z.enum(PROJECT_HEALTH).optional(),
@@ -699,26 +714,19 @@ const listQuery = z.object({
   search: z.string().optional(),
 });
 
-projectsRouter.get('/', async (req, res) => {
-  const ctx = getAuth(req);
+projectsRouter.get('/', requires('projects.view'), async (req, res) => {
+  const actor = getActor(req);
   const q = listQuery.parse(req.query);
 
-  const filters = [eq(projects.agencyId, ctx.agencyId)];
+  const filters: SQL[] = [
+    eq(projects.agencyId, actor.agencyId),
+    projectScopeFilter(actor, 'projects.view'),
+  ];
   if (q.status) filters.push(eq(projects.status, q.status));
   if (q.health) filters.push(eq(projects.health, q.health));
   if (q.clientId) filters.push(eq(projects.clientId, q.clientId));
   if (q.search && q.search.trim()) {
     filters.push(like(projects.name, `%${q.search.trim()}%`));
-  }
-
-  // Scoped members only see the projects they belong to / are assigned on.
-  if (!(await canViewAllProjects(req))) {
-    const allowed = await visibleProjectIds(ctx);
-    if (allowed.length === 0) {
-      ok(res, []);
-      return;
-    }
-    filters.push(inArray(projects.id, allowed));
   }
 
   const rows = await db
@@ -728,50 +736,51 @@ projectsRouter.get('/', async (req, res) => {
     .where(and(...filters))
     .orderBy(asc(projects.createdAt));
 
-  const showFinance = await canSeeProjectFinance(req);
-  ok(res, (rows as ProjectRow[]).map((p) => serializeProject(p, showFinance)));
+  const members = await memberProjectIds(actor);
+  ok(
+    res,
+    (rows as ProjectRow[]).map((p) =>
+      serializeProject(p, actor, projectFactsFromRow(actor, p, members)),
+    ),
+  );
 });
 
-// GET /projects/all-tasks — cross-project tasks list for the agency team
-projectsRouter.get('/all-tasks', async (req, res) => {
-  const ctx = getAuth(req);
-  const projectId = req.query.projectId as string | undefined;
-  const clientId = req.query.clientId as string | undefined;
-  const status = req.query.status as string | undefined;
-  const priority = req.query.priority as string | undefined;
-  const assigneeId = req.query.assigneeId as string | undefined;
-  const search = req.query.search as string | undefined;
+// GET /projects/all-tasks — cross-project task board — tasks.view (SQL scope)
+const allTasksQuery = z.object({
+  projectId: z.string().optional(),
+  clientId: z.string().optional(),
+  status: z.enum(TASK_STATUSES).optional(),
+  priority: z.enum(TASK_PRIORITIES).optional(),
+  assigneeId: z.string().optional(),
+  search: z.string().optional(),
+  archived: z.string().optional(),
+  month: z.string().optional(),
+});
 
-  const archived = req.query.archived === 'true';
-  const month = req.query.month as string | undefined;
+projectsRouter.get('/all-tasks', requires('tasks.view'), async (req, res) => {
+  const actor = getActor(req);
+  const q = allTasksQuery.parse(req.query);
+  const archived = q.archived === 'true';
 
-  const filters = [eq(projectTasks.agencyId, ctx.agencyId)];
-  if (projectId) filters.push(eq(projectTasks.projectId, projectId));
-  if (status) filters.push(eq(projectTasks.status, status as any));
-  if (priority) filters.push(eq(projectTasks.priority, priority as any));
-  if (assigneeId) filters.push(eq(projectTasks.assigneeId, assigneeId));
-  if (clientId) filters.push(eq(projects.clientId, clientId));
-  if (search && search.trim()) {
-    filters.push(like(projectTasks.title, `%${search.trim()}%`));
+  const filters: SQL[] = [
+    eq(projectTasks.agencyId, actor.agencyId),
+    taskScopeFilter(actor, 'tasks.view'),
+  ];
+  if (q.projectId) filters.push(eq(projectTasks.projectId, q.projectId));
+  if (q.status) filters.push(eq(projectTasks.status, q.status));
+  if (q.priority) filters.push(eq(projectTasks.priority, q.priority));
+  if (q.assigneeId) filters.push(eq(projectTasks.assigneeId, q.assigneeId));
+  if (q.clientId) filters.push(eq(projects.clientId, q.clientId));
+  if (q.search && q.search.trim()) {
+    filters.push(like(projectTasks.title, `%${q.search.trim()}%`));
   }
   // Active board excludes archived tasks; ?archived=true returns ONLY the
   // month-wise archive (optionally a single ?month=YYYY-MM).
   if (archived) {
     filters.push(isNotNull(projectTasks.archivedAt));
-    if (month) filters.push(eq(projectTasks.archivedMonth, month));
+    if (q.month) filters.push(eq(projectTasks.archivedMonth, q.month));
   } else {
     filters.push(isNull(projectTasks.archivedAt));
-  }
-
-  // Scope guard: only owner/admin/Manager (projects:manage) see every task.
-  // A plain employee is limited to tasks in the projects they belong to or have
-  // a task assigned on — they can't fetch the whole agency's board here.
-  // (Uses the manage threshold on purpose — view-level project browsing must not
-  // widen which TASKS an employee sees.)
-  if (!(await canSeeAllProjects(req))) {
-    const allowed = await visibleProjectIds(ctx);
-    if (allowed.length === 0) return ok(res, []);
-    filters.push(inArray(projectTasks.projectId, allowed));
   }
 
   const rows = await db
@@ -791,38 +800,56 @@ projectsRouter.get('/all-tasks', async (req, res) => {
 
   ok(
     res,
-    rows.map((r) => ({
-      ...serializeTask(r.t),
-      projectName: r.projectName,
-      clientName: r.clientName,
-      assigneeName: r.assigneeName,
-    })),
+    await withTaskCapabilities(
+      actor,
+      rows.map((r) => ({
+        ...serializeTask(r.t),
+        projectName: r.projectName,
+        clientName: r.clientName,
+        assigneeName: r.assigneeName,
+      })),
+    ),
   );
 });
 
 // POST /projects/tasks/archive-run — sweep this agency's ended months now.
-// (Auto-runs monthly + on boot; this lets a manager force it from History.)
-projectsRouter.post('/tasks/archive-run', async (req, res) => {
-  const ctx = getAuth(req);
-  if (!(await canSeeAllProjects(req))) {
-    return void res
-      .status(403)
-      .json({ error: 'You need manage access on projects to archive months.' });
-  }
-  const r = await sweepEndedMonths(new Date(), ctx.agencyId);
+// tasks.archive sweeps tasks; posts are swept only when the caller also holds
+// posts.archive (cross-module operation).
+projectsRouter.post('/tasks/archive-run', requires('tasks.archive'), async (req, res) => {
+  const actor = getActor(req);
+  const sweepPosts = canOrg(actor, 'posts.archive');
+  const r = await sweepEndedMonths(new Date(), actor.agencyId, {
+    tasks: true,
+    posts: sweepPosts,
+  });
+  await auditAs(actor, req, {
+    action: 'archive.run',
+    entityType: 'agency',
+    entityId: actor.agencyId,
+    metadata: { tasks: r.tasks, posts: r.posts, postsSwept: sweepPosts },
+  });
   ok(res, r);
 });
 
-// POST /projects/tasks/:taskId/unarchive — restore an archived task.
-projectsRouter.post('/tasks/:taskId/unarchive', async (req, res) => {
-  const ctx = getAuth(req);
-  if (!(await canSeeAllProjects(req))) {
-    return void res
-      .status(403)
-      .json({ error: 'You need manage access on projects to restore a task.' });
-  }
-  const done = await unarchiveTask(ctx.agencyId, param(req, 'taskId'));
+// POST /projects/tasks/:taskId/unarchive — restore an ARCHIVED task.
+// tasks.restore on the task (project or organization scope).
+projectsRouter.post('/tasks/:taskId/unarchive', requires('tasks.restore'), async (req, res) => {
+  const actor = getActor(req);
+  const facts = await taskFacts(actor, param(req, 'taskId'));
+  authorize(actor, 'tasks.restore', facts, { view: 'tasks.view' });
+  if (!facts!.task.archivedAt) throw notFound('Archived task not found.');
+  const done = await unarchiveTask(actor.agencyId, facts!.task.id);
   if (!done) throw notFound('Archived task not found.');
+  await auditAs(actor, req, {
+    action: 'task.unarchive',
+    entityType: 'task',
+    entityId: facts!.task.id,
+    metadata: {
+      projectId: facts!.task.projectId,
+      taskTitle: facts!.task.title,
+      archivedMonth: facts!.task.archivedMonth,
+    },
+  });
   ok(res, { restored: true });
 });
 
@@ -864,35 +891,52 @@ const createSchema = z.object({
 /**
  * GET /projects/milestone-templates — the service→milestones presets, so the
  * create form can prefill (and explain an intentionally empty preset).
- * Registered before '/:id' so it is not read as a project id.
+ * Registered before '/:id' so it is not read as a project id. Static config;
+ * projects.view.
  */
-projectsRouter.get('/milestone-templates', async (_req, res) => {
+projectsRouter.get('/milestone-templates', requires('projects.view'), async (_req, res) => {
   ok(res, {
     continuousServices: CONTINUOUS_SERVICES,
     templates: MILESTONE_TEMPLATES,
   });
 });
 
-projectsRouter.post('/', async (req, res) => {
-  const ctx = getAuth(req);
-  // Creating a project needs the 'manage' tier (owner/admin/Manager preset).
-  // Plain employees (projects:edit) work on tasks but can't spin up projects.
-  if (!isPrivileged(ctx.role)) {
-    const perms = await loadPermissions(req);
-    if (!meetsLevel(perms.projects, 'manage')) {
-      res
-        .status(403)
-        .json({ error: 'You need manage access on projects to create one.' });
-      return;
-    }
-  }
+/** True when a create/update body carries any project money field. */
+function touchesFinancials(body: {
+  contractValue?: unknown;
+  billingType?: unknown;
+  recurringPaise?: unknown;
+}): boolean {
+  return (
+    body.contractValue !== undefined ||
+    body.billingType !== undefined ||
+    body.recurringPaise !== undefined
+  );
+}
+
+const FINANCIALS_FORBIDDEN = "You don't have permission to set project financials.";
+
+// POST /projects — projects.create; money fields need projects.update_financials;
+// seeded milestones need project_milestones.manage.
+projectsRouter.post('/', requires('projects.create'), async (req, res) => {
+  const actor = getActor(req);
+  const uid = staffUserId(actor);
   const body = createSchema.parse(req.body);
-  await requireAgencyClient(ctx, body.clientId);
+  await requireInAgency(clients, actor.agencyId, body.clientId, 'Client');
+
+  // The creator becomes a project lead, so an `assigned` financial grant covers
+  // the new project: any scope suffices.
+  if (touchesFinancials(body) && !can(actor, 'projects.update_financials')) {
+    throw forbidden(FINANCIALS_FORBIDDEN);
+  }
+  if (body.milestones?.length && !can(actor, 'project_milestones.manage')) {
+    throw forbidden("You don't have permission to create milestones.");
+  }
 
   const id = newId('prj');
   await db.insert(projects).values({
     id,
-    agencyId: ctx.agencyId,
+    agencyId: actor.agencyId,
     clientId: body.clientId,
     name: body.name,
     scopeOfWork: body.scopeOfWork ?? null,
@@ -913,16 +957,16 @@ projectsRouter.post('/', async (req, res) => {
     ...(body.currency !== undefined ? { currency: body.currency } : {}),
     startDate: body.startDate ?? null,
     deadline: body.deadline ?? null,
-    createdBy: ctx.userId,
+    createdBy: uid,
   });
 
-  // The creator is automatically an 'owner' member of the project.
+  // The creator is automatically a 'lead' member of the project.
   await db.insert(projectMembers).values({
     id: newId('prm'),
-    agencyId: ctx.agencyId,
+    agencyId: actor.agencyId,
     projectId: id,
-    userId: ctx.userId,
-    role: 'owner',
+    userId: uid,
+    role: 'lead',
   });
 
   // Seed the milestones the UI showed at creation time (service preset, edited).
@@ -930,7 +974,7 @@ projectsRouter.post('/', async (req, res) => {
     await db.insert(projectMilestones).values(
       body.milestones.map((m, i) => ({
         id: newId('pms'),
-        agencyId: ctx.agencyId,
+        agencyId: actor.agencyId,
         projectId: id,
         title: m.title,
         description: m.description ?? null,
@@ -940,10 +984,7 @@ projectsRouter.post('/', async (req, res) => {
     );
   }
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+  await auditAs(actor, req, {
     action: 'project.create',
     entityType: 'project',
     entityId: id,
@@ -952,20 +993,21 @@ projectsRouter.post('/', async (req, res) => {
       name: body.name,
       milestonesSeeded: body.milestones?.length ?? 0,
     },
-    ip: req.ip,
   });
 
-  const row = await getScopedProject(req, id);
-  created(res, serializeProject(row, await canSeeProjectFinance(req)));
+  const facts = await authorizeProject(actor, id, 'projects.view');
+  created(res, serializeProject(await loadProjectRow(actor, id), actor, facts));
 });
 
-// GET /projects/:id
-projectsRouter.get('/:id', async (req, res) => {
-  const row = await getScopedProject(req, param(req, 'id'));
-  ok(res, serializeProject(row, await canSeeProjectFinance(req)));
+// GET /projects/:id — projects.view on the project
+projectsRouter.get('/:id', requires('projects.view'), async (req, res) => {
+  const actor = getActor(req);
+  const projectId = param(req, 'id');
+  const facts = await authorizeProject(actor, projectId, 'projects.view');
+  ok(res, serializeProject(await loadProjectRow(actor, projectId), actor, facts));
 });
 
-// PATCH /projects/:id
+// PATCH /projects/:id — projects.update; money fields need projects.update_financials
 const updateSchema = z.object({
   name: z.string().min(1).max(160).optional(),
   clientId: z.string().min(1).optional(),
@@ -983,14 +1025,17 @@ const updateSchema = z.object({
   deadline: z.coerce.date().nullable().optional(),
 });
 
-projectsRouter.patch('/:id', async (req, res) => {
-  const ctx = getAuth(req);
+projectsRouter.patch('/:id', requires('projects.update'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
+  const facts = await authorizeProject(actor, projectId, 'projects.update');
   const body = updateSchema.parse(req.body);
 
+  if (touchesFinancials(body)) {
+    authorize(actor, 'projects.update_financials', facts, { message: FINANCIALS_FORBIDDEN });
+  }
   if (body.clientId !== undefined) {
-    await requireAgencyClient(ctx, body.clientId);
+    await requireInAgency(clients, actor.agencyId, body.clientId, 'Client');
   }
 
   const patch: Partial<typeof projects.$inferInsert> = { updatedAt: new Date() };
@@ -1015,48 +1060,44 @@ projectsRouter.patch('/:id', async (req, res) => {
     .update(projects)
     .set(patch)
     .where(
-      and(eq(projects.id, projectId), eq(projects.agencyId, ctx.agencyId)),
+      and(eq(projects.id, projectId), eq(projects.agencyId, actor.agencyId)),
     );
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+  await auditAs(actor, req, {
     action: 'project.update',
     entityType: 'project',
     entityId: projectId,
     metadata: {
       projectId,
       ...(body.status !== undefined ? { status: body.status } : {}),
+      ...(body.clientId !== undefined && body.clientId !== facts.clientId
+        ? { fromClientId: facts.clientId, toClientId: body.clientId }
+        : {}),
+      ...(touchesFinancials(body) ? { financialsChanged: true } : {}),
     },
-    ip: req.ip,
   });
 
-  const row = await getScopedProject(req, projectId);
-  ok(res, serializeProject(row, await canSeeProjectFinance(req)));
+  const after = await authorizeProject(actor, projectId, 'projects.view');
+  ok(res, serializeProject(await loadProjectRow(actor, projectId), actor, after));
 });
 
-// DELETE /projects/:id (children cascade)
-projectsRouter.delete('/:id', async (req, res) => {
-  const ctx = getAuth(req);
+// DELETE /projects/:id (children cascade) — projects.delete
+projectsRouter.delete('/:id', requires('projects.delete'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
+  await authorizeProject(actor, projectId, 'projects.delete');
 
   await db
     .delete(projects)
     .where(
-      and(eq(projects.id, projectId), eq(projects.agencyId, ctx.agencyId)),
+      and(eq(projects.id, projectId), eq(projects.agencyId, actor.agencyId)),
     );
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+  await auditAs(actor, req, {
     action: 'project.delete',
     entityType: 'project',
     entityId: projectId,
     metadata: { projectId },
-    ip: req.ip,
   });
   ok(res, { deleted: true });
 });
@@ -1067,7 +1108,7 @@ projectsRouter.delete('/:id', async (req, res) => {
 
 /** Fetch a label scoped to the project + agency, or throw 404. */
 async function getScopedLabel(
-  ctx: ReturnType<typeof getAuth>,
+  agencyId: string,
   projectId: string,
   labelId: string,
 ) {
@@ -1077,7 +1118,7 @@ async function getScopedLabel(
     .where(
       and(
         eq(projectTaskLabels.id, labelId),
-        eq(projectTaskLabels.agencyId, ctx.agencyId),
+        eq(projectTaskLabels.agencyId, agencyId),
         eq(projectTaskLabels.projectId, projectId),
       ),
     )
@@ -1086,18 +1127,18 @@ async function getScopedLabel(
   return row;
 }
 
-// GET /projects/:id/labels
-projectsRouter.get('/:id/labels', async (req, res) => {
-  const ctx = getAuth(req);
+// GET /projects/:id/labels — projects.view on the project
+projectsRouter.get('/:id/labels', requires('projects.view'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
+  await authorizeProject(actor, projectId, 'projects.view');
 
   const rows = await db
     .select()
     .from(projectTaskLabels)
     .where(
       and(
-        eq(projectTaskLabels.agencyId, ctx.agencyId),
+        eq(projectTaskLabels.agencyId, actor.agencyId),
         eq(projectTaskLabels.projectId, projectId),
       ),
     )
@@ -1106,83 +1147,80 @@ projectsRouter.get('/:id/labels', async (req, res) => {
   ok(res, rows.map(serializeLabel));
 });
 
-// POST /projects/:id/labels
+// POST /projects/:id/labels — project_labels.manage
 const createLabelSchema = z.object({
   name: z.string().trim().min(1).max(60),
   color: z.enum(LABEL_COLORS).optional(),
 });
 
-projectsRouter.post('/:id/labels', async (req, res) => {
-  const ctx = getAuth(req);
-  const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
-  const body = createLabelSchema.parse(req.body);
-
-  // Enforce per-project unique name (case-sensitive, matches the unique index).
+async function labelNameTaken(agencyId: string, projectId: string, name: string): Promise<boolean> {
   const [dup] = await db
     .select({ id: projectTaskLabels.id })
     .from(projectTaskLabels)
     .where(
       and(
+        eq(projectTaskLabels.agencyId, agencyId),
         eq(projectTaskLabels.projectId, projectId),
-        eq(projectTaskLabels.name, body.name),
+        eq(projectTaskLabels.name, name),
       ),
     )
     .limit(1);
-  if (dup) throw conflict('A label with that name already exists.');
+  return !!dup;
+}
+
+projectsRouter.post('/:id/labels', requires('project_labels.manage'), async (req, res) => {
+  const actor = getActor(req);
+  const projectId = param(req, 'id');
+  await authorizeProject(actor, projectId, 'project_labels.manage');
+  const body = createLabelSchema.parse(req.body);
+
+  // Enforce per-project unique name (case-sensitive, matches the unique index).
+  if (await labelNameTaken(actor.agencyId, projectId, body.name)) {
+    throw conflict('A label with that name already exists.');
+  }
 
   const id = newId('plb');
   await db.insert(projectTaskLabels).values({
     id,
-    agencyId: ctx.agencyId,
+    agencyId: actor.agencyId,
     projectId,
     name: body.name,
     ...(body.color !== undefined ? { color: body.color } : {}),
   });
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+  await auditAs(actor, req, {
     action: 'label.create',
     entityType: 'label',
     entityId: id,
     metadata: { projectId, name: body.name, color: body.color ?? 'pine' },
-    ip: req.ip,
   });
 
   const [row] = await db
     .select()
     .from(projectTaskLabels)
-    .where(eq(projectTaskLabels.id, id));
+    .where(and(eq(projectTaskLabels.id, id), eq(projectTaskLabels.agencyId, actor.agencyId)));
   created(res, serializeLabel(row!));
 });
 
-// PATCH /projects/:id/labels/:labelId
+// PATCH /projects/:id/labels/:labelId — project_labels.manage
 const updateLabelSchema = z.object({
   name: z.string().trim().min(1).max(60).optional(),
   color: z.enum(LABEL_COLORS).optional(),
 });
 
-projectsRouter.patch('/:id/labels/:labelId', async (req, res) => {
-  const ctx = getAuth(req);
+projectsRouter.patch('/:id/labels/:labelId', requires('project_labels.manage'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
-  const label = await getScopedLabel(ctx, projectId, param(req, 'labelId'));
+  await authorizeProject(actor, projectId, 'project_labels.manage');
+  const label = await getScopedLabel(actor.agencyId, projectId, param(req, 'labelId'));
   const body = updateLabelSchema.parse(req.body);
 
-  if (body.name !== undefined && body.name !== label.name) {
-    const [dup] = await db
-      .select({ id: projectTaskLabels.id })
-      .from(projectTaskLabels)
-      .where(
-        and(
-          eq(projectTaskLabels.projectId, projectId),
-          eq(projectTaskLabels.name, body.name),
-        ),
-      )
-      .limit(1);
-    if (dup) throw conflict('A label with that name already exists.');
+  if (
+    body.name !== undefined &&
+    body.name !== label.name &&
+    (await labelNameTaken(actor.agencyId, projectId, body.name))
+  ) {
+    throw conflict('A label with that name already exists.');
   }
 
   const patch: Partial<typeof projectTaskLabels.$inferInsert> = {};
@@ -1196,54 +1234,46 @@ projectsRouter.patch('/:id/labels/:labelId', async (req, res) => {
       .where(
         and(
           eq(projectTaskLabels.id, label.id),
-          eq(projectTaskLabels.agencyId, ctx.agencyId),
+          eq(projectTaskLabels.agencyId, actor.agencyId),
         ),
       );
   }
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+  await auditAs(actor, req, {
     action: 'label.update',
     entityType: 'label',
     entityId: label.id,
     metadata: { projectId, ...patch },
-    ip: req.ip,
   });
 
   const [row] = await db
     .select()
     .from(projectTaskLabels)
-    .where(eq(projectTaskLabels.id, label.id));
+    .where(and(eq(projectTaskLabels.id, label.id), eq(projectTaskLabels.agencyId, actor.agencyId)));
   ok(res, serializeLabel(row!));
 });
 
-// DELETE /projects/:id/labels/:labelId (cascades links)
-projectsRouter.delete('/:id/labels/:labelId', async (req, res) => {
-  const ctx = getAuth(req);
+// DELETE /projects/:id/labels/:labelId (cascades links) — project_labels.manage
+projectsRouter.delete('/:id/labels/:labelId', requires('project_labels.manage'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
-  const label = await getScopedLabel(ctx, projectId, param(req, 'labelId'));
+  await authorizeProject(actor, projectId, 'project_labels.manage');
+  const label = await getScopedLabel(actor.agencyId, projectId, param(req, 'labelId'));
 
   await db
     .delete(projectTaskLabels)
     .where(
       and(
         eq(projectTaskLabels.id, label.id),
-        eq(projectTaskLabels.agencyId, ctx.agencyId),
+        eq(projectTaskLabels.agencyId, actor.agencyId),
       ),
     );
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+  await auditAs(actor, req, {
     action: 'label.delete',
     entityType: 'label',
     entityId: label.id,
     metadata: { projectId, name: label.name },
-    ip: req.ip,
   });
   ok(res, { deleted: true });
 });
@@ -1284,10 +1314,12 @@ const listTasksQuery = z.object({
     .transform((v) => v !== 'false'),
 });
 
-projectsRouter.get('/:id/tasks', async (req, res) => {
-  const ctx = getAuth(req);
+// tasks.view — project must be visible (projects.view); rows filtered by the
+// actor's tasks.view scope in SQL.
+projectsRouter.get('/:id/tasks', requires('tasks.view'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
+  await authorizeProject(actor, projectId, 'projects.view');
 
   const q = listTasksQuery.parse(req.query);
   const statusFilter = toArray(req.query['status[]'] ?? req.query.status).filter(
@@ -1307,35 +1339,14 @@ projectsRouter.get('/:id/tasks', async (req, res) => {
     req.query['milestone[]'] ?? req.query.milestone,
   );
 
-  const filters = [
-    eq(projectTasks.agencyId, ctx.agencyId),
+  const filters: SQL[] = [
+    eq(projectTasks.agencyId, actor.agencyId),
     eq(projectTasks.projectId, projectId),
     // Archived (past-month, incomplete) tasks live only in the Tasks-module
     // History; the project board shows active tasks.
     isNull(projectTasks.archivedAt),
+    taskScopeFilter(actor, 'tasks.view'),
   ];
-
-  // Scoped members (Employee tier) only see the tasks assigned to them within a
-  // project — either as the primary assignee or via the task-assignees join.
-  // Manage threshold on purpose: a member can BROWSE any project (view), but in
-  // the Tasks tab an employee sees only their own tasks, not the whole team's.
-  if (!(await canSeeAllProjects(req))) {
-    const myAssigned = db
-      .select({ taskId: taskAssignees.taskId })
-      .from(taskAssignees)
-      .where(
-        and(
-          eq(taskAssignees.agencyId, ctx.agencyId),
-          eq(taskAssignees.userId, ctx.userId),
-        ),
-      );
-    filters.push(
-      or(
-        eq(projectTasks.assigneeId, ctx.userId),
-        inArray(projectTasks.id, myAssigned),
-      )!,
-    );
-  }
 
   if (!q.includeSubtasks) filters.push(isNull(projectTasks.parentTaskId));
   if (statusFilter.length > 0)
@@ -1348,7 +1359,7 @@ projectsRouter.get('/:id/tasks', async (req, res) => {
   if (assigneeFilter.length > 0) {
     const ids = assigneeFilter.filter((a) => a !== 'unassigned');
     const wantsUnassigned = assigneeFilter.includes('unassigned');
-    const parts = [];
+    const parts: SQL[] = [];
     // Match a task when ANY of its assignees is one of the requested users.
     if (ids.length > 0) {
       const assigned = db
@@ -1356,7 +1367,7 @@ projectsRouter.get('/:id/tasks', async (req, res) => {
         .from(taskAssignees)
         .where(
           and(
-            eq(taskAssignees.agencyId, ctx.agencyId),
+            eq(taskAssignees.agencyId, actor.agencyId),
             inArray(taskAssignees.userId, ids),
           ),
         );
@@ -1404,7 +1415,7 @@ projectsRouter.get('/:id/tasks', async (req, res) => {
       .from(projectTaskLabelLinks)
       .where(
         and(
-          eq(projectTaskLabelLinks.agencyId, ctx.agencyId),
+          eq(projectTaskLabelLinks.agencyId, actor.agencyId),
           inArray(projectTaskLabelLinks.labelId, labelFilter),
         ),
       );
@@ -1443,32 +1454,8 @@ projectsRouter.get('/:id/tasks', async (req, res) => {
     .where(and(...filters))
     .orderBy(...orderBy);
 
-  const enriched = await enrichTasks(ctx.agencyId, rows);
-  ok(res, enriched);
+  ok(res, await withTaskCapabilities(actor, await enrichTasks(actor.agencyId, rows)));
 });
-
-/**
- * Verify a milestone exists in the SAME project + agency, or throw 404.
- * Used to validate a task's milestoneId link.
- */
-async function requireProjectMilestone(
-  ctx: ReturnType<typeof getAuth>,
-  projectId: string,
-  milestoneId: string,
-): Promise<void> {
-  const [row] = await db
-    .select({ id: projectMilestones.id })
-    .from(projectMilestones)
-    .where(
-      and(
-        eq(projectMilestones.id, milestoneId),
-        eq(projectMilestones.agencyId, ctx.agencyId),
-        eq(projectMilestones.projectId, projectId),
-      ),
-    )
-    .limit(1);
-  if (!row) throw notFound('Milestone not found.');
-}
 
 /**
  * Verify a candidate parent task is a valid one-level parent in this project:
@@ -1477,7 +1464,7 @@ async function requireProjectMilestone(
  * nesting violation, 404 if not found.
  */
 async function requireValidParentTask(
-  ctx: ReturnType<typeof getAuth>,
+  agencyId: string,
   projectId: string,
   parentTaskId: string,
   selfId?: string,
@@ -1485,7 +1472,7 @@ async function requireValidParentTask(
   if (selfId && parentTaskId === selfId) {
     throw new AppError('VALIDATION_ERROR', 'A task cannot be its own parent.');
   }
-  const parent = await getScopedTask(ctx, projectId, parentTaskId);
+  const parent = await requireTaskInProject(agencyId, projectId, parentTaskId);
   if (parent.parentTaskId !== null) {
     throw new AppError(
       'VALIDATION_ERROR',
@@ -1495,7 +1482,8 @@ async function requireValidParentTask(
   return parent;
 }
 
-// POST /projects/:id/tasks
+// POST /projects/:id/tasks — tasks.create on the project; assigning anyone
+// other than exactly [actor] needs tasks.assign.
 const createTaskSchema = z.object({
   title: z.string().min(1).max(200),
   description: z.string().max(5000).optional(),
@@ -1511,38 +1499,31 @@ const createTaskSchema = z.object({
   position: z.number().int().min(0).optional(),
 });
 
-projectsRouter.post('/:id/tasks', async (req, res) => {
-  const ctx = getAuth(req);
+projectsRouter.post('/:id/tasks', requires('tasks.create'), async (req, res) => {
+  const actor = getActor(req);
+  const uid = staffUserId(actor);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
+  const pf = await authorizeProject(actor, projectId, 'tasks.create');
   const body = createTaskSchema.parse(req.body);
 
   // Resolve the assignee set: explicit `assigneeIds` wins, else the legacy
   // single `assigneeId`. When NONE is given, auto-assign to the CREATOR so
-  // members can self-create tasks (e.g. when a manager isn't around to assign).
-  // A scoped member (Employee tier) ALWAYS owns the tasks they create — they're
-  // added to the assignee set even if others are named, so the task lands on
-  // their board (a plain member only sees tasks assigned to them).
+  // members can self-create tasks.
   const requested =
     body.assigneeIds ?? (body.assigneeId ? [body.assigneeId] : []);
-  const ids = requested.length ? [...requested] : [ctx.userId];
-  const scopedMember = !(await canSeeAllProjects(req));
-  if (scopedMember && !ids.includes(ctx.userId)) ids.push(ctx.userId);
-  const assigneeIds = [...new Set(ids)];
-  for (const uid of assigneeIds) {
-    await requireAgencyUser(ctx, uid);
-  }
+  const assigneeIds = [...new Set(requested.length ? requested : [uid])];
+  await authorizeAssignees(actor, pf, assigneeIds);
   const primaryAssigneeId = assigneeIds[0] ?? null;
 
   // Subtasks inherit their parent's milestone when one isn't given.
   let parent: typeof projectTasks.$inferSelect | undefined;
   if (body.parentTaskId) {
-    parent = await requireValidParentTask(ctx, projectId, body.parentTaskId);
+    parent = await requireValidParentTask(actor.agencyId, projectId, body.parentTaskId);
   }
 
   let milestoneId = body.milestoneId ?? null;
   if (milestoneId) {
-    await requireProjectMilestone(ctx, projectId, milestoneId);
+    await requireMilestoneInProject(actor.agencyId, projectId, milestoneId);
   } else if (body.milestoneId === undefined && parent) {
     milestoneId = parent.milestoneId;
   }
@@ -1552,8 +1533,9 @@ projectsRouter.post('/:id/tasks', async (req, res) => {
   const completedAt = body.status === 'done' ? new Date() : null;
   await db.insert(projectTasks).values({
     id,
-    agencyId: ctx.agencyId,
+    agencyId: actor.agencyId,
     projectId,
+    createdBy: uid,
     title: body.title,
     description: body.description ?? null,
     ...(body.status !== undefined ? { status: body.status } : {}),
@@ -1569,12 +1551,9 @@ projectsRouter.post('/:id/tasks', async (req, res) => {
   });
 
   // Sync the M:N join table with the resolved assignee set.
-  await syncTaskAssignees(ctx.agencyId, id, assigneeIds);
+  await syncTaskAssignees(actor.agencyId, id, assigneeIds);
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+  await auditAs(actor, req, {
     action: body.parentTaskId ? 'task.subtask_add' : 'task.create',
     entityType: 'task',
     entityId: id,
@@ -1586,34 +1565,36 @@ projectsRouter.post('/:id/tasks', async (req, res) => {
       ...(milestoneId ? { milestoneId } : {}),
       ...(body.parentTaskId ? { parentTaskId: body.parentTaskId } : {}),
     },
-    ip: req.ip,
   });
 
   const [row] = await db
     .select()
     .from(projectTasks)
-    .where(eq(projectTasks.id, id));
-  const [enriched] = await attachAssignees(ctx.agencyId, [
-    serializeTask(row!),
-  ]);
+    .where(and(eq(projectTasks.id, id), eq(projectTasks.agencyId, actor.agencyId)));
+  const [enriched] = await withTaskCapabilities(
+    actor,
+    await attachAssignees(actor.agencyId, [serializeTask(row!)]),
+  );
   created(res, enriched);
 });
 
-// POST /projects/:id/tasks/bulk — create many tasks from a list of titles.
+// POST /projects/:id/tasks/bulk — create many (unassigned) tasks from titles.
+// tasks.create on the project.
 const bulkCreateTaskSchema = z.object({
-  titles: z.array(z.string().trim().min(1).max(200)).min(1),
+  titles: z.array(z.string().trim().min(1).max(200)).min(1).max(200),
   milestoneId: z.string().min(1).nullable().optional(),
   status: z.enum(TASK_STATUSES).optional(),
 });
 
-projectsRouter.post('/:id/tasks/bulk', async (req, res) => {
-  const ctx = getAuth(req);
+projectsRouter.post('/:id/tasks/bulk', requires('tasks.create'), async (req, res) => {
+  const actor = getActor(req);
+  const uid = staffUserId(actor);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
+  await authorizeProject(actor, projectId, 'tasks.create');
   const body = bulkCreateTaskSchema.parse(req.body);
 
   if (body.milestoneId) {
-    await requireProjectMilestone(ctx, projectId, body.milestoneId);
+    await requireMilestoneInProject(actor.agencyId, projectId, body.milestoneId);
   }
 
   // Position new tasks sequentially after the current max in the project.
@@ -1622,7 +1603,7 @@ projectsRouter.post('/:id/tasks/bulk', async (req, res) => {
     .from(projectTasks)
     .where(
       and(
-        eq(projectTasks.agencyId, ctx.agencyId),
+        eq(projectTasks.agencyId, actor.agencyId),
         eq(projectTasks.projectId, projectId),
       ),
     );
@@ -1634,19 +1615,18 @@ projectsRouter.post('/:id/tasks/bulk', async (req, res) => {
     ids.push(id);
     await db.insert(projectTasks).values({
       id,
-      agencyId: ctx.agencyId,
+      agencyId: actor.agencyId,
       projectId,
+      createdBy: uid,
       title,
       ...(body.status !== undefined ? { status: body.status } : {}),
       milestoneId: body.milestoneId ?? null,
+      completedAt: body.status === 'done' ? new Date() : null,
       position: position++,
     });
   }
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+  await auditAs(actor, req, {
     action: 'task.bulk_create',
     entityType: 'task',
     entityId: projectId,
@@ -1655,7 +1635,6 @@ projectsRouter.post('/:id/tasks/bulk', async (req, res) => {
       count: ids.length,
       ...(body.milestoneId ? { milestoneId: body.milestoneId } : {}),
     },
-    ip: req.ip,
   });
 
   const rows = await db
@@ -1663,38 +1642,24 @@ projectsRouter.post('/:id/tasks/bulk', async (req, res) => {
     .from(projectTasks)
     .where(
       and(
-        eq(projectTasks.agencyId, ctx.agencyId),
+        eq(projectTasks.agencyId, actor.agencyId),
         eq(projectTasks.projectId, projectId),
         inArray(projectTasks.id, ids),
       ),
     )
     .orderBy(asc(projectTasks.position));
 
-  created(res, await attachAssignees(ctx.agencyId, rows.map(serializeTask)));
+  created(
+    res,
+    await withTaskCapabilities(
+      actor,
+      await attachAssignees(actor.agencyId, rows.map(serializeTask)),
+    ),
+  );
 });
 
-/** Fetch a task scoped to the project + agency, or throw 404. */
-async function getScopedTask(
-  ctx: ReturnType<typeof getAuth>,
-  projectId: string,
-  taskId: string,
-) {
-  const [row] = await db
-    .select()
-    .from(projectTasks)
-    .where(
-      and(
-        eq(projectTasks.id, taskId),
-        eq(projectTasks.agencyId, ctx.agencyId),
-        eq(projectTasks.projectId, projectId),
-      ),
-    )
-    .limit(1);
-  if (!row) throw notFound('Task not found.');
-  return row;
-}
-
-// PATCH /projects/:id/tasks/:taskId  §3.3
+// PATCH /projects/:id/tasks/:taskId  §3.3 — tasks.update on the task;
+// assignee changes follow authorizeAssignees (tasks.assign unless self-only).
 const updateTaskSchema = z.object({
   title: z.string().min(1).max(200).optional(),
   description: z.string().max(5000).nullable().optional(),
@@ -1710,11 +1675,68 @@ const updateTaskSchema = z.object({
   position: z.number().int().min(0).optional(),
 });
 
-projectsRouter.patch('/:id/tasks/:taskId', async (req, res) => {
-  const ctx = getAuth(req);
+/**
+ * Calendar pipeline side effect: a task auto-created by publishing a content
+ * calendar sheet links to a content post. Completing the task publishes the
+ * post; reopening reverts it to scheduled. The post is only touched when the
+ * caller holds posts.publish on the post's client; the write itself runs as a
+ * system actor (audited `actorType: 'system'`).
+ */
+async function syncLinkedPost(
+  actor: Actor,
+  req: Request,
+  task: typeof projectTasks.$inferSelect,
+  nowDone: boolean,
+): Promise<void> {
+  if (!task.postId) return;
+  const [post] = await db
+    .select({
+      id: contentPosts.id,
+      clientId: contentPosts.clientId,
+      status: contentPosts.status,
+    })
+    .from(contentPosts)
+    .where(
+      and(
+        eq(contentPosts.id, task.postId),
+        eq(contentPosts.agencyId, actor.agencyId),
+      ),
+    )
+    .limit(1);
+  if (!post) return;
+  const nextStatus = nowDone ? 'posted' : 'scheduled';
+  if (post.status === nextStatus) return;
+  if (!check(actor, 'posts.publish', await clientFacts(actor, post.clientId))) return;
+
+  const sys = systemActor('task_post_sync', actor.agencyId, [
+    { permission: 'posts.publish', scope: 'organization' },
+  ]);
+  if (!check(sys, 'posts.publish', { agencyId: actor.agencyId, clientId: post.clientId })) return;
+  await db
+    .update(contentPosts)
+    .set({ status: nextStatus, updatedAt: new Date() })
+    .where(and(eq(contentPosts.id, post.id), eq(contentPosts.agencyId, actor.agencyId)));
+  broadcastPortalRefresh(post.clientId);
+  await auditAs(sys, req, {
+    action: 'post.status_sync',
+    entityType: 'post',
+    entityId: post.id,
+    metadata: {
+      clientId: post.clientId,
+      taskId: task.id,
+      projectId: task.projectId,
+      fromStatus: post.status,
+      toStatus: nextStatus,
+      triggeredBy: actorAuditId(actor),
+    },
+  });
+}
+
+projectsRouter.patch('/:id/tasks/:taskId', requires('tasks.update'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
-  const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
+  const facts = await authorizeTask(actor, projectId, param(req, 'taskId'), 'tasks.update');
+  const task = facts.task;
   const body = updateTaskSchema.parse(req.body);
 
   // Resolve the next assignee set. `assigneeIds` (when present) is authoritative
@@ -1727,22 +1749,27 @@ projectsRouter.patch('/:id/tasks/:taskId', async (req, res) => {
     nextAssigneeIds = body.assigneeId ? [body.assigneeId] : [];
   }
   if (nextAssigneeIds !== undefined) {
-    for (const uid of nextAssigneeIds) await requireAgencyUser(ctx, uid);
+    const current = await currentAssigneeIds(actor.agencyId, task);
+    if (sameSet(current, nextAssigneeIds)) {
+      // No effective change: keep the order the caller sent (primary mirror).
+    } else {
+      await authorizeAssignees(actor, facts, nextAssigneeIds);
+    }
   }
   if (body.milestoneId) {
-    await requireProjectMilestone(ctx, projectId, body.milestoneId);
+    await requireMilestoneInProject(actor.agencyId, projectId, body.milestoneId);
   }
 
   // Re-parenting: the new parent must be a top-level task in this project, and
   // this task must not already have children (else it would create a 3rd level).
   if (body.parentTaskId) {
-    await requireValidParentTask(ctx, projectId, body.parentTaskId, task.id);
+    await requireValidParentTask(actor.agencyId, projectId, body.parentTaskId, task.id);
     const [child] = await db
       .select({ id: projectTasks.id })
       .from(projectTasks)
       .where(
         and(
-          eq(projectTasks.agencyId, ctx.agencyId),
+          eq(projectTasks.agencyId, actor.agencyId),
           eq(projectTasks.parentTaskId, task.id),
         ),
       )
@@ -1787,54 +1814,28 @@ projectsRouter.patch('/:id/tasks/:taskId', async (req, res) => {
     .where(
       and(
         eq(projectTasks.id, task.id),
-        eq(projectTasks.agencyId, ctx.agencyId),
+        eq(projectTasks.agencyId, actor.agencyId),
       ),
     );
 
   // Replace the M:N join set when assignees were touched (either field).
   if (nextAssigneeIds !== undefined) {
-    await syncTaskAssignees(ctx.agencyId, task.id, nextAssigneeIds);
+    await syncTaskAssignees(actor.agencyId, task.id, nextAssigneeIds);
   }
 
-  // Completing a task auto-stops any running timers on it (across all users),
-  // so time stops accruing against finished work. Best-effort.
+  // Completing a task auto-stops running timers on it: the caller's own as the
+  // caller, other people's as a system actor. Best-effort.
   if (body.status === 'done' && task.status !== 'done') {
-    await stopTimersForTask(ctx, task.id, patch.title ?? task.title).catch(
+    await stopTimersForTask(actor, task.id, patch.title ?? task.title).catch(
       () => undefined,
     );
   }
 
-  // Calendar pipeline: a task auto-created by publishing a content-calendar
-  // sheet links to a content post. Completing the task publishes the post (the
-  // client portal calendar shows it done); reopening reverts it to scheduled.
   if (task.postId && body.status !== undefined && body.status !== task.status) {
     const nowDone = body.status === 'done';
     const wasDone = task.status === 'done';
     if (nowDone !== wasDone) {
-      const [post] = await db
-        .select({
-          id: contentPosts.id,
-          clientId: contentPosts.clientId,
-          status: contentPosts.status,
-        })
-        .from(contentPosts)
-        .where(
-          and(
-            eq(contentPosts.id, task.postId),
-            eq(contentPosts.agencyId, ctx.agencyId),
-          ),
-        )
-        .limit(1);
-      if (post) {
-        const nextStatus = nowDone ? 'posted' : 'scheduled';
-        if (post.status !== nextStatus) {
-          await db
-            .update(contentPosts)
-            .set({ status: nextStatus, updatedAt: new Date() })
-            .where(eq(contentPosts.id, post.id));
-          broadcastPortalRefresh(post.clientId);
-        }
-      }
+      await syncLinkedPost(actor, req, task, nowDone).catch(() => undefined);
     }
   }
 
@@ -1853,10 +1854,7 @@ projectsRouter.patch('/:id/tasks/:taskId', async (req, res) => {
     body.parentTaskId !== undefined &&
     body.parentTaskId !== task.parentTaskId;
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+  await auditAs(actor, req, {
     action: statusChanged ? 'task.status_change' : 'task.update',
     entityType: 'task',
     entityId: task.id,
@@ -1867,90 +1865,76 @@ projectsRouter.patch('/:id/tasks/:taskId', async (req, res) => {
         ? { fromStatus: task.status, toStatus: body.status }
         : {}),
       ...(assigneeChanged ? { assigneeId: nextPrimaryAssigneeId } : {}),
+      ...(nextAssigneeIds !== undefined ? { assigneeIds: nextAssigneeIds } : {}),
       ...(milestoneChanged ? { milestoneId: body.milestoneId } : {}),
       ...(priorityChanged
         ? { fromPriority: task.priority, toPriority: body.priority }
         : {}),
       ...(parentChanged ? { parentTaskId: body.parentTaskId } : {}),
     },
-    ip: req.ip,
   });
 
   const [row] = await db
     .select()
     .from(projectTasks)
-    .where(eq(projectTasks.id, task.id));
-  const [enriched] = await attachAssignees(ctx.agencyId, [serializeTask(row!)]);
+    .where(and(eq(projectTasks.id, task.id), eq(projectTasks.agencyId, actor.agencyId)));
+  const [enriched] = await withTaskCapabilities(
+    actor,
+    await attachAssignees(actor.agencyId, [serializeTask(row!)]),
+  );
   ok(res, enriched);
 });
 
-// GET /projects/:id/tasks/:taskId/subtasks  §3.4
-projectsRouter.get('/:id/tasks/:taskId/subtasks', async (req, res) => {
-  const ctx = getAuth(req);
+// GET /projects/:id/tasks/:taskId/subtasks  §3.4 — tasks.view on the parent;
+// subtasks filtered by the actor's tasks.view scope.
+projectsRouter.get('/:id/tasks/:taskId/subtasks', requires('tasks.view'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
-  const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
+  const { task } = await authorizeTask(actor, projectId, param(req, 'taskId'), 'tasks.view');
 
   const rows = await db
     .select()
     .from(projectTasks)
     .where(
       and(
-        eq(projectTasks.agencyId, ctx.agencyId),
+        eq(projectTasks.agencyId, actor.agencyId),
         eq(projectTasks.projectId, projectId),
         eq(projectTasks.parentTaskId, task.id),
+        taskScopeFilter(actor, 'tasks.view'),
       ),
     )
     .orderBy(asc(projectTasks.position), asc(projectTasks.createdAt));
 
-  ok(res, await enrichTasks(ctx.agencyId, rows));
+  ok(res, await withTaskCapabilities(actor, await enrichTasks(actor.agencyId, rows)));
 });
 
-// DELETE /projects/:id/tasks/:taskId
-projectsRouter.delete('/:id/tasks/:taskId', async (req, res) => {
-  const ctx = getAuth(req);
+// DELETE /projects/:id/tasks/:taskId — tasks.delete (own = creator, project,
+// organization). Being an assignee does NOT grant delete.
+projectsRouter.delete('/:id/tasks/:taskId', requires('tasks.delete'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
-  const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
-
-  // A scoped member (Employee tier) may only delete tasks assigned to them —
-  // they see only their own tasks, so this keeps delete symmetric with what
-  // they can act on. Owner/admin/manager (canSeeAllProjects) may delete any.
-  if (!(await canSeeAllProjects(req))) {
-    const [mine] = await db
-      .select({ t: taskAssignees.taskId })
-      .from(taskAssignees)
-      .where(
-        and(
-          eq(taskAssignees.agencyId, ctx.agencyId),
-          eq(taskAssignees.taskId, task.id),
-          eq(taskAssignees.userId, ctx.userId),
-        ),
-      )
-      .limit(1);
-    if (task.assigneeId !== ctx.userId && !mine) {
-      throw forbidden('You can only delete tasks assigned to you.');
-    }
-  }
+  const { task } = await authorizeTask(
+    actor,
+    projectId,
+    param(req, 'taskId'),
+    'tasks.delete',
+    "You don't have permission to delete this task.",
+  );
 
   await db
     .delete(projectTasks)
     .where(
       and(
         eq(projectTasks.id, task.id),
-        eq(projectTasks.agencyId, ctx.agencyId),
+        eq(projectTasks.agencyId, actor.agencyId),
       ),
     );
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+  await auditAs(actor, req, {
     action: 'task.delete',
     entityType: 'task',
     entityId: task.id,
     metadata: { projectId, taskTitle: task.title },
-    ip: req.ip,
   });
   ok(res, { deleted: true });
 });
@@ -1960,37 +1944,20 @@ projectsRouter.delete('/:id/tasks/:taskId', async (req, res) => {
 // ============================================================
 
 // PUT /projects/:id/tasks/:taskId/labels — replace the full label set.
+// tasks.update on the task; labels must belong to the task's project.
 const putTaskLabelsSchema = z.object({
   labelIds: z.array(z.string().min(1)).max(50),
 });
 
-projectsRouter.put('/:id/tasks/:taskId/labels', async (req, res) => {
-  const ctx = getAuth(req);
+projectsRouter.put('/:id/tasks/:taskId/labels', requires('tasks.update'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
-  const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
+  const { task } = await authorizeTask(actor, projectId, param(req, 'taskId'), 'tasks.update');
   const body = putTaskLabelsSchema.parse(req.body);
 
   // De-dupe and validate every requested label belongs to this project.
   const wanted = [...new Set(body.labelIds)];
-  if (wanted.length > 0) {
-    const valid = await db
-      .select({ id: projectTaskLabels.id })
-      .from(projectTaskLabels)
-      .where(
-        and(
-          eq(projectTaskLabels.agencyId, ctx.agencyId),
-          eq(projectTaskLabels.projectId, projectId),
-          inArray(projectTaskLabels.id, wanted),
-        ),
-      );
-    if (valid.length !== wanted.length) {
-      throw new AppError(
-        'VALIDATION_ERROR',
-        'One or more labels do not belong to this project.',
-      );
-    }
-  }
+  await requireLabelsInProject(actor.agencyId, projectId, wanted);
 
   // Replace the full set: delete-then-insert in a transaction.
   await db.transaction(async (tx) => {
@@ -1998,14 +1965,14 @@ projectsRouter.put('/:id/tasks/:taskId/labels', async (req, res) => {
       .delete(projectTaskLabelLinks)
       .where(
         and(
-          eq(projectTaskLabelLinks.agencyId, ctx.agencyId),
+          eq(projectTaskLabelLinks.agencyId, actor.agencyId),
           eq(projectTaskLabelLinks.taskId, task.id),
         ),
       );
     if (wanted.length > 0) {
       await tx.insert(projectTaskLabelLinks).values(
         wanted.map((labelId) => ({
-          agencyId: ctx.agencyId,
+          agencyId: actor.agencyId,
           taskId: task.id,
           labelId,
         })),
@@ -2013,15 +1980,11 @@ projectsRouter.put('/:id/tasks/:taskId/labels', async (req, res) => {
     }
   });
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+  await auditAs(actor, req, {
     action: 'task.label_change',
     entityType: 'task',
     entityId: task.id,
     metadata: { projectId, labelIds: wanted },
-    ip: req.ip,
   });
 
   // Return the resolved labels for the task.
@@ -2034,7 +1997,7 @@ projectsRouter.put('/:id/tasks/:taskId/labels', async (req, res) => {
             .from(projectTaskLabels)
             .where(
               and(
-                eq(projectTaskLabels.agencyId, ctx.agencyId),
+                eq(projectTaskLabels.agencyId, actor.agencyId),
                 inArray(projectTaskLabels.id, wanted),
               ),
             )
@@ -2060,7 +2023,6 @@ async function dependencyWouldCycle(
   blockerTaskId: string,
   blockedTaskId: string,
 ): Promise<boolean> {
-  // A direct 2-cycle (the reverse edge already exists) is the trivial case.
   const edges = await db
     .select({
       blocker: projectTaskDependencies.blockerTaskId,
@@ -2097,19 +2059,12 @@ async function dependencyWouldCycle(
   return false;
 }
 
-// GET /projects/:id/tasks/:taskId/dependencies -> { blockedBy, blocks }
-projectsRouter.get('/:id/tasks/:taskId/dependencies', async (req, res) => {
-  const ctx = getAuth(req);
-  const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
-  const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
-
-  const deps = await loadTaskDependencies(ctx.agencyId, task.id);
-  ok(res, deps);
-});
-
-/** Resolve a task's blocked-by + blocks lists into serialized tasks + dep ids. */
-async function loadTaskDependencies(agencyId: string, taskId: string) {
+/**
+ * Resolve a task's blocked-by + blocks lists into serialized tasks + dep ids.
+ * Only related tasks the actor may view (tasks.view scope) are returned.
+ */
+async function loadTaskDependencies(actor: Actor, taskId: string) {
+  const visible = taskScopeFilter(actor, 'tasks.view');
   // Edges where this task is the blocked side -> its blockers.
   const blockedByEdges = await db
     .select({
@@ -2123,8 +2078,9 @@ async function loadTaskDependencies(agencyId: string, taskId: string) {
     )
     .where(
       and(
-        eq(projectTaskDependencies.agencyId, agencyId),
+        eq(projectTaskDependencies.agencyId, actor.agencyId),
         eq(projectTaskDependencies.blockedTaskId, taskId),
+        visible,
       ),
     )
     .orderBy(asc(projectTaskDependencies.createdAt));
@@ -2142,8 +2098,9 @@ async function loadTaskDependencies(agencyId: string, taskId: string) {
     )
     .where(
       and(
-        eq(projectTaskDependencies.agencyId, agencyId),
+        eq(projectTaskDependencies.agencyId, actor.agencyId),
         eq(projectTaskDependencies.blockerTaskId, taskId),
+        visible,
       ),
     )
     .orderBy(asc(projectTaskDependencies.createdAt));
@@ -2160,17 +2117,25 @@ async function loadTaskDependencies(agencyId: string, taskId: string) {
   };
 }
 
+// GET /projects/:id/tasks/:taskId/dependencies -> { blockedBy, blocks } — tasks.view
+projectsRouter.get('/:id/tasks/:taskId/dependencies', requires('tasks.view'), async (req, res) => {
+  const actor = getActor(req);
+  const projectId = param(req, 'id');
+  const { task } = await authorizeTask(actor, projectId, param(req, 'taskId'), 'tasks.view');
+  ok(res, await loadTaskDependencies(actor, task.id));
+});
+
 // POST /projects/:id/tasks/:taskId/dependencies { type, otherTaskId }
+// tasks.update on the task + tasks.view on the other task (same project).
 const createDependencySchema = z.object({
   type: z.enum(['blocks', 'blocked_by']),
   otherTaskId: z.string().min(1),
 });
 
-projectsRouter.post('/:id/tasks/:taskId/dependencies', async (req, res) => {
-  const ctx = getAuth(req);
+projectsRouter.post('/:id/tasks/:taskId/dependencies', requires('tasks.update'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
-  const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
+  const { task } = await authorizeTask(actor, projectId, param(req, 'taskId'), 'tasks.update');
   const body = createDependencySchema.parse(req.body);
 
   if (body.otherTaskId === task.id) {
@@ -2179,8 +2144,8 @@ projectsRouter.post('/:id/tasks/:taskId/dependencies', async (req, res) => {
       'A task cannot depend on itself.',
     );
   }
-  // The other task must also live in this project.
-  const other = await getScopedTask(ctx, projectId, body.otherTaskId);
+  // The other task must live in this project and be visible to the caller.
+  const { task: other } = await authorizeTask(actor, projectId, body.otherTaskId, 'tasks.view');
 
   // Normalize to canonical (blocker -> blocked).
   const blockerTaskId = body.type === 'blocks' ? task.id : other.id;
@@ -2192,6 +2157,7 @@ projectsRouter.post('/:id/tasks/:taskId/dependencies', async (req, res) => {
     .from(projectTaskDependencies)
     .where(
       and(
+        eq(projectTaskDependencies.agencyId, actor.agencyId),
         eq(projectTaskDependencies.blockerTaskId, blockerTaskId),
         eq(projectTaskDependencies.blockedTaskId, blockedTaskId),
       ),
@@ -2202,7 +2168,7 @@ projectsRouter.post('/:id/tasks/:taskId/dependencies', async (req, res) => {
   // Reject any edge that would introduce a cycle (covers 2-cycles too).
   if (
     await dependencyWouldCycle(
-      ctx.agencyId,
+      actor.agencyId,
       projectId,
       blockerTaskId,
       blockedTaskId,
@@ -2217,35 +2183,31 @@ projectsRouter.post('/:id/tasks/:taskId/dependencies', async (req, res) => {
   const id = newId('pdp');
   await db.insert(projectTaskDependencies).values({
     id,
-    agencyId: ctx.agencyId,
+    agencyId: actor.agencyId,
     projectId,
     blockerTaskId,
     blockedTaskId,
-    createdBy: ctx.userId,
+    createdBy: staffUserId(actor),
   });
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+  await auditAs(actor, req, {
     action: 'task.dependency_add',
     entityType: 'task',
     entityId: task.id,
     metadata: { projectId, blockerTaskId, blockedTaskId },
-    ip: req.ip,
   });
 
-  created(res, await loadTaskDependencies(ctx.agencyId, task.id));
+  created(res, await loadTaskDependencies(actor, task.id));
 });
 
-// DELETE /projects/:id/tasks/:taskId/dependencies/:depId
+// DELETE /projects/:id/tasks/:taskId/dependencies/:depId — tasks.update on the task
 projectsRouter.delete(
   '/:id/tasks/:taskId/dependencies/:depId',
+  requires('tasks.update'),
   async (req, res) => {
-    const ctx = getAuth(req);
+    const actor = getActor(req);
     const projectId = param(req, 'id');
-    await getScopedProject(req, projectId);
-    const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
+    const { task } = await authorizeTask(actor, projectId, param(req, 'taskId'), 'tasks.update');
     const depId = param(req, 'depId');
 
     const [dep] = await db
@@ -2254,7 +2216,7 @@ projectsRouter.delete(
       .where(
         and(
           eq(projectTaskDependencies.id, depId),
-          eq(projectTaskDependencies.agencyId, ctx.agencyId),
+          eq(projectTaskDependencies.agencyId, actor.agencyId),
           eq(projectTaskDependencies.projectId, projectId),
         ),
       )
@@ -2270,14 +2232,11 @@ projectsRouter.delete(
       .where(
         and(
           eq(projectTaskDependencies.id, depId),
-          eq(projectTaskDependencies.agencyId, ctx.agencyId),
+          eq(projectTaskDependencies.agencyId, actor.agencyId),
         ),
       );
 
-    await audit({
-      agencyId: ctx.agencyId,
-      actorType: ctx.role,
-      actorId: ctx.userId,
+    await auditAs(actor, req, {
       action: 'task.dependency_remove',
       entityType: 'task',
       entityId: task.id,
@@ -2286,10 +2245,9 @@ projectsRouter.delete(
         blockerTaskId: dep.blockerTaskId,
         blockedTaskId: dep.blockedTaskId,
       },
-      ip: req.ip,
     });
 
-    ok(res, await loadTaskDependencies(ctx.agencyId, task.id));
+    ok(res, await loadTaskDependencies(actor, task.id));
   },
 );
 
@@ -2309,15 +2267,22 @@ function serializeComment(c: {
   deletedAt: Date | null;
   authorName: string | null;
 }) {
+  let mentions: string[] = [];
+  if (c.mentionsJson) {
+    try {
+      const v = JSON.parse(c.mentionsJson);
+      if (Array.isArray(v)) mentions = v.filter((x): x is string => typeof x === 'string');
+    } catch {
+      mentions = [];
+    }
+  }
   return {
     id: c.id,
     taskId: c.taskId,
     authorId: c.authorId,
     authorName: c.authorName,
     body: c.body,
-    mentions: c.mentionsJson
-      ? (JSON.parse(c.mentionsJson) as string[])
-      : [],
+    mentions,
     createdAt: toIso(c.createdAt),
     updatedAt: toIso(c.updatedAt),
     deletedAt: toIso(c.deletedAt),
@@ -2337,15 +2302,20 @@ const commentSelection = {
 };
 
 /**
- * Parse explicit `mentions` (array of userIds) plus any `@token`s in the body,
- * resolved against agency users, and intersect with the project's members.
- * Returns the validated, de-duped set of mentioned userIds.
+ * Parse explicit `mentions` (array of userIds) plus any `@token`s in the body.
+ * Only ACTIVE STAFF of the agency can be mentioned (client accounts and
+ * outsiders are dropped). Returns the validated, de-duped set of user ids.
  */
 async function resolveMentions(
   agencyId: string,
   body: string,
   explicit: string[] | undefined,
 ): Promise<string[]> {
+  const staff = and(
+    eq(users.agencyId, agencyId),
+    eq(users.kind, 'staff'),
+    eq(users.status, 'active'),
+  );
   const ids = new Set<string>(explicit ?? []);
 
   // Lightweight @-token parse: @ followed by name-ish chars (handles @jane or
@@ -2355,7 +2325,7 @@ async function resolveMentions(
     const candidates = await db
       .select({ id: users.id, email: users.email, fullName: users.fullName })
       .from(users)
-      .where(eq(users.agencyId, agencyId));
+      .where(staff);
     for (const tok of tokens) {
       const low = tok.toLowerCase();
       const hit = candidates.find(
@@ -2369,70 +2339,72 @@ async function resolveMentions(
 
   if (ids.size === 0) return [];
 
-  // Keep only ids that are real agency users.
   const valid = await db
     .select({ id: users.id })
     .from(users)
-    .where(and(eq(users.agencyId, agencyId), inArray(users.id, [...ids])));
+    .where(and(staff, inArray(users.id, [...ids])));
   return valid.map((u) => u.id);
 }
 
-// GET /projects/:id/tasks/:taskId/comments (non-deleted, oldest-first)
-projectsRouter.get('/:id/tasks/:taskId/comments', async (req, res) => {
-  const ctx = getAuth(req);
-  const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
-  const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
-
+async function loadComments(agencyId: string, taskId: string) {
   const rows = await db
     .select(commentSelection)
     .from(projectTaskComments)
     .leftJoin(users, eq(users.id, projectTaskComments.authorId))
     .where(
       and(
-        eq(projectTaskComments.agencyId, ctx.agencyId),
-        eq(projectTaskComments.taskId, task.id),
+        eq(projectTaskComments.agencyId, agencyId),
+        eq(projectTaskComments.taskId, taskId),
         isNull(projectTaskComments.deletedAt),
       ),
     )
     .orderBy(asc(projectTaskComments.createdAt));
+  return rows.map(serializeComment);
+}
 
-  ok(res, rows.map(serializeComment));
+async function loadComment(agencyId: string, commentId: string) {
+  const [row] = await db
+    .select(commentSelection)
+    .from(projectTaskComments)
+    .leftJoin(users, eq(users.id, projectTaskComments.authorId))
+    .where(and(eq(projectTaskComments.id, commentId), eq(projectTaskComments.agencyId, agencyId)));
+  return serializeComment(row!);
+}
+
+// GET /projects/:id/tasks/:taskId/comments (non-deleted, oldest-first) — tasks.view
+projectsRouter.get('/:id/tasks/:taskId/comments', requires('tasks.view'), async (req, res) => {
+  const actor = getActor(req);
+  const projectId = param(req, 'id');
+  const { task } = await authorizeTask(actor, projectId, param(req, 'taskId'), 'tasks.view');
+  ok(res, await loadComments(actor.agencyId, task.id));
 });
 
-// POST /projects/:id/tasks/:taskId/comments { body, mentions? }
+// POST /projects/:id/tasks/:taskId/comments { body, mentions? } — task_comments.create
 const createCommentSchema = z.object({
   body: z.string().trim().min(1).max(5000),
-  mentions: z.array(z.string().min(1)).optional(),
+  mentions: z.array(z.string().min(1)).max(50).optional(),
 });
 
-projectsRouter.post('/:id/tasks/:taskId/comments', async (req, res) => {
-  const ctx = getAuth(req);
+projectsRouter.post('/:id/tasks/:taskId/comments', requires('task_comments.create'), async (req, res) => {
+  const actor = getActor(req);
+  const uid = staffUserId(actor);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
-  const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
+  const { task } = await authorizeTask(actor, projectId, param(req, 'taskId'), 'task_comments.create');
   const body = createCommentSchema.parse(req.body);
 
-  const mentions = await resolveMentions(
-    ctx.agencyId,
-    body.body,
-    body.mentions,
-  );
+  const mentions = await resolveMentions(actor.agencyId, body.body, body.mentions);
 
   const id = newId('pcm');
   await db.insert(projectTaskComments).values({
     id,
-    agencyId: ctx.agencyId,
+    agencyId: actor.agencyId,
     taskId: task.id,
-    authorId: ctx.userId,
+    authorId: uid,
     body: body.body,
     mentionsJson: mentions.length > 0 ? JSON.stringify(mentions) : null,
   });
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+  await auditAs(actor, req, {
     action: 'task.comment_add',
     entityType: 'task',
     entityId: task.id,
@@ -2441,66 +2413,33 @@ projectsRouter.post('/:id/tasks/:taskId/comments', async (req, res) => {
       commentId: id,
       ...(mentions.length > 0 ? { mentions } : {}),
     },
-    ip: req.ip,
   });
 
-  const [row] = await db
-    .select(commentSelection)
-    .from(projectTaskComments)
-    .leftJoin(users, eq(users.id, projectTaskComments.authorId))
-    .where(eq(projectTaskComments.id, id));
-  created(res, serializeComment(row!));
+  created(res, await loadComment(actor.agencyId, id));
 });
 
-/** Fetch a comment scoped to its task + agency (incl. soft-deleted), or 404. */
-async function getScopedComment(
-  ctx: ReturnType<typeof getAuth>,
-  taskId: string,
-  commentId: string,
-) {
-  const [row] = await db
-    .select()
-    .from(projectTaskComments)
-    .where(
-      and(
-        eq(projectTaskComments.id, commentId),
-        eq(projectTaskComments.agencyId, ctx.agencyId),
-        eq(projectTaskComments.taskId, taskId),
-      ),
-    )
-    .limit(1);
-  if (!row || row.deletedAt) throw notFound('Comment not found.');
-  return row;
-}
-
-// PATCH /projects/:id/tasks/:taskId/comments/:commentId (author-only)
+// PATCH /projects/:id/tasks/:taskId/comments/:commentId
+// tasks.view on the task (404) + task_comments.update on the comment (own/org).
 const updateCommentSchema = z.object({
   body: z.string().trim().min(1).max(5000),
-  mentions: z.array(z.string().min(1)).optional(),
+  mentions: z.array(z.string().min(1)).max(50).optional(),
 });
 
 projectsRouter.patch(
   '/:id/tasks/:taskId/comments/:commentId',
+  requires('task_comments.update'),
   async (req, res) => {
-    const ctx = getAuth(req);
+    const actor = getActor(req);
     const projectId = param(req, 'id');
-    await getScopedProject(req, projectId);
-    const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
-    const comment = await getScopedComment(
-      ctx,
-      task.id,
-      param(req, 'commentId'),
-    );
-    if (comment.authorId !== ctx.userId) {
-      throw forbidden('You can only edit your own comments.');
-    }
+    const { task } = await authorizeTask(actor, projectId, param(req, 'taskId'), 'tasks.view');
+    const cf = await commentFacts(actor, param(req, 'commentId'), task.id);
+    authorize(actor, 'task_comments.update', cf, {
+      message: 'You can only edit your own comments.',
+    });
+    const comment = cf!.comment;
     const body = updateCommentSchema.parse(req.body);
 
-    const mentions = await resolveMentions(
-      ctx.agencyId,
-      body.body,
-      body.mentions,
-    );
+    const mentions = await resolveMentions(actor.agencyId, body.body, body.mentions);
 
     await db
       .update(projectTaskComments)
@@ -2512,35 +2451,37 @@ projectsRouter.patch(
       .where(
         and(
           eq(projectTaskComments.id, comment.id),
-          eq(projectTaskComments.agencyId, ctx.agencyId),
+          eq(projectTaskComments.agencyId, actor.agencyId),
         ),
       );
 
-    const [row] = await db
-      .select(commentSelection)
-      .from(projectTaskComments)
-      .leftJoin(users, eq(users.id, projectTaskComments.authorId))
-      .where(eq(projectTaskComments.id, comment.id));
-    ok(res, serializeComment(row!));
+    if (comment.authorId !== actorUserId(actor)) {
+      await auditAs(actor, req, {
+        action: 'task.comment_moderate_edit',
+        entityType: 'task',
+        entityId: task.id,
+        metadata: { projectId, commentId: comment.id, authorId: comment.authorId },
+      });
+    }
+
+    ok(res, await loadComment(actor.agencyId, comment.id));
   },
 );
 
-// DELETE /projects/:id/tasks/:taskId/comments/:commentId (author-only soft delete)
+// DELETE /projects/:id/tasks/:taskId/comments/:commentId (soft delete)
+// tasks.view on the task (404) + task_comments.delete on the comment (own/org).
 projectsRouter.delete(
   '/:id/tasks/:taskId/comments/:commentId',
+  requires('task_comments.delete'),
   async (req, res) => {
-    const ctx = getAuth(req);
+    const actor = getActor(req);
     const projectId = param(req, 'id');
-    await getScopedProject(req, projectId);
-    const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
-    const comment = await getScopedComment(
-      ctx,
-      task.id,
-      param(req, 'commentId'),
-    );
-    if (comment.authorId !== ctx.userId) {
-      throw forbidden('You can only delete your own comments.');
-    }
+    const { task } = await authorizeTask(actor, projectId, param(req, 'taskId'), 'tasks.view');
+    const cf = await commentFacts(actor, param(req, 'commentId'), task.id);
+    authorize(actor, 'task_comments.delete', cf, {
+      message: 'You can only delete your own comments.',
+    });
+    const comment = cf!.comment;
 
     await db
       .update(projectTaskComments)
@@ -2548,9 +2489,16 @@ projectsRouter.delete(
       .where(
         and(
           eq(projectTaskComments.id, comment.id),
-          eq(projectTaskComments.agencyId, ctx.agencyId),
+          eq(projectTaskComments.agencyId, actor.agencyId),
         ),
       );
+
+    await auditAs(actor, req, {
+      action: 'task.comment_delete',
+      entityType: 'task',
+      entityId: task.id,
+      metadata: { projectId, commentId: comment.id, authorId: comment.authorId },
+    });
 
     ok(res, { deleted: true });
   },
@@ -2560,45 +2508,42 @@ projectsRouter.delete(
 //  SINGLE TASK DETAIL  §3.7
 // ============================================================
 
-// GET /projects/:id/tasks/:taskId — full detail bundle.
-projectsRouter.get('/:id/tasks/:taskId', async (req, res) => {
-  const ctx = getAuth(req);
+// GET /projects/:id/tasks/:taskId — full detail bundle. tasks.view on the task;
+// subtasks and dependency endpoints are filtered by the tasks.view scope.
+projectsRouter.get('/:id/tasks/:taskId', requires('tasks.view'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
-  const taskRow = await getScopedTask(ctx, projectId, param(req, 'taskId'));
+  const facts = await authorizeTask(actor, projectId, param(req, 'taskId'), 'tasks.view');
+  const taskRow = facts.task;
 
-  const [enrichedTask] = await enrichTasks(ctx.agencyId, [taskRow]);
+  const [enriched] = await enrichTasks(actor.agencyId, [taskRow]);
+  const enrichedTask = {
+    ...enriched!,
+    capabilities: capabilities(actor, facts, TASK_CAPS),
+  };
 
-  // Subtasks (children by position).
+  // Subtasks (children by position) the actor may view.
   const subtaskRows = await db
     .select()
     .from(projectTasks)
     .where(
       and(
-        eq(projectTasks.agencyId, ctx.agencyId),
+        eq(projectTasks.agencyId, actor.agencyId),
         eq(projectTasks.projectId, projectId),
         eq(projectTasks.parentTaskId, taskRow.id),
+        taskScopeFilter(actor, 'tasks.view'),
       ),
     )
     .orderBy(asc(projectTasks.position), asc(projectTasks.createdAt));
-  const subtasks = await enrichTasks(ctx.agencyId, subtaskRows);
+  const subtasks = await withTaskCapabilities(
+    actor,
+    await enrichTasks(actor.agencyId, subtaskRows),
+  );
 
-  const dependencies = await loadTaskDependencies(ctx.agencyId, taskRow.id);
+  const dependencies = await loadTaskDependencies(actor, taskRow.id);
 
   // Comments (non-deleted, oldest-first) with author names.
-  const commentRows = await db
-    .select(commentSelection)
-    .from(projectTaskComments)
-    .leftJoin(users, eq(users.id, projectTaskComments.authorId))
-    .where(
-      and(
-        eq(projectTaskComments.agencyId, ctx.agencyId),
-        eq(projectTaskComments.taskId, taskRow.id),
-        isNull(projectTaskComments.deletedAt),
-      ),
-    )
-    .orderBy(asc(projectTaskComments.createdAt));
-  const comments = commentRows.map(serializeComment);
+  const comments = await loadComments(actor.agencyId, taskRow.id);
 
   // Activity = audit entries for this task entity, with actor names.
   const activityRows = await db
@@ -2615,7 +2560,7 @@ projectsRouter.get('/:id/tasks/:taskId', async (req, res) => {
     .leftJoin(users, eq(users.id, auditLog.actorId))
     .where(
       and(
-        eq(auditLog.agencyId, ctx.agencyId),
+        eq(auditLog.agencyId, actor.agencyId),
         eq(auditLog.entityType, 'task'),
         eq(auditLog.entityId, taskRow.id),
       ),
@@ -2627,7 +2572,7 @@ projectsRouter.get('/:id/tasks/:taskId', async (req, res) => {
     actorId: a.actorId,
     actorName: a.actorName,
     action: a.action,
-    metadata: a.metadataJson ? JSON.parse(a.metadataJson) : null,
+    metadata: parseMetadata(a.metadataJson),
     createdAt: toIso(a.createdAt),
   }));
 
@@ -2648,7 +2593,7 @@ projectsRouter.get('/:id/tasks/:taskId', async (req, res) => {
   ok(res, {
     task: enrichedTask,
     subtasks,
-    labels: enrichedTask?.labels ?? [],
+    labels: enrichedTask.labels ?? [],
     dependencies,
     comments,
     activity,
@@ -2660,18 +2605,18 @@ projectsRouter.get('/:id/tasks/:taskId', async (req, res) => {
 //  MILESTONES
 // ============================================================
 
-// GET /projects/:id/milestones
-projectsRouter.get('/:id/milestones', async (req, res) => {
-  const ctx = getAuth(req);
+// GET /projects/:id/milestones — projects.view
+projectsRouter.get('/:id/milestones', requires('projects.view'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
+  await authorizeProject(actor, projectId, 'projects.view');
 
   const rows = await db
     .select()
     .from(projectMilestones)
     .where(
       and(
-        eq(projectMilestones.agencyId, ctx.agencyId),
+        eq(projectMilestones.agencyId, actor.agencyId),
         eq(projectMilestones.projectId, projectId),
       ),
     )
@@ -2683,7 +2628,7 @@ projectsRouter.get('/:id/milestones', async (req, res) => {
   ok(res, rows.map(serializeMilestone));
 });
 
-// POST /projects/:id/milestones
+// POST /projects/:id/milestones — project_milestones.manage
 const createMilestoneSchema = z.object({
   title: z.string().min(1).max(200),
   description: z.string().max(5000).optional(),
@@ -2692,16 +2637,16 @@ const createMilestoneSchema = z.object({
   position: z.number().int().min(0).optional(),
 });
 
-projectsRouter.post('/:id/milestones', async (req, res) => {
-  const ctx = getAuth(req);
+projectsRouter.post('/:id/milestones', requires('project_milestones.manage'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
+  await authorizeProject(actor, projectId, 'project_milestones.manage');
   const body = createMilestoneSchema.parse(req.body);
 
   const id = newId('pms');
   await db.insert(projectMilestones).values({
     id,
-    agencyId: ctx.agencyId,
+    agencyId: actor.agencyId,
     projectId,
     title: body.title,
     description: body.description ?? null,
@@ -2712,10 +2657,7 @@ projectsRouter.post('/:id/milestones', async (req, res) => {
     ...(body.position !== undefined ? { position: body.position } : {}),
   });
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+  await auditAs(actor, req, {
     action: 'milestone.create',
     entityType: 'milestone',
     entityId: id,
@@ -2724,19 +2666,18 @@ projectsRouter.post('/:id/milestones', async (req, res) => {
       milestoneTitle: body.title,
       status: body.status ?? 'pending',
     },
-    ip: req.ip,
   });
 
   const [row] = await db
     .select()
     .from(projectMilestones)
-    .where(eq(projectMilestones.id, id));
+    .where(and(eq(projectMilestones.id, id), eq(projectMilestones.agencyId, actor.agencyId)));
   created(res, serializeMilestone(row!));
 });
 
 /** Fetch a milestone scoped to the project + agency, or throw 404. */
 async function getScopedMilestone(
-  ctx: ReturnType<typeof getAuth>,
+  agencyId: string,
   projectId: string,
   milestoneId: string,
 ) {
@@ -2746,7 +2687,7 @@ async function getScopedMilestone(
     .where(
       and(
         eq(projectMilestones.id, milestoneId),
-        eq(projectMilestones.agencyId, ctx.agencyId),
+        eq(projectMilestones.agencyId, agencyId),
         eq(projectMilestones.projectId, projectId),
       ),
     )
@@ -2755,7 +2696,7 @@ async function getScopedMilestone(
   return row;
 }
 
-// PATCH /projects/:id/milestones/:milestoneId
+// PATCH /projects/:id/milestones/:milestoneId — project_milestones.manage
 const updateMilestoneSchema = z.object({
   title: z.string().min(1).max(200).optional(),
   description: z.string().max(5000).nullable().optional(),
@@ -2764,15 +2705,11 @@ const updateMilestoneSchema = z.object({
   position: z.number().int().min(0).optional(),
 });
 
-projectsRouter.patch('/:id/milestones/:milestoneId', async (req, res) => {
-  const ctx = getAuth(req);
+projectsRouter.patch('/:id/milestones/:milestoneId', requires('project_milestones.manage'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
-  const milestone = await getScopedMilestone(
-    ctx,
-    projectId,
-    param(req, 'milestoneId'),
-  );
+  await authorizeProject(actor, projectId, 'project_milestones.manage');
+  const milestone = await getScopedMilestone(actor.agencyId, projectId, param(req, 'milestoneId'));
   const body = updateMilestoneSchema.parse(req.body);
 
   const patch: Partial<typeof projectMilestones.$inferInsert> = {
@@ -2786,8 +2723,7 @@ projectsRouter.patch('/:id/milestones/:milestoneId', async (req, res) => {
     patch.status = body.status;
     // Completing stamps completedAt; un-completing clears it.
     if (body.status === 'completed') {
-      patch.completedAt =
-        milestone.completedAt ?? new Date();
+      patch.completedAt = milestone.completedAt ?? new Date();
     } else {
       patch.completedAt = null;
     }
@@ -2799,17 +2735,14 @@ projectsRouter.patch('/:id/milestones/:milestoneId', async (req, res) => {
     .where(
       and(
         eq(projectMilestones.id, milestone.id),
-        eq(projectMilestones.agencyId, ctx.agencyId),
+        eq(projectMilestones.agencyId, actor.agencyId),
       ),
     );
 
   const mStatusChanged =
     body.status !== undefined && body.status !== milestone.status;
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+  await auditAs(actor, req, {
     action: 'milestone.update',
     entityType: 'milestone',
     entityId: milestone.id,
@@ -2820,45 +2753,36 @@ projectsRouter.patch('/:id/milestones/:milestoneId', async (req, res) => {
         ? { fromStatus: milestone.status, toStatus: body.status }
         : {}),
     },
-    ip: req.ip,
   });
 
   const [row] = await db
     .select()
     .from(projectMilestones)
-    .where(eq(projectMilestones.id, milestone.id));
+    .where(and(eq(projectMilestones.id, milestone.id), eq(projectMilestones.agencyId, actor.agencyId)));
   ok(res, serializeMilestone(row!));
 });
 
-// DELETE /projects/:id/milestones/:milestoneId
-projectsRouter.delete('/:id/milestones/:milestoneId', async (req, res) => {
-  const ctx = getAuth(req);
+// DELETE /projects/:id/milestones/:milestoneId — project_milestones.manage
+projectsRouter.delete('/:id/milestones/:milestoneId', requires('project_milestones.manage'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
-  const milestone = await getScopedMilestone(
-    ctx,
-    projectId,
-    param(req, 'milestoneId'),
-  );
+  await authorizeProject(actor, projectId, 'project_milestones.manage');
+  const milestone = await getScopedMilestone(actor.agencyId, projectId, param(req, 'milestoneId'));
 
   await db
     .delete(projectMilestones)
     .where(
       and(
         eq(projectMilestones.id, milestone.id),
-        eq(projectMilestones.agencyId, ctx.agencyId),
+        eq(projectMilestones.agencyId, actor.agencyId),
       ),
     );
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+  await auditAs(actor, req, {
     action: 'milestone.delete',
     entityType: 'milestone',
     entityId: milestone.id,
     metadata: { projectId, milestoneTitle: milestone.title },
-    ip: req.ip,
   });
   ok(res, { deleted: true });
 });
@@ -2867,93 +2791,94 @@ projectsRouter.delete('/:id/milestones/:milestoneId', async (req, res) => {
 //  MEMBERS
 // ============================================================
 
-// GET /projects/:id/members
-projectsRouter.get('/:id/members', async (req, res) => {
-  const ctx = getAuth(req);
+const memberSelection = {
+  id: projectMembers.id,
+  userId: projectMembers.userId,
+  role: projectMembers.role,
+  createdAt: projectMembers.createdAt,
+  userName: users.fullName,
+  userEmail: users.email,
+};
+
+function serializeMember(m: {
+  id: string;
+  userId: string;
+  role: string | null;
+  createdAt: Date | null;
+  userName: string | null;
+  userEmail: string | null;
+}) {
+  return {
+    id: m.id,
+    userId: m.userId,
+    role: m.role,
+    userName: m.userName,
+    userEmail: m.userEmail,
+    createdAt: toIso(m.createdAt),
+  };
+}
+
+// GET /projects/:id/members — projects.view
+projectsRouter.get('/:id/members', requires('projects.view'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
+  await authorizeProject(actor, projectId, 'projects.view');
 
   const rows = await db
-    .select({
-      id: projectMembers.id,
-      userId: projectMembers.userId,
-      role: projectMembers.role,
-      createdAt: projectMembers.createdAt,
-      userName: users.fullName,
-      userEmail: users.email,
-    })
+    .select(memberSelection)
     .from(projectMembers)
     .leftJoin(users, eq(users.id, projectMembers.userId))
     .where(
       and(
-        eq(projectMembers.agencyId, ctx.agencyId),
+        eq(projectMembers.agencyId, actor.agencyId),
         eq(projectMembers.projectId, projectId),
       ),
     )
     .orderBy(asc(projectMembers.createdAt));
 
-  ok(
-    res,
-    rows.map((m) => ({
-      id: m.id,
-      userId: m.userId,
-      role: m.role,
-      userName: m.userName,
-      userEmail: m.userEmail,
-      createdAt: toIso(m.createdAt),
-    })),
-  );
+  ok(res, rows.map(serializeMember));
 });
 
-// POST /projects/:id/members
+// POST /projects/:id/members — projects.manage_members; target must be active
+// staff; role ∈ lead | member.
 const addMemberSchema = z.object({
   userId: z.string().min(1),
-  role: z.string().trim().max(40).optional(),
+  role: z.enum(PROJECT_MEMBER_ROLES).optional(),
 });
 
-projectsRouter.post('/:id/members', async (req, res) => {
-  const ctx = getAuth(req);
+projectsRouter.post('/:id/members', requires('projects.manage_members'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
+  await authorizeProject(actor, projectId, 'projects.manage_members');
   const body = addMemberSchema.parse(req.body);
-  await requireAgencyUser(ctx, body.userId);
+  await requireActiveStaff(actor.agencyId, [body.userId]);
 
-  const id = newId('prm');
+  const role = body.role ?? 'member';
   await db
     .insert(projectMembers)
     .values({
-      id,
-      agencyId: ctx.agencyId,
+      id: newId('prm'),
+      agencyId: actor.agencyId,
       projectId,
       userId: body.userId,
-      role: body.role ?? null,
+      role,
     })
     .onConflictDoNothing();
 
   const [row] = await db
-    .select({
-      id: projectMembers.id,
-      userId: projectMembers.userId,
-      role: projectMembers.role,
-      createdAt: projectMembers.createdAt,
-      userName: users.fullName,
-      userEmail: users.email,
-    })
+    .select(memberSelection)
     .from(projectMembers)
     .leftJoin(users, eq(users.id, projectMembers.userId))
     .where(
       and(
-        eq(projectMembers.agencyId, ctx.agencyId),
+        eq(projectMembers.agencyId, actor.agencyId),
         eq(projectMembers.projectId, projectId),
         eq(projectMembers.userId, body.userId),
       ),
     )
     .limit(1);
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+  await auditAs(actor, req, {
     action: 'member.add',
     entityType: 'project_member',
     entityId: row!.id,
@@ -2961,48 +2886,36 @@ projectsRouter.post('/:id/members', async (req, res) => {
       projectId,
       userId: body.userId,
       userName: row!.userName,
-      role: body.role ?? null,
+      role: row!.role,
     },
-    ip: req.ip,
   });
 
-  created(res, {
-    id: row!.id,
-    userId: row!.userId,
-    role: row!.role,
-    userName: row!.userName,
-    userEmail: row!.userEmail,
-    createdAt: toIso(row!.createdAt),
-  });
+  created(res, serializeMember(row!));
 });
 
-// DELETE /projects/:id/members/:memberId
-projectsRouter.delete('/:id/members/:memberId', async (req, res) => {
-  const ctx = getAuth(req);
+// DELETE /projects/:id/members/:memberId — projects.manage_members
+projectsRouter.delete('/:id/members/:memberId', requires('projects.manage_members'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
+  await authorizeProject(actor, projectId, 'projects.manage_members');
 
   const result = await db
     .delete(projectMembers)
     .where(
       and(
         eq(projectMembers.id, param(req, 'memberId')),
-        eq(projectMembers.agencyId, ctx.agencyId),
+        eq(projectMembers.agencyId, actor.agencyId),
         eq(projectMembers.projectId, projectId),
       ),
     )
-    .returning({ id: projectMembers.id, userId: projectMembers.userId });
+    .returning({ id: projectMembers.id, userId: projectMembers.userId, role: projectMembers.role });
   if (!result.length) throw notFound('Member not found.');
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+  await auditAs(actor, req, {
     action: 'member.remove',
     entityType: 'project_member',
     entityId: result[0]!.id,
-    metadata: { projectId, userId: result[0]!.userId },
-    ip: req.ip,
+    metadata: { projectId, userId: result[0]!.userId, role: result[0]!.role },
   });
 
   ok(res, { deleted: true });
@@ -3012,19 +2925,26 @@ projectsRouter.delete('/:id/members/:memberId', async (req, res) => {
 //  TIME TRACKING (project-scoped reads; mutations live in timers.ts)
 // ============================================================
 
-// GET /projects/:id/timers — ALL running timers for the project
-projectsRouter.get('/:id/timers', async (req, res) => {
-  const ctx = getAuth(req);
+// GET /projects/:id/timers — running timers in the project: projects.view on
+// the project; others' timers only via timers.view scope (own always).
+projectsRouter.get('/:id/timers', requires('projects.view'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
-  ok(res, await listProjectTimers(ctx, projectId));
+  await authorizeProject(actor, projectId, 'projects.view');
+  ok(res, await listProjectTimers(actor, projectId));
 });
 
-// GET /projects/:id/time-summary
-projectsRouter.get('/:id/time-summary', async (req, res) => {
-  const ctx = getAuth(req);
+// GET /projects/:id/time-summary — time_logs.view; totals/by-member/by-task are
+// computed over the log rows in the actor's time_logs.view scope.
+projectsRouter.get('/:id/time-summary', requires('time_logs.view'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
+  await authorizeProject(actor, projectId, 'projects.view');
+  const scope = and(
+    eq(timeLogs.agencyId, actor.agencyId),
+    eq(timeLogs.projectId, projectId),
+    timeLogScopeFilter(actor, 'time_logs.view'),
+  );
 
   const [{ totalMinutes, logCount } = { totalMinutes: 0, logCount: 0 }] =
     await db
@@ -3033,12 +2953,7 @@ projectsRouter.get('/:id/time-summary', async (req, res) => {
         logCount: sql<number>`count(*)`,
       })
       .from(timeLogs)
-      .where(
-        and(
-          eq(timeLogs.agencyId, ctx.agencyId),
-          eq(timeLogs.projectId, projectId),
-        ),
-      );
+      .where(scope);
 
   const byMemberRows = await db
     .select({
@@ -3048,12 +2963,7 @@ projectsRouter.get('/:id/time-summary', async (req, res) => {
     })
     .from(timeLogs)
     .leftJoin(users, eq(users.id, timeLogs.userId))
-    .where(
-      and(
-        eq(timeLogs.agencyId, ctx.agencyId),
-        eq(timeLogs.projectId, projectId),
-      ),
-    )
+    .where(scope)
     .groupBy(timeLogs.userId, users.fullName)
     .orderBy(desc(sql`sum(${timeLogs.minutes})`));
 
@@ -3065,17 +2975,12 @@ projectsRouter.get('/:id/time-summary', async (req, res) => {
     })
     .from(timeLogs)
     .leftJoin(projectTasks, eq(projectTasks.id, timeLogs.taskId))
-    .where(
-      and(
-        eq(timeLogs.agencyId, ctx.agencyId),
-        eq(timeLogs.projectId, projectId),
-      ),
-    )
+    .where(scope)
     .groupBy(timeLogs.taskId, projectTasks.title)
     .orderBy(desc(sql`sum(${timeLogs.minutes})`))
     .limit(15);
 
-  const activeTimers = await listProjectTimers(ctx, projectId);
+  const activeTimers = await listProjectTimers(actor, projectId);
 
   ok(res, {
     totalMinutes: Number(totalMinutes ?? 0),
@@ -3094,15 +2999,15 @@ projectsRouter.get('/:id/time-summary', async (req, res) => {
   });
 });
 
-// GET /projects/:id/time-logs?limit
+// GET /projects/:id/time-logs?limit — time_logs.view (SQL scope)
 const projectLogsQuery = z.object({
   limit: z.coerce.number().int().min(1).max(200).optional(),
 });
 
-projectsRouter.get('/:id/time-logs', async (req, res) => {
-  const ctx = getAuth(req);
+projectsRouter.get('/:id/time-logs', requires('time_logs.view'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
+  await authorizeProject(actor, projectId, 'projects.view');
   const q = projectLogsQuery.parse(req.query);
 
   const rows = await db
@@ -3121,8 +3026,9 @@ projectsRouter.get('/:id/time-logs', async (req, res) => {
     .leftJoin(projectTasks, eq(projectTasks.id, timeLogs.taskId))
     .where(
       and(
-        eq(timeLogs.agencyId, ctx.agencyId),
+        eq(timeLogs.agencyId, actor.agencyId),
         eq(timeLogs.projectId, projectId),
+        timeLogScopeFilter(actor, 'time_logs.view'),
       ),
     )
     .orderBy(desc(timeLogs.workDate))
@@ -3144,15 +3050,17 @@ projectsRouter.get('/:id/time-logs', async (req, res) => {
 });
 
 // GET /projects/:id/tasks/:taskId/time-logs — task-scoped timeline.
-// Returns the task's logged entries (newest first), a summed total, and how
-// many timers are running on THIS task right now, so the task panel can show
-// "Total tracked: 3h 20m" alongside a per-entry timeline (who · start→end ·
-// duration · note).
-projectsRouter.get('/:id/tasks/:taskId/time-logs', async (req, res) => {
-  const ctx = getAuth(req);
+// tasks.view on the task + time_logs.view (SQL scope); the running-timer count
+// covers only timers the actor may see.
+projectsRouter.get('/:id/tasks/:taskId/time-logs', requires('time_logs.view'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
-  const task = await getScopedTask(ctx, projectId, param(req, 'taskId'));
+  const { task } = await authorizeTask(actor, projectId, param(req, 'taskId'), 'tasks.view');
+  const scope = and(
+    eq(timeLogs.agencyId, actor.agencyId),
+    eq(timeLogs.taskId, task.id),
+    timeLogScopeFilter(actor, 'time_logs.view'),
+  );
 
   const rows = await db
     .select({
@@ -3165,12 +3073,7 @@ projectsRouter.get('/:id/tasks/:taskId/time-logs', async (req, res) => {
     })
     .from(timeLogs)
     .leftJoin(users, eq(users.id, timeLogs.userId))
-    .where(
-      and(
-        eq(timeLogs.agencyId, ctx.agencyId),
-        eq(timeLogs.taskId, task.id),
-      ),
-    )
+    .where(scope)
     .orderBy(desc(timeLogs.workDate));
 
   const [{ totalMinutes } = { totalMinutes: 0 }] = await db
@@ -3178,15 +3081,17 @@ projectsRouter.get('/:id/tasks/:taskId/time-logs', async (req, res) => {
       totalMinutes: sql<number>`coalesce(sum(${timeLogs.minutes}), 0)`,
     })
     .from(timeLogs)
-    .where(
-      and(eq(timeLogs.agencyId, ctx.agencyId), eq(timeLogs.taskId, task.id)),
-    );
+    .where(scope);
 
   const [{ activeCount } = { activeCount: 0 }] = await db
     .select({ activeCount: sql<number>`count(*)` })
     .from(timers)
     .where(
-      and(eq(timers.agencyId, ctx.agencyId), eq(timers.taskId, task.id)),
+      and(
+        eq(timers.agencyId, actor.agencyId),
+        eq(timers.taskId, task.id),
+        timerScopeFilter(actor),
+      ),
     );
 
   ok(res, {
@@ -3220,15 +3125,16 @@ type ActivityRow = {
   createdAt: Date | null;
 };
 
-function serializeActivity(r: ActivityRow) {
-  let metadata: Record<string, unknown> | null = null;
-  if (r.metadataJson) {
-    try {
-      metadata = JSON.parse(r.metadataJson);
-    } catch {
-      metadata = null;
-    }
+function parseMetadata(json: string | null): Record<string, unknown> | null {
+  if (!json) return null;
+  try {
+    return JSON.parse(json);
+  } catch {
+    return null;
   }
+}
+
+function serializeActivity(r: ActivityRow) {
   return {
     id: r.id,
     action: r.action,
@@ -3236,20 +3142,53 @@ function serializeActivity(r: ActivityRow) {
     actorName: r.actorName,
     entityType: r.entityType,
     entityId: r.entityId,
-    metadata,
+    metadata: parseMetadata(r.metadataJson),
     createdAt: toIso(r.createdAt),
   };
 }
 
 /**
- * Read the audit feed for a project: rows whose metadata json has the matching
- * projectId. Uses json_extract with a LIKE fallback for robustness.
+ * Read the audit feed for a project (rows whose metadata.projectId matches),
+ * restricted to what the actor may see: task entries only for tasks in their
+ * tasks.view scope; timer / time-log entries only with project- or
+ * organization-wide time_logs.view (or their own).
  */
 async function fetchProjectActivity(
-  ctx: ReturnType<typeof getAuth>,
-  projectId: string,
+  actor: Actor,
+  facts: ProjectFacts,
   limit: number,
 ): Promise<ReturnType<typeof serializeActivity>[]> {
+  const projectId = facts.projectId;
+  const conds: SQL[] = [
+    eq(auditLog.agencyId, actor.agencyId),
+    sql`(case when json_valid(${auditLog.metadataJson}) then json_extract(${auditLog.metadataJson}, '$.projectId') end) = ${projectId}`,
+  ];
+  if (!canOrg(actor, 'tasks.view')) {
+    conds.push(
+      or(
+        isNull(auditLog.entityType),
+        ne(auditLog.entityType, 'task'),
+        inArray(auditLog.entityId, visibleTaskIdsSq(actor, 'tasks.view')),
+      )!,
+    );
+  }
+  const projectTime = check(actor, 'time_logs.view', {
+    agencyId: actor.agencyId,
+    projectMember: facts.projectMember,
+  });
+  if (!projectTime) {
+    const uid = actorUserId(actor);
+    conds.push(
+      or(
+        isNull(auditLog.entityType),
+        notInArray(auditLog.entityType, ['timer', 'time_log']),
+        ...(uid && check(actor, 'time_logs.view', { agencyId: actor.agencyId, ownerIds: [uid] })
+          ? [eq(auditLog.actorId, uid)]
+          : []),
+      )!,
+    );
+  }
+
   const rows = await db
     .select({
       id: auditLog.id,
@@ -3263,42 +3202,36 @@ async function fetchProjectActivity(
     })
     .from(auditLog)
     .leftJoin(users, eq(users.id, auditLog.actorId))
-    .where(
-      and(
-        eq(auditLog.agencyId, ctx.agencyId),
-        sql`(
-          json_extract(${auditLog.metadataJson}, '$.projectId') = ${projectId}
-          or ${auditLog.metadataJson} like ${'%"projectId":"' + projectId + '"%'}
-        )`,
-      ),
-    )
+    .where(and(...conds))
     .orderBy(desc(auditLog.createdAt))
     .limit(limit);
 
   return (rows as ActivityRow[]).map(serializeActivity);
 }
 
-// GET /projects/:id/activity?limit=50
+// GET /projects/:id/activity?limit=50 — projects.view (entries filtered, above)
 const activityQuery = z.object({
   limit: z.coerce.number().int().min(1).max(200).optional(),
 });
 
-projectsRouter.get('/:id/activity', async (req, res) => {
-  const ctx = getAuth(req);
+projectsRouter.get('/:id/activity', requires('projects.view'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
+  const facts = await authorizeProject(actor, projectId, 'projects.view');
   const q = activityQuery.parse(req.query);
-  ok(res, await fetchProjectActivity(ctx, projectId, q.limit ?? 50));
+  ok(res, await fetchProjectActivity(actor, facts, q.limit ?? 50));
 });
 
 // ============================================================
 //  OVERVIEW (boss dashboard tab)
 // ============================================================
 
-projectsRouter.get('/:id/overview', async (req, res) => {
-  const ctx = getAuth(req);
+// GET /projects/:id/overview — projects.view. Task counts respect the
+// tasks.view scope, logged time the time_logs.view scope, timers timers.view.
+projectsRouter.get('/:id/overview', requires('projects.view'), async (req, res) => {
+  const actor = getActor(req);
   const projectId = param(req, 'id');
-  await getScopedProject(req, projectId);
+  const facts = await authorizeProject(actor, projectId, 'projects.view');
 
   // Tasks grouped by status.
   const taskStatusRows = await db
@@ -3309,8 +3242,9 @@ projectsRouter.get('/:id/overview', async (req, res) => {
     .from(projectTasks)
     .where(
       and(
-        eq(projectTasks.agencyId, ctx.agencyId),
+        eq(projectTasks.agencyId, actor.agencyId),
         eq(projectTasks.projectId, projectId),
+        taskScopeFilter(actor, 'tasks.view'),
       ),
     )
     .groupBy(projectTasks.status);
@@ -3347,7 +3281,7 @@ projectsRouter.get('/:id/overview', async (req, res) => {
       .from(projectMilestones)
       .where(
         and(
-          eq(projectMilestones.agencyId, ctx.agencyId),
+          eq(projectMilestones.agencyId, actor.agencyId),
           eq(projectMilestones.projectId, projectId),
         ),
       );
@@ -3358,12 +3292,12 @@ projectsRouter.get('/:id/overview', async (req, res) => {
     .from(projectMembers)
     .where(
       and(
-        eq(projectMembers.agencyId, ctx.agencyId),
+        eq(projectMembers.agencyId, actor.agencyId),
         eq(projectMembers.projectId, projectId),
       ),
     );
 
-  // Logged time.
+  // Logged time (within the actor's time_logs.view scope).
   const [{ totalTimeMinutes } = { totalTimeMinutes: 0 }] = await db
     .select({
       totalTimeMinutes: sql<number>`coalesce(sum(${timeLogs.minutes}), 0)`,
@@ -3371,13 +3305,14 @@ projectsRouter.get('/:id/overview', async (req, res) => {
     .from(timeLogs)
     .where(
       and(
-        eq(timeLogs.agencyId, ctx.agencyId),
+        eq(timeLogs.agencyId, actor.agencyId),
         eq(timeLogs.projectId, projectId),
+        timeLogScopeFilter(actor, 'time_logs.view'),
       ),
     );
 
-  const activeTimers = await listProjectTimers(ctx, projectId);
-  const recentActivity = await fetchProjectActivity(ctx, projectId, 6);
+  const activeTimers = await listProjectTimers(actor, projectId);
+  const recentActivity = await fetchProjectActivity(actor, facts, 6);
 
   ok(res, {
     tasksByStatus,
