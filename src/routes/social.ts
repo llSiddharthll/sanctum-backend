@@ -9,7 +9,6 @@ import { and, asc, desc, eq, ne } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   clients,
-  contentPosts,
   postPublications,
   socialAccounts,
   socialConnectSessions,
@@ -17,10 +16,6 @@ import {
 import { ok, param, toIso } from '../lib/http.js';
 import { badRequest, invalidState, notFound } from '../lib/errors.js';
 import { newId } from '../lib/ids.js';
-import { requireAuth } from '../middleware/auth.js';
-import { requireModuleRW } from '../middleware/permissions.js';
-import { getAuth, requireClientAccess } from '../middleware/tenant.js';
-import type { AuthContext } from '../types/index.js';
 import { audit } from '../services/audit.js';
 import { sealToString, unsealString } from '../services/vault.js';
 import {
@@ -31,17 +26,42 @@ import {
   pageProfile,
 } from '../services/meta.js';
 import {
+  isPendingPayload,
   metaRedirectUri,
   signOAuthState,
   type ConnectSessionPayload,
 } from '../services/social-oauth.js';
 import { publishPost, socialPublishEnabled } from '../services/social-publish.js';
+import { authenticate, getStaffActor, requires } from '../authz/http.js';
+import { authorize, type ObjectFacts } from '../authz/engine.js';
+import type { StaffActor } from '../authz/actor.js';
+import { clientFacts } from '../authz/policies/clients.js';
+import {
+  canPublish,
+  postApprovalIsValid,
+  socialAccountFacts,
+  viewOpt,
+} from '../authz/policies/posts.js';
+import { authorizePost } from './posts.js';
 
+/**
+ * Authorizes itself (the clients router no longer gates nested paths):
+ * view = social_accounts.view; connect / disconnect / auto-publish =
+ * social_accounts.manage; "publish now" = posts.publish on the post.
+ */
 export const socialRouter = Router({ mergeParams: true });
-socialRouter.use(requireAuth);
-// Social accounts belong to a client, so they ride the Clients module gate:
-// GET = view; connect / disconnect / publish = manage.
-socialRouter.use(requireModuleRW('clients'));
+socialRouter.use(authenticate);
+
+/** URL client in scope for `permission` (404 when the client isn't visible). */
+async function authorizeSocialClient(
+  actor: StaffActor,
+  clientId: string,
+  permission: string,
+): Promise<ObjectFacts> {
+  const facts = await clientFacts(actor, clientId);
+  authorize(actor, permission, facts, viewOpt(permission, 'social_accounts.view'));
+  return facts!;
+}
 
 type Account = typeof socialAccounts.$inferSelect;
 
@@ -92,36 +112,17 @@ async function listAccounts(agencyId: string, clientId: string): Promise<Account
     .orderBy(asc(socialAccounts.platform), asc(socialAccounts.createdAt));
 }
 
-async function getAccount(ctx: AuthContext, clientId: string, accountId: string): Promise<Account> {
-  const [row] = await db
-    .select()
-    .from(socialAccounts)
-    .where(
-      and(
-        eq(socialAccounts.id, accountId),
-        eq(socialAccounts.agencyId, ctx.agencyId),
-        eq(socialAccounts.clientId, clientId),
-      ),
-    )
-    .limit(1);
-  if (!row || row.status === 'revoked') throw notFound('Social account not found.');
-  return row;
-}
-
-async function getPost(ctx: AuthContext, clientId: string, postId: string) {
-  const [post] = await db
-    .select()
-    .from(contentPosts)
-    .where(
-      and(
-        eq(contentPosts.id, postId),
-        eq(contentPosts.agencyId, ctx.agencyId),
-        eq(contentPosts.clientId, clientId),
-      ),
-    )
-    .limit(1);
-  if (!post) throw notFound('Post not found.');
-  return post;
+/** Social account bound to the URL client + agency, authorized for `permission`. */
+async function getAccount(
+  actor: StaffActor,
+  clientId: string,
+  accountId: string,
+  permission: string,
+): Promise<Account> {
+  const loaded = await socialAccountFacts(actor, clientId, accountId);
+  if (!loaded) throw notFound('Social account not found.');
+  authorize(actor, permission, loaded.facts, viewOpt(permission, 'social_accounts.view'));
+  return loaded.row;
 }
 
 async function listPublications(agencyId: string, postId: string) {
@@ -144,10 +145,10 @@ function safeObj(json: string | null): Record<string, string> {
 }
 
 // ---- GET / — connected accounts + whether Meta is configured ----
-socialRouter.get('/', async (req, res) => {
-  const ctx = getAuth(req);
+socialRouter.get('/', requires('social_accounts.view'), async (req, res) => {
+  const ctx = getStaffActor(req);
   const clientId = param(req, 'clientId');
-  await requireClientAccess(ctx, clientId);
+  await authorizeSocialClient(ctx, clientId, 'social_accounts.view');
   const rows = await listAccounts(ctx.agencyId, clientId);
   ok(res, {
     configured: metaConfigured(),
@@ -157,10 +158,10 @@ socialRouter.get('/', async (req, res) => {
 });
 
 // ---- POST /meta/connect — start Facebook Login ----
-socialRouter.post('/meta/connect', async (req, res) => {
-  const ctx = getAuth(req);
+socialRouter.post('/meta/connect', requires('social_accounts.manage'), async (req, res) => {
+  const ctx = getStaffActor(req);
   const clientId = param(req, 'clientId');
-  await requireClientAccess(ctx, clientId);
+  await authorizeSocialClient(ctx, clientId, 'social_accounts.manage');
   if (!metaConfigured()) {
     throw badRequest(
       'Meta is not configured on the server yet — set META_APP_ID and META_APP_SECRET.',
@@ -170,7 +171,8 @@ socialRouter.post('/meta/connect', async (req, res) => {
   ok(res, { authorizeUrl: authorizeUrl(state, metaRedirectUri(req)) });
 });
 
-async function loadSession(ctx: AuthContext, clientId: string, sessionId: string) {
+/** A completed connect session of THIS user for THIS client (never another user's). */
+async function loadSession(ctx: StaffActor, clientId: string, sessionId: string) {
   const [row] = await db
     .select()
     .from(socialConnectSessions)
@@ -179,20 +181,26 @@ async function loadSession(ctx: AuthContext, clientId: string, sessionId: string
         eq(socialConnectSessions.id, sessionId),
         eq(socialConnectSessions.agencyId, ctx.agencyId),
         eq(socialConnectSessions.clientId, clientId),
+        eq(socialConnectSessions.userId, ctx.userId),
       ),
     )
     .limit(1);
   if (!row || row.expiresAt.getTime() < Date.now()) {
     throw notFound('This Meta connection expired — click Connect again.');
   }
-  return { row, payload: JSON.parse(unsealString(row.payloadEnc)) as ConnectSessionPayload };
+  const payload = JSON.parse(unsealString(row.payloadEnc)) as unknown;
+  // A reserved login that never completed is not a selectable session.
+  if (isPendingPayload(payload)) {
+    throw notFound('This Meta connection expired — click Connect again.');
+  }
+  return { row, payload: payload as ConnectSessionPayload };
 }
 
 // ---- GET /meta/sessions/:sessionId — Pages offered by the login (no tokens) ----
-socialRouter.get('/meta/sessions/:sessionId', async (req, res) => {
-  const ctx = getAuth(req);
+socialRouter.get('/meta/sessions/:sessionId', requires('social_accounts.manage'), async (req, res) => {
+  const ctx = getStaffActor(req);
   const clientId = param(req, 'clientId');
-  await requireClientAccess(ctx, clientId);
+  await authorizeSocialClient(ctx, clientId, 'social_accounts.manage');
   const { payload } = await loadSession(ctx, clientId, param(req, 'sessionId'));
   const connected = new Set((await listAccounts(ctx.agencyId, clientId)).map((a) => a.externalId));
   ok(res, {
@@ -209,7 +217,7 @@ socialRouter.get('/meta/sessions/:sessionId', async (req, res) => {
 });
 
 async function upsertAccount(
-  ctx: AuthContext,
+  ctx: StaffActor,
   clientId: string,
   v: {
     platform: 'instagram' | 'facebook';
@@ -266,10 +274,16 @@ async function upsertAccount(
 const selectSchema = z.object({ pageIds: z.array(z.string().min(1)).min(1).max(20) });
 
 // ---- POST /meta/sessions/:sessionId/select — link the chosen Page(s) ----
-socialRouter.post('/meta/sessions/:sessionId/select', async (req, res) => {
-  const ctx = getAuth(req);
+socialRouter.post('/meta/sessions/:sessionId/select', requires('social_accounts.manage'), async (req, res) => {
+  const ctx = getStaffActor(req);
   const clientId = param(req, 'clientId');
-  const client = await requireClientAccess(ctx, clientId);
+  await authorizeSocialClient(ctx, clientId, 'social_accounts.manage');
+  const [client] = await db
+    .select({ handlesJson: clients.handlesJson })
+    .from(clients)
+    .where(and(eq(clients.id, clientId), eq(clients.agencyId, ctx.agencyId)))
+    .limit(1);
+  if (!client) throw notFound('Client not found.');
   const body = selectSchema.parse(req.body);
   const { row, payload } = await loadSession(ctx, clientId, param(req, 'sessionId'));
 
@@ -317,7 +331,7 @@ socialRouter.post('/meta/sessions/:sessionId/select', async (req, res) => {
   await db.delete(socialConnectSessions).where(eq(socialConnectSessions.id, row.id));
   await audit({
     agencyId: ctx.agencyId,
-    actorType: ctx.role,
+    actorType: ctx.type,
     actorId: ctx.userId,
     action: 'social.connect',
     entityType: 'client',
@@ -331,11 +345,10 @@ socialRouter.post('/meta/sessions/:sessionId/select', async (req, res) => {
 // ---- PATCH /:accountId — toggle auto-publish ----
 const patchSchema = z.object({ autoPublish: z.boolean() });
 
-socialRouter.patch('/:accountId', async (req, res) => {
-  const ctx = getAuth(req);
+socialRouter.patch('/:accountId', requires('social_accounts.manage'), async (req, res) => {
+  const ctx = getStaffActor(req);
   const clientId = param(req, 'clientId');
-  await requireClientAccess(ctx, clientId);
-  const acct = await getAccount(ctx, clientId, param(req, 'accountId'));
+  const acct = await getAccount(ctx, clientId, param(req, 'accountId'), 'social_accounts.manage');
   const body = patchSchema.parse(req.body);
   await db
     .update(socialAccounts)
@@ -343,7 +356,7 @@ socialRouter.patch('/:accountId', async (req, res) => {
     .where(eq(socialAccounts.id, acct.id));
   await audit({
     agencyId: ctx.agencyId,
-    actorType: ctx.role,
+    actorType: ctx.type,
     actorId: ctx.userId,
     action: 'social.update',
     entityType: 'social_account',
@@ -351,15 +364,16 @@ socialRouter.patch('/:accountId', async (req, res) => {
     metadata: { autoPublish: body.autoPublish },
     ip: req.ip,
   });
-  ok(res, serializeAccount(await getAccount(ctx, clientId, acct.id)));
+  ok(res, serializeAccount(await getAccount(ctx, clientId, acct.id, 'social_accounts.view')));
 });
 
 // ---- POST /:accountId/refresh — re-read handle / avatar / followers ----
-socialRouter.post('/:accountId/refresh', async (req, res) => {
-  const ctx = getAuth(req);
+// Re-reads what Meta already exposes for the account (a sync, not a change of
+// access) -> social_accounts.view.
+socialRouter.post('/:accountId/refresh', requires('social_accounts.view'), async (req, res) => {
+  const ctx = getStaffActor(req);
   const clientId = param(req, 'clientId');
-  await requireClientAccess(ctx, clientId);
-  const acct = await getAccount(ctx, clientId, param(req, 'accountId'));
+  const acct = await getAccount(ctx, clientId, param(req, 'accountId'), 'social_accounts.view');
   try {
     const token = unsealString(acct.accessTokenEnc);
     if (acct.platform === 'instagram') {
@@ -400,22 +414,21 @@ socialRouter.post('/:accountId/refresh', async (req, res) => {
       .set({ status: 'expired', lastError: e.message.slice(0, 500), updatedAt: new Date() })
       .where(eq(socialAccounts.id, acct.id));
   }
-  ok(res, serializeAccount(await getAccount(ctx, clientId, acct.id)));
+  ok(res, serializeAccount(await getAccount(ctx, clientId, acct.id, 'social_accounts.view')));
 });
 
 // ---- DELETE /:accountId — disconnect (token wiped; publish history kept) ----
-socialRouter.delete('/:accountId', async (req, res) => {
-  const ctx = getAuth(req);
+socialRouter.delete('/:accountId', requires('social_accounts.manage'), async (req, res) => {
+  const ctx = getStaffActor(req);
   const clientId = param(req, 'clientId');
-  await requireClientAccess(ctx, clientId);
-  const acct = await getAccount(ctx, clientId, param(req, 'accountId'));
+  const acct = await getAccount(ctx, clientId, param(req, 'accountId'), 'social_accounts.manage');
   await db
     .update(socialAccounts)
     .set({ status: 'revoked', accessTokenEnc: '', autoPublish: false, updatedAt: new Date() })
     .where(eq(socialAccounts.id, acct.id));
   await audit({
     agencyId: ctx.agencyId,
-    actorType: ctx.role,
+    actorType: ctx.type,
     actorId: ctx.userId,
     action: 'social.disconnect',
     entityType: 'social_account',
@@ -426,23 +439,27 @@ socialRouter.delete('/:accountId', async (req, res) => {
 });
 
 // ---- GET /posts/:postId/publications — where a post went live (or failed) ----
-socialRouter.get('/posts/:postId/publications', async (req, res) => {
-  const ctx = getAuth(req);
+socialRouter.get('/posts/:postId/publications', requires('posts.view'), async (req, res) => {
+  const ctx = getStaffActor(req);
   const clientId = param(req, 'clientId');
-  await requireClientAccess(ctx, clientId);
-  const post = await getPost(ctx, clientId, param(req, 'postId'));
+  const { row: post } = await authorizePost(ctx, clientId, param(req, 'postId'), 'posts.view');
   ok(res, await listPublications(ctx.agencyId, post.id));
 });
 
 // ---- POST /posts/:postId/publish — "Publish now" ----
-socialRouter.post('/posts/:postId/publish', async (req, res) => {
-  const ctx = getAuth(req);
+// "Publish now" = posts.publish on the post. Only approved/scheduled posts whose
+// client approval is still valid (a `posted` post may be retried for accounts
+// that failed; publishing is idempotent per account).
+socialRouter.post('/posts/:postId/publish', requires('posts.publish'), async (req, res) => {
+  const ctx = getStaffActor(req);
   const clientId = param(req, 'clientId');
-  await requireClientAccess(ctx, clientId);
-  const post = await getPost(ctx, clientId, param(req, 'postId'));
+  const { row: post } = await authorizePost(ctx, clientId, param(req, 'postId'), 'posts.publish');
   if (!metaConfigured()) throw badRequest('Meta is not configured on the server yet.');
-  if (!['approved', 'scheduled', 'posted'].includes(post.status)) {
+  if (!(canPublish(post.status) || post.status === 'posted')) {
     throw invalidState('Only approved or scheduled posts can be published.');
+  }
+  if (!(await postApprovalIsValid(ctx.agencyId, post))) {
+    throw invalidState('This post needs client approval before it can be published.');
   }
   const results = await publishPost(ctx.agencyId, post.id, { manual: true, maxWaitMs: 60_000 });
   if (!results.length) {
@@ -450,7 +467,7 @@ socialRouter.post('/posts/:postId/publish', async (req, res) => {
   }
   await audit({
     agencyId: ctx.agencyId,
-    actorType: ctx.role,
+    actorType: ctx.type,
     actorId: ctx.userId,
     action: 'social.publish',
     entityType: 'post',

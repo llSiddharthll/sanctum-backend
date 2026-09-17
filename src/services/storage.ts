@@ -108,15 +108,37 @@ export async function signDocumentUpload(input: DocSignInput) {
 }
 
 /**
+ * True when a storage key belongs to `agencyId`: content-post media live under
+ * `agency/<agencyId>/…` (signMediaUpload / cloudinary.signUpload) and Documents
+ * uploads under `sanctum/<agencyId>/…`. Path traversal is never allowed.
+ */
+export function isAgencyStorageKey(agencyId: string, key: string | null | undefined): boolean {
+  if (!agencyId || !key) return false;
+  const k = key.replace(/^\/+/, '');
+  if (k.includes('..') || k.includes('\0')) return false;
+  return k.startsWith(`agency/${agencyId}/`) || k.startsWith(`sanctum/${agencyId}/`);
+}
+
+/**
  * Delete a stored asset. Routes by the asset's URL so a mixed store (old
  * Cloudinary + new R2) cleans up correctly regardless of the current driver.
  * `publicId` is the Cloudinary public_id or the R2 object key.
+ *
+ * With `agencyId`, keys outside that agency's storage prefix are REFUSED (never
+ * deleted) — a poisoned/foreign key can't destroy another tenant's object.
+ * TODO(authz): make `agencyId` required once every caller passes it
+ * (routes/documents.ts).
  */
 export async function deleteAsset(opts: {
   publicId: string;
   secureUrl?: string | null;
   resourceType?: 'image' | 'video' | 'raw';
+  agencyId?: string;
 }): Promise<void> {
+  if (opts.agencyId !== undefined && !isAgencyStorageKey(opts.agencyId, opts.publicId)) {
+    console.warn(`[storage] refused to delete a key outside agency ${opts.agencyId}`);
+    return;
+  }
   const url = opts.secureUrl ?? '';
   if (url.includes('cloudinary.com')) {
     await cloudinary.destroyAsset(opts.publicId, opts.resourceType ?? 'image');

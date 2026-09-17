@@ -19,10 +19,14 @@ import {
 } from '../services/meta.js';
 import {
   apiOrigin,
+  consumeOAuthState,
   metaRedirectUri,
   verifyOAuthState,
   type ConnectSessionPayload,
 } from '../services/social-oauth.js';
+import { actorFromLegacyUser } from '../authz/http.js';
+import { check } from '../authz/engine.js';
+import { clientFacts } from '../authz/policies/clients.js';
 
 export const oauthRouter = Router();
 // Meta posts the platform callbacks form-encoded.
@@ -34,14 +38,38 @@ function backToApp(clientId: string, params: Record<string, string>): string {
   return `${getFrontendOrigin()}/clients/${encodeURIComponent(clientId)}?${q}`;
 }
 
+/**
+ * The user who started the login must still be active staff holding
+ * social_accounts.manage on the client (grants may have changed since).
+ */
+async function initiatorMayConnect(agencyId: string, userId: string, clientId: string): Promise<boolean> {
+  try {
+    const { actor } = await actorFromLegacyUser(userId, agencyId);
+    if (actor.type !== 'staff') return false;
+    return check(actor, 'social_accounts.manage', await clientFacts(actor, clientId));
+  } catch {
+    return false;
+  }
+}
+
 // ---- GET /meta/callback — Facebook Login redirect ----
+// Public (no session): authorized by the signed, single-use `state` bound to the
+// initiating user + client (see services/social-oauth.ts).
 oauthRouter.get('/meta/callback', async (req, res) => {
   const state = await verifyOAuthState(String(req.query.state ?? ''));
-  if (!state) {
+  // Consume first: a state works once, whatever the outcome.
+  if (!state || !(await consumeOAuthState(state))) {
     res
       .status(400)
       .type('text/plain')
       .send('This Meta login link is invalid or expired. Close this tab and click Connect again.');
+    return;
+  }
+  if (!(await initiatorMayConnect(state.agencyId, state.userId, state.clientId))) {
+    res
+      .status(403)
+      .type('text/plain')
+      .send("You no longer have permission to connect this client's social accounts.");
     return;
   }
   if (req.query.error || !req.query.code) {

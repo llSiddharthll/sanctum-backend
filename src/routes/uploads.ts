@@ -26,7 +26,11 @@ uploadsRouter.put(
     const key = String(req.query.key ?? '');
     const exp = Number(req.query.exp ?? 0);
     const sig = String(req.query.sig ?? '');
-    if (!verifyUploadToken(key, exp, sig)) {
+    // Public by design: authorised only by the purpose-bound HMAC upload token
+    // (services/local-storage.ts), which binds the tenant-prefixed key + expiry.
+    // Keys are always minted under agency/<id>/ (post media) or sanctum/<id>/
+    // (documents); anything else is refused even with a valid signature.
+    if (!/^(agency|sanctum)\/[A-Za-z0-9_-]+\//.test(key) || !verifyUploadToken(key, exp, sig)) {
       res
         .status(403)
         .json({ error: { code: 'FORBIDDEN', message: 'Invalid or expired upload token.' } });

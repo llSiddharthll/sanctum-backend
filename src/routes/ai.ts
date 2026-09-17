@@ -1,27 +1,40 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, desc, eq } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, or } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   aiGenerations,
   brandStrategy,
+  clients,
   contentPosts,
   plans,
   subscriptions,
 } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
-import { newId } from '../lib/ids.js';
-import { quotaExceeded } from '../lib/errors.js';
-import { requireAuth } from '../middleware/auth.js';
-import { requireModuleRW } from '../middleware/permissions.js';
+import { newId, currentPeriod } from '../lib/ids.js';
+import { notFound, quotaExceeded } from '../lib/errors.js';
 import { aiLimiter } from '../middleware/rate-limit.js';
-import { getAuth, requireClientAccess } from '../middleware/tenant.js';
 import { generateMonth } from '../services/ai.js';
 import { audit } from '../services/audit.js';
+import { authenticate, getStaffActor, requires, requiresAny } from '../authz/http.js';
+import { authorize, check } from '../authz/engine.js';
+import { clientFacts } from '../authz/policies/clients.js';
 
+/**
+ * Client-scoped AI (content calendar generation), mounted at
+ * /clients/:clientId/ai. Authorizes itself: the URL client must be in the
+ * actor's scope for ai.generate_content (and posts.create, since drafts are
+ * written into the calendar).
+ */
 export const aiRouter = Router({ mergeParams: true });
-aiRouter.use(requireAuth);
-aiRouter.use(requireModuleRW('ai'));
+aiRouter.use(authenticate);
+
+/** Start of the current (UTC) calendar month — the quota period. */
+function periodStart(d = new Date()): Date {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1));
+}
+/** A pending run older than this is treated as crashed and stops counting. */
+const PENDING_COUNTS_MS = 15 * 60_000;
 
 const POST_TYPES = ['reel', 'story', 'carousel', 'post'] as const;
 
@@ -40,16 +53,28 @@ const generateSchema = z.object({
 });
 
 // POST /clients/:clientId/ai/generate-month
-aiRouter.post('/generate-month', aiLimiter, async (req, res) => {
-  const ctx = getAuth(req);
+aiRouter.post('/generate-month', requires('ai.generate_content', 'posts.create'), aiLimiter, async (req, res) => {
+  const ctx = getStaffActor(req);
   const clientId = param(req, 'clientId');
-  const client = await requireClientAccess(ctx, clientId);
+  const facts = await clientFacts(ctx, clientId);
+  // Cross-module: generating writes draft posts → both permissions on the client.
+  authorize(ctx, 'ai.generate_content', facts, { view: 'clients.view' });
+  authorize(ctx, 'posts.create', facts, { view: 'clients.view' });
+  const [client] = await db
+    .select({ name: clients.name })
+    .from(clients)
+    .where(and(eq(clients.id, clientId), eq(clients.agencyId, ctx.agencyId)))
+    .limit(1);
+  if (!client) throw notFound('Client not found.');
   const body = generateSchema.parse(req.body);
 
   // Note: AI generation never returns 501. When no Gemini key is configured,
   // services/ai.ts produces deterministic fallback drafts instead.
 
-  // ---- Per-plan monthly quota check (counts succeeded runs this period) ----
+  // ---- Per-plan monthly quota: runs STARTED in the current billing period,
+  // whatever month they generate for (keying on the requested month let callers
+  // reset the limit). In-flight runs count too, so concurrent requests can't
+  // all pass the check. ----
   const [sub] = await db
     .select()
     .from(subscriptions)
@@ -71,8 +96,14 @@ aiRouter.post('/generate-month', aiLimiter, async (req, res) => {
       .where(
         and(
           eq(aiGenerations.agencyId, ctx.agencyId),
-          eq(aiGenerations.period, body.month),
-          eq(aiGenerations.status, 'succeeded'),
+          gte(aiGenerations.createdAt, periodStart()),
+          or(
+            eq(aiGenerations.status, 'succeeded'),
+            and(
+              inArray(aiGenerations.status, ['pending']),
+              gte(aiGenerations.createdAt, new Date(Date.now() - PENDING_COUNTS_MS)),
+            ),
+          ),
         ),
       );
     if (runs.length >= limit) {
@@ -80,7 +111,7 @@ aiRouter.post('/generate-month', aiLimiter, async (req, res) => {
         resource: 'ai_generations',
         limit,
         used: runs.length,
-        period: body.month,
+        period: currentPeriod(),
       });
     }
   }
@@ -185,7 +216,7 @@ aiRouter.post('/generate-month', aiLimiter, async (req, res) => {
 
     await audit({
       agencyId: ctx.agencyId,
-      actorType: ctx.role,
+      actorType: ctx.type,
       actorId: ctx.userId,
       action: 'ai.generate_month',
       entityType: 'ai_generation',
@@ -227,10 +258,13 @@ aiRouter.post('/generate-month', aiLimiter, async (req, res) => {
 });
 
 // GET /clients/:clientId/ai/generations
-aiRouter.get('/generations', async (req, res) => {
-  const ctx = getAuth(req);
+aiRouter.get('/generations', requiresAny('ai.generate_content', 'posts.view'), async (req, res) => {
+  const ctx = getStaffActor(req);
   const clientId = param(req, 'clientId');
-  await requireClientAccess(ctx, clientId);
+  const facts = await clientFacts(ctx, clientId);
+  if (!check(ctx, 'ai.generate_content', facts)) {
+    authorize(ctx, 'posts.view', facts, { view: 'clients.view' });
+  }
 
   const rows = await db
     .select()

@@ -28,7 +28,15 @@ import {
   type PublishInput,
   type Published,
 } from './meta.js';
-import { agencyApprovers, notifyMany } from './notifications.js';
+import { notifyPermissionHolders } from './notifications.js';
+import { isAgencyStorageKey } from './storage.js';
+import { audit } from './audit.js';
+import { actorAuditId, systemActor } from '../authz/actor.js';
+import { can } from '../authz/engine.js';
+import { postApprovalIsValid } from '../authz/policies/posts.js';
+
+/** Explicit, minimal grant of the auto-publish job (design §I.4). */
+export const AUTO_PUBLISH_GRANTS = [{ permission: 'posts.publish', scope: 'organization' as const }];
 
 const VIDEO_EXT = /\.(mp4|m4v|mov|webm|mkv|3gp|avi)(?:[?#]|$)/i;
 /** Automatic retries per (post, account); "Publish now" ignores the cap. */
@@ -181,6 +189,15 @@ export async function publishPost(
     .where(and(eq(contentPosts.id, postId), eq(contentPosts.agencyId, agencyId)))
     .limit(1);
   if (!post) return [];
+  // Defence in depth: whoever calls this, only client-approved content goes out.
+  // (A `posted` post may be retried for accounts that failed.)
+  if (
+    !['approved', 'scheduled', 'posted'].includes(post.status) ||
+    post.archivedAt ||
+    !(await postApprovalIsValid(agencyId, post))
+  ) {
+    return [];
+  }
 
   const platforms = platformsOf(post.platformsJson);
   const accounts = await db
@@ -212,7 +229,8 @@ export async function publishPost(
   const input: PublishInput = {
     postType: post.postType,
     caption: post.caption ?? '',
-    media: mediaRows.map((m) => ({
+    // Only assets stored under this agency's prefix are handed to Meta.
+    media: mediaRows.filter((m) => isAgencyStorageKey(agencyId, m.cloudinaryPublicId)).map((m) => ({
       url: m.secureUrl,
       video: m.resourceType === 'video' || VIDEO_EXT.test(m.secureUrl),
     })),
@@ -255,11 +273,10 @@ export async function publishPost(
   }
   if (results.some((r) => r.status === 'published')) broadcastPortalRefresh(post.clientId);
 
-  // Automatic runs have no one watching — tell the owners/admins what failed.
+  // Automatic runs have no one watching — tell the people who can publish.
   if (!opts.manual && freshFailures.length) {
-    const approvers = await agencyApprovers(agencyId);
     const where = freshFailures.map((f) => (f.platform === 'instagram' ? 'Instagram' : 'Facebook'));
-    await notifyMany(approvers, {
+    await notifyPermissionHolders(agencyId, 'posts.publish', {
       agencyId,
       type: 'social.publish_failed',
       title: `Couldn't publish to ${[...new Set(where)].join(' & ')}`,
@@ -277,6 +294,11 @@ let running = false;
 /**
  * Scheduler entry: publish approved/scheduled posts that came due in the last
  * 24h, and finish Instagram videos still processing from a previous run.
+ *
+ * Runs per agency as `systemActor('social-auto-publish', agencyId,
+ * ['posts.publish'])`; a post is only published when its client approval is
+ * still valid (postApprovalIsValid). Each attempt is audited with
+ * actorType 'system'.
  */
 export async function runDuePublishing(
   now = new Date(),
@@ -328,12 +350,26 @@ export async function runDuePublishing(
     for (const p of candidates) {
       if (seen.has(p.id) || !withAccounts.has(p.clientId)) continue;
       seen.add(p.id);
+      const actor = systemActor('social-auto-publish', p.agencyId, AUTO_PUBLISH_GRANTS);
+      if (!can(actor, 'posts.publish')) continue;
       tally.posts++;
       try {
-        for (const r of await publishPost(p.agencyId, p.id, opts)) {
+        const results = await publishPost(actor.agencyId, p.id, opts);
+        for (const r of results) {
           if (r.status === 'published') tally.published++;
           else if (r.status === 'failed') tally.failed++;
           else if (r.status === 'processing') tally.processing++;
+        }
+        if (results.length) {
+          await audit({
+            agencyId: actor.agencyId,
+            actorType: 'system',
+            actorId: actorAuditId(actor),
+            action: 'social.auto_publish',
+            entityType: 'post',
+            entityId: p.id,
+            metadata: { results: results.map((r) => `${r.platform}:${r.status}`) },
+          });
         }
       } catch (e) {
         tally.failed++;

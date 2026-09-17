@@ -3,9 +3,16 @@ import { promisify } from 'node:util';
 import path from 'node:path';
 import { and, eq, gte, lt, ne } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { documents, postMedia, clients, contentPosts } from '../db/schema.js';
+import { agencies, documents, postMedia, clients, contentPosts } from '../db/schema.js';
 import { env } from '../env.js';
 import { deleteObjectLocal } from './local-storage.js';
+import { isAgencyStorageKey } from './storage.js';
+import { audit } from './audit.js';
+import { actorAuditId, systemActor, type SystemActor } from '../authz/actor.js';
+import { can } from '../authz/engine.js';
+
+/** Explicit, minimal grant of the media archive job (design §I.4). */
+export const MEDIA_ARCHIVE_GRANTS = [{ permission: 'storage.archive', scope: 'organization' as const }];
 
 /**
  * Media retention / archival. Self-hosted files older than MEDIA_RETENTION_DAYS
@@ -88,8 +95,21 @@ export interface ArchiveResult {
   dryRun: boolean;
 }
 
+/**
+ * Agencies the job may touch. When PLATFORM_AGENCY_ID is set the job only ever
+ * archives that agency's files (an explicit `agencyId` outside it matches
+ * nothing); when unset, every agency (or just `agencyId`) is processed, each
+ * under its own system actor.
+ */
+async function targetAgencies(agencyId?: string): Promise<string[]> {
+  const platform = env.PLATFORM_AGENCY_ID;
+  if (platform) return !agencyId || agencyId === platform ? [platform] : [];
+  if (agencyId) return [agencyId];
+  return (await db.select({ id: agencies.id }).from(agencies)).map((a) => a.id);
+}
+
 export async function runMediaArchive(
-  opts: { retentionDays?: number; dryRun?: boolean } = {},
+  opts: { retentionDays?: number; dryRun?: boolean; agencyId?: string } = {},
 ): Promise<ArchiveResult> {
   const res: ArchiveResult = {
     scanned: 0,
@@ -106,13 +126,45 @@ export async function runMediaArchive(
   // Don't delete anything unless there's an archive destination to copy to.
   if (!opts.dryRun && !(await backupRemote())) return res;
 
+  for (const agencyId of await targetAgencies(opts.agencyId)) {
+    const actor = systemActor('media-archive', agencyId, MEDIA_ARCHIVE_GRANTS);
+    if (!can(actor, 'storage.archive')) continue;
+    const before = res.archived;
+    await archiveAgency(actor, cutoff, opts, res);
+    if (!opts.dryRun && res.archived > before) {
+      await audit({
+        agencyId,
+        actorType: 'system',
+        actorId: actorAuditId(actor),
+        action: 'storage.media_archive',
+        metadata: { archived: res.archived - before, retentionDays },
+      });
+    }
+  }
+  return res;
+}
+
+async function archiveAgency(
+  actor: SystemActor,
+  cutoff: Date,
+  opts: { dryRun?: boolean },
+  res: ArchiveResult,
+): Promise<void> {
+  const agencyId = actor.agencyId;
   // --- Documents ---
   const docs = await db
     .select()
     .from(documents)
-    .where(and(eq(documents.archived, false), lt(documents.createdAt, cutoff)));
+    .where(
+      and(
+        eq(documents.agencyId, agencyId),
+        eq(documents.archived, false),
+        lt(documents.createdAt, cutoff),
+      ),
+    );
   for (const d of docs) {
-    if (!isSelfHosted(d.fileUrl) || !d.publicId) {
+    // Never copy/delete a key outside this agency's storage prefix.
+    if (!isSelfHosted(d.fileUrl) || !d.publicId || !isAgencyStorageKey(agencyId, d.publicId)) {
       res.skipped++;
       continue;
     }
@@ -128,7 +180,7 @@ export async function runMediaArchive(
       await db
         .update(documents)
         .set({ archived: true, archivedAt: new Date() })
-        .where(eq(documents.id, d.id));
+        .where(and(eq(documents.id, d.id), eq(documents.agencyId, agencyId)));
       res.archived++;
     } else {
       res.errors++;
@@ -139,7 +191,13 @@ export async function runMediaArchive(
   const media = await db
     .select()
     .from(postMedia)
-    .where(and(eq(postMedia.archived, false), lt(postMedia.createdAt, cutoff)));
+    .where(
+      and(
+        eq(postMedia.agencyId, agencyId),
+        eq(postMedia.archived, false),
+        lt(postMedia.createdAt, cutoff),
+      ),
+    );
   // Never archive media a post still needs: auto-publish hands these URLs to
   // Instagram / Facebook, so anything on a not-yet-posted post that is
   // upcoming (or came due within the last day) stays on disk.
@@ -150,6 +208,7 @@ export async function runMediaArchive(
         .from(contentPosts)
         .where(
           and(
+            eq(contentPosts.agencyId, agencyId),
             ne(contentPosts.status, 'posted'),
             gte(contentPosts.scheduledAt, new Date(Date.now() - 86_400_000)),
           ),
@@ -157,7 +216,11 @@ export async function runMediaArchive(
     ).map((r) => r.id),
   );
   for (const m of media) {
-    if (!isSelfHosted(m.secureUrl) || pendingPosts.has(m.postId)) {
+    if (
+      !isSelfHosted(m.secureUrl) ||
+      pendingPosts.has(m.postId) ||
+      !isAgencyStorageKey(agencyId, m.cloudinaryPublicId)
+    ) {
       res.skipped++;
       continue;
     }
@@ -173,12 +236,10 @@ export async function runMediaArchive(
       await db
         .update(postMedia)
         .set({ archived: true, archivedAt: new Date() })
-        .where(eq(postMedia.id, m.id));
+        .where(and(eq(postMedia.id, m.id), eq(postMedia.agencyId, agencyId)));
       res.archived++;
     } else {
       res.errors++;
     }
   }
-
-  return res;
 }

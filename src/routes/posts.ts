@@ -6,42 +6,39 @@ import { contentPosts, postMedia } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { invalidState, notFound } from '../lib/errors.js';
-import { requireAuth } from '../middleware/auth.js';
-import { requireModuleRW } from '../middleware/permissions.js';
-import { getAuth, requireClientAccess } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
 import { unarchivePost } from '../services/archive.js';
 import { notifyClientReviewReady } from '../services/client-notify.js';
 import { broadcastPortalRefresh } from '../realtime/io.js';
+import { authenticate, getStaffActor, requires } from '../authz/http.js';
+import { authorize, type ObjectFacts } from '../authz/engine.js';
+import { actorAuditId, type Actor } from '../authz/actor.js';
+import { clientFacts } from '../authz/policies/clients.js';
+import {
+  APPROVAL_RESET_ACTION,
+  APPROVED_STATES,
+  STAFF_TRANSITIONS,
+  TRANSITION_PERMISSION,
+  postCapabilities,
+  viewOpt,
+  postFacts,
+  postRowFacts,
+  type PostRow,
+  type PostStatus,
+} from '../authz/policies/posts.js';
 
 // mergeParams so :clientId from the parent mount is available here.
+// Mounted at /clients/:clientId/posts; the clients router no longer gates
+// nested paths, so this router authenticates and authorizes itself.
 export const postsRouter = Router({ mergeParams: true });
-postsRouter.use(requireAuth);
-// Content posts are part of the Clients module (mounted outside clientsRouter,
-// so the module gate must be re-applied here): GET=view, writes=manage.
-postsRouter.use(requireModuleRW('clients'));
-
-type PostStatus =
-  | 'draft'
-  | 'pending_approval'
-  | 'approved'
-  | 'changes_requested'
-  | 'scheduled'
-  | 'posted';
-
-// Legal staff-initiated status transitions (client-only statuses excluded here).
-const TRANSITIONS: Record<PostStatus, PostStatus[]> = {
-  draft: ['pending_approval', 'scheduled'],
-  pending_approval: ['draft', 'scheduled'],
-  approved: ['scheduled', 'pending_approval'],
-  changes_requested: ['draft', 'pending_approval'],
-  scheduled: ['posted', 'draft'],
-  posted: [],
-};
+postsRouter.use(authenticate);
 
 const POST_TYPES = ['reel', 'story', 'carousel', 'post'] as const;
 
-function serializePost(p: typeof contentPosts.$inferSelect) {
+function serializePost(
+  p: PostRow,
+  caps?: Record<string, boolean>,
+) {
   return {
     id: p.id,
     clientId: p.clientId,
@@ -56,6 +53,7 @@ function serializePost(p: typeof contentPosts.$inferSelect) {
     archivedMonth: p.archivedMonth,
     createdAt: toIso(p.createdAt),
     updatedAt: toIso(p.updatedAt),
+    ...(caps ? { capabilities: caps } : {}),
   };
 }
 
@@ -79,6 +77,60 @@ function monthRange(month: string): { from: Date; to: Date } | null {
   return { from, to };
 }
 
+/** URL client in the actor's scope for `permission` (404 when not visible). */
+export async function authorizeContentClient(
+  actor: Actor,
+  clientId: string,
+  permission: string,
+): Promise<ObjectFacts> {
+  const facts = await clientFacts(actor, clientId);
+  authorize(actor, permission, facts, viewOpt(permission, 'posts.view'));
+  return facts!;
+}
+
+/** Load a post bound to the URL client and authorize `permission` on it. */
+export async function authorizePost(
+  actor: Actor,
+  clientId: string,
+  postId: string,
+  permission: string,
+): Promise<{ row: PostRow; facts: ObjectFacts; client: ObjectFacts }> {
+  const client = await clientFacts(actor, clientId);
+  const loaded = client ? await postFacts(actor, clientId, postId, client) : null;
+  if (!loaded || !client) throw notFound('Post not found.');
+  authorize(actor, permission, loaded.facts, viewOpt(permission, 'posts.view'));
+  return { ...loaded, client };
+}
+
+/**
+ * A content change on an approved/scheduled/posted post invalidates the client
+ * approval: the post goes back to draft and must be re-approved. Returns true
+ * when the status was reset.
+ */
+export async function resetApprovalIfNeeded(
+  actor: Actor,
+  post: PostRow,
+  reason: string,
+  ip?: string,
+): Promise<boolean> {
+  if (!APPROVED_STATES.has(post.status)) return false;
+  await db
+    .update(contentPosts)
+    .set({ status: 'draft', updatedAt: new Date() })
+    .where(and(eq(contentPosts.id, post.id), eq(contentPosts.agencyId, actor.agencyId)));
+  await audit({
+    agencyId: actor.agencyId,
+    actorType: actor.type,
+    actorId: actorAuditId(actor),
+    action: APPROVAL_RESET_ACTION,
+    entityType: 'post',
+    entityId: post.id,
+    metadata: { from: post.status, reason },
+    ip,
+  });
+  return true;
+}
+
 // GET /clients/:clientId/posts?month=YYYY-MM&status=a,b&type=reel&archived=true
 const listQuery = z.object({
   month: z.string().optional(),
@@ -87,14 +139,15 @@ const listQuery = z.object({
   archived: z.enum(['true', 'false']).optional(),
 });
 
-postsRouter.get('/', async (req, res) => {
-  const ctx = getAuth(req);
+postsRouter.get('/', requires('posts.view'), async (req, res) => {
+  const actor = getStaffActor(req);
   const clientId = param(req, 'clientId');
-  await requireClientAccess(ctx, clientId);
+  // posts.view has no `own` scope: seeing the client's calendar == the client in scope.
+  const client = await authorizeContentClient(actor, clientId, 'posts.view');
   const q = listQuery.parse(req.query);
 
   const filters = [
-    eq(contentPosts.agencyId, ctx.agencyId),
+    eq(contentPosts.agencyId, actor.agencyId),
     eq(contentPosts.clientId, clientId),
   ];
 
@@ -132,8 +185,7 @@ postsRouter.get('/', async (req, res) => {
     .orderBy(asc(contentPosts.scheduledAt));
 
   // Attach a single hero thumbnail (first media by position) per post so the
-  // calendar/list can render previews without a per-post detail fetch. Cheap:
-  // one extra query scoped to just the listed posts.
+  // calendar/list can render previews without a per-post detail fetch.
   const heroByPost = new Map<
     string,
     { secureUrl: string; resourceType: 'image' | 'video'; archived: boolean }
@@ -150,7 +202,8 @@ postsRouter.get('/', async (req, res) => {
       .from(postMedia)
       .where(
         and(
-          eq(postMedia.agencyId, ctx.agencyId),
+          eq(postMedia.agencyId, actor.agencyId),
+          eq(postMedia.clientId, clientId),
           inArray(
             postMedia.postId,
             rows.map((r) => r.id),
@@ -159,7 +212,6 @@ postsRouter.get('/', async (req, res) => {
       )
       .orderBy(asc(postMedia.position));
     for (const m of mediaRows) {
-      // Rows come ordered by position asc, so the first seen per post is the hero.
       if (!heroByPost.has(m.postId)) {
         heroByPost.set(m.postId, {
           secureUrl: m.secureUrl,
@@ -171,10 +223,11 @@ postsRouter.get('/', async (req, res) => {
   }
 
   const serialized = rows.map((p) => {
+    const base = serializePost(p, postCapabilities(actor, postRowFacts(client, p), p.status));
     const hero = heroByPost.get(p.id);
     return hero
       ? {
-          ...serializePost(p),
+          ...base,
           media: [
             {
               secureUrl: hero.secureUrl,
@@ -184,44 +237,51 @@ postsRouter.get('/', async (req, res) => {
             },
           ],
         }
-      : serializePost(p);
+      : base;
   });
 
   ok(res, serialized, 200, { meta: { month: q.month ?? null } });
 });
 
-// POST /clients/:clientId/posts
+// POST /clients/:clientId/posts — always starts as a draft. `status` stays in the
+// schema for compatibility, but only 'draft' is accepted: scheduling requires
+// client approval first (see /transition).
 const createSchema = z.object({
   postType: z.enum(POST_TYPES),
   caption: z.string().max(5000).optional(),
   platforms: z.array(z.string()).default([]),
   scheduledAt: z.string().datetime().optional(),
-  status: z.enum(['draft', 'scheduled']).default('draft'),
+  status: z.enum(['draft', 'scheduled', 'posted']).default('draft'),
 });
 
-postsRouter.post('/', async (req, res) => {
-  const ctx = getAuth(req);
+postsRouter.post('/', requires('posts.create'), async (req, res) => {
+  const actor = getStaffActor(req);
   const clientId = param(req, 'clientId');
-  await requireClientAccess(ctx, clientId);
+  const client = await authorizeContentClient(actor, clientId, 'posts.create');
   const body = createSchema.parse(req.body);
+  if (body.status !== 'draft') {
+    throw invalidState(
+      'New posts start as drafts. Send them for approval, then schedule once the client approves.',
+    );
+  }
 
   const id = newId('post');
   await db.insert(contentPosts).values({
     id,
-    agencyId: ctx.agencyId,
+    agencyId: actor.agencyId,
     clientId,
     postType: body.postType,
     caption: body.caption ?? null,
     platformsJson: JSON.stringify(body.platforms),
     scheduledAt: body.scheduledAt ? new Date(body.scheduledAt) : null,
-    status: body.status,
-    createdBy: ctx.userId,
+    status: 'draft',
+    createdBy: actor.userId,
   });
 
   await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+    agencyId: actor.agencyId,
+    actorType: actor.type,
+    actorId: actor.userId,
     action: 'post.create',
     entityType: 'post',
     entityId: id,
@@ -231,51 +291,31 @@ postsRouter.post('/', async (req, res) => {
   const [row] = await db
     .select()
     .from(contentPosts)
-    .where(eq(contentPosts.id, id));
-  created(res, serializePost(row!));
+    .where(and(eq(contentPosts.id, id), eq(contentPosts.agencyId, actor.agencyId)));
+  broadcastPortalRefresh(clientId);
+  created(res, serializePost(row!, postCapabilities(actor, postRowFacts(client, row!), row!.status)));
 });
 
-/** Fetch a post within the caller's tenant+client or throw 404. */
-async function getScopedPost(
-  ctx: ReturnType<typeof getAuth>,
-  clientId: string,
-  postId: string,
-) {
-  const [row] = await db
-    .select()
-    .from(contentPosts)
-    .where(
-      and(
-        eq(contentPosts.id, postId),
-        eq(contentPosts.agencyId, ctx.agencyId),
-        eq(contentPosts.clientId, clientId),
-      ),
-    )
-    .limit(1);
-  if (!row) throw notFound('Post not found.');
-  return row;
-}
-
 // GET /clients/:clientId/posts/:postId — detail + media.
-postsRouter.get('/:postId', async (req, res) => {
-  const ctx = getAuth(req);
+postsRouter.get('/:postId', requires('posts.view'), async (req, res) => {
+  const actor = getStaffActor(req);
   const clientId = param(req, 'clientId');
-  await requireClientAccess(ctx, clientId);
-  const post = await getScopedPost(ctx, clientId, param(req, 'postId'));
+  const { row: post, facts } = await authorizePost(actor, clientId, param(req, 'postId'), 'posts.view');
 
   const media = await db
     .select()
     .from(postMedia)
     .where(
       and(
-        eq(postMedia.agencyId, ctx.agencyId),
+        eq(postMedia.agencyId, actor.agencyId),
+        eq(postMedia.clientId, clientId),
         eq(postMedia.postId, post.id),
       ),
     )
     .orderBy(asc(postMedia.position));
 
   ok(res, {
-    ...serializePost(post),
+    ...serializePost(post, postCapabilities(actor, facts, post.status)),
     media: media.map((m) => ({
       id: m.id,
       cloudinaryPublicId: m.cloudinaryPublicId,
@@ -299,62 +339,94 @@ const updateSchema = z.object({
   scheduledAt: z.string().datetime().nullable().optional(),
 });
 
-postsRouter.patch('/:postId', async (req, res) => {
-  const ctx = getAuth(req);
+postsRouter.patch('/:postId', requires('posts.update'), async (req, res) => {
+  const actor = getStaffActor(req);
   const clientId = param(req, 'clientId');
-  await requireClientAccess(ctx, clientId);
-  const post = await getScopedPost(ctx, clientId, param(req, 'postId'));
+  const { row: post, facts } = await authorizePost(actor, clientId, param(req, 'postId'), 'posts.update');
   const body = updateSchema.parse(req.body);
 
-  const patch: Partial<typeof contentPosts.$inferInsert> = {
-    updatedAt: new Date(),
-  };
-  if (body.postType !== undefined) patch.postType = body.postType;
-  if (body.caption !== undefined) patch.caption = body.caption;
-  if (body.platforms !== undefined)
-    patch.platformsJson = JSON.stringify(body.platforms);
-  if (body.scheduledAt !== undefined)
-    patch.scheduledAt = body.scheduledAt ? new Date(body.scheduledAt) : null;
+  const patch: Partial<typeof contentPosts.$inferInsert> = {};
+  // Only fields that actually change count (clients often send the whole post).
+  let contentChanged = false;
+  if (body.postType !== undefined && body.postType !== post.postType) {
+    patch.postType = body.postType;
+    contentChanged = true;
+  }
+  if (body.caption !== undefined && body.caption !== post.caption) {
+    patch.caption = body.caption;
+    contentChanged = true;
+  }
+  if (body.platforms !== undefined) {
+    const next = JSON.stringify(body.platforms);
+    if (next !== JSON.stringify(safeArr(post.platformsJson))) {
+      patch.platformsJson = next;
+      contentChanged = true;
+    }
+  }
+  if (body.scheduledAt !== undefined) {
+    const next = body.scheduledAt ? new Date(body.scheduledAt) : null;
+    if ((next?.getTime() ?? null) !== (post.scheduledAt?.getTime() ?? null)) {
+      patch.scheduledAt = next;
+      // Moving the date of an approved/scheduled post is a scheduling decision.
+      if (APPROVED_STATES.has(post.status) && post.status !== 'posted') {
+        authorize(actor, 'posts.schedule', facts, { view: 'posts.view' });
+      }
+    }
+  }
 
-  await db
-    .update(contentPosts)
-    .set(patch)
-    .where(
-      and(
-        eq(contentPosts.id, post.id),
-        eq(contentPosts.agencyId, ctx.agencyId),
-      ),
-    );
+  let approvalReset = false;
+  if (Object.keys(patch).length) {
+    await db
+      .update(contentPosts)
+      .set({ ...patch, updatedAt: new Date() })
+      .where(and(eq(contentPosts.id, post.id), eq(contentPosts.agencyId, actor.agencyId)));
+    await audit({
+      agencyId: actor.agencyId,
+      actorType: actor.type,
+      actorId: actor.userId,
+      action: 'post.update',
+      entityType: 'post',
+      entityId: post.id,
+      metadata: { fields: Object.keys(patch) },
+      ip: req.ip,
+    });
+    // Edited content needs re-approval (the client approved the old version).
+    if (contentChanged) {
+      approvalReset = await resetApprovalIfNeeded(actor, post, 'content_edit', req.ip);
+    }
+  }
 
   const [row] = await db
     .select()
     .from(contentPosts)
-    .where(eq(contentPosts.id, post.id));
-  // Live-update the client portal (caption/schedule/platforms/type changed).
+    .where(and(eq(contentPosts.id, post.id), eq(contentPosts.agencyId, actor.agencyId)));
   broadcastPortalRefresh(clientId);
-  ok(res, serializePost(row!));
+  ok(res, {
+    ...serializePost(row!, postCapabilities(actor, facts, row!.status)),
+    approvalReset,
+  });
 });
 
 // DELETE /clients/:clientId/posts/:postId
-postsRouter.delete('/:postId', async (req, res) => {
-  const ctx = getAuth(req);
+postsRouter.delete('/:postId', requires('posts.delete'), async (req, res) => {
+  const actor = getStaffActor(req);
   const clientId = param(req, 'clientId');
-  await requireClientAccess(ctx, clientId);
-  const post = await getScopedPost(ctx, clientId, param(req, 'postId'));
+  const { row: post } = await authorizePost(actor, clientId, param(req, 'postId'), 'posts.delete');
 
   await db
     .delete(contentPosts)
     .where(
       and(
         eq(contentPosts.id, post.id),
-        eq(contentPosts.agencyId, ctx.agencyId),
+        eq(contentPosts.agencyId, actor.agencyId),
+        eq(contentPosts.clientId, clientId),
       ),
     );
 
   await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+    agencyId: actor.agencyId,
+    actorType: actor.type,
+    actorId: actor.userId,
     action: 'post.delete',
     entityType: 'post',
     entityId: post.id,
@@ -377,17 +449,22 @@ const transitionSchema = z.object({
 });
 
 postsRouter.post('/:postId/transition', async (req, res) => {
-  const ctx = getAuth(req);
+  const actor = getStaffActor(req);
   const clientId = param(req, 'clientId');
-  await requireClientAccess(ctx, clientId);
-  const post = await getScopedPost(ctx, clientId, param(req, 'postId'));
   const body = transitionSchema.parse(req.body);
+  // approved / changes_requested are client decisions → no staff permission.
+  const permission = TRANSITION_PERMISSION[body.to] ?? 'posts.approve';
+  const { row: post, facts } = await authorizePost(actor, clientId, param(req, 'postId'), permission);
 
-  const allowed = TRANSITIONS[post.status as PostStatus] ?? [];
+  const allowed = STAFF_TRANSITIONS[post.status] ?? [];
   if (!allowed.includes(body.to)) {
-    throw invalidState(
-      `Cannot transition from '${post.status}' to '${body.to}'.`,
-    );
+    const hint =
+      body.to === 'scheduled'
+        ? ' Only client-approved posts can be scheduled.'
+        : body.to === 'posted'
+          ? ' Only approved or scheduled posts can be marked as posted.'
+          : '';
+    throw invalidState(`Cannot transition from '${post.status}' to '${body.to}'.${hint}`);
   }
 
   await db
@@ -396,19 +473,34 @@ postsRouter.post('/:postId/transition', async (req, res) => {
     .where(
       and(
         eq(contentPosts.id, post.id),
-        eq(contentPosts.agencyId, ctx.agencyId),
+        eq(contentPosts.agencyId, actor.agencyId),
+        eq(contentPosts.status, post.status),
       ),
     );
 
   await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+    agencyId: actor.agencyId,
+    actorType: actor.type,
+    actorId: actor.userId,
     action: `post.transition.${body.to}`,
     entityType: 'post',
     entityId: post.id,
+    metadata: { from: post.status },
     ip: req.ip,
   });
+  // Leaving an approved state (e.g. re-submitting or reverting) voids the approval.
+  if (APPROVED_STATES.has(post.status) && (body.to === 'draft' || body.to === 'pending_approval')) {
+    await audit({
+      agencyId: actor.agencyId,
+      actorType: actor.type,
+      actorId: actor.userId,
+      action: APPROVAL_RESET_ACTION,
+      entityType: 'post',
+      entityId: post.id,
+      metadata: { from: post.status, reason: `transition_${body.to}` },
+      ip: req.ip,
+    });
+  }
 
   // Email the client when content becomes reviewable. Revisions of a post they
   // sent back ("changes addressed") always notify; a fresh send only notifies
@@ -422,7 +514,7 @@ postsRouter.post('/:postId/transition', async (req, res) => {
         .from(contentPosts)
         .where(
           and(
-            eq(contentPosts.agencyId, ctx.agencyId),
+            eq(contentPosts.agencyId, actor.agencyId),
             eq(contentPosts.clientId, clientId),
             eq(contentPosts.status, 'pending_approval'),
             ne(contentPosts.id, post.id),
@@ -432,37 +524,45 @@ postsRouter.post('/:postId/transition', async (req, res) => {
     }
     if (shouldEmail) {
       void notifyClientReviewReady({
-        agencyId: ctx.agencyId,
+        agencyId: actor.agencyId,
         clientId,
-        createdBy: ctx.userId,
+        createdBy: actor.userId,
         kind: wasChanges ? 'changes' : 'new',
       }).catch(() => {});
     }
   }
 
-  // Live-refresh any open client portal (status change is client-visible).
   broadcastPortalRefresh(clientId);
 
   const [row] = await db
     .select()
     .from(contentPosts)
-    .where(eq(contentPosts.id, post.id));
-  ok(res, serializePost(row!));
+    .where(and(eq(contentPosts.id, post.id), eq(contentPosts.agencyId, actor.agencyId)));
+  ok(res, serializePost(row!, postCapabilities(actor, facts, row!.status)));
 });
 
-// POST /clients/:clientId/posts/:id/unarchive — restore an archived post to the
-// active calendar (clients:manage via the router gate).
-postsRouter.post('/:id/unarchive', async (req, res) => {
-  const ctx = getAuth(req);
+// POST /clients/:clientId/posts/:id/unarchive — restore an archived post of THIS
+// client to the active calendar.
+postsRouter.post('/:id/unarchive', requires('posts.restore'), async (req, res) => {
+  const actor = getStaffActor(req);
   const clientId = param(req, 'clientId');
-  await requireClientAccess(ctx, clientId);
-  const id = param(req, 'id');
-  const restored = await unarchivePost(ctx.agencyId, id);
+  const { row: post, facts } = await authorizePost(actor, clientId, param(req, 'id'), 'posts.restore');
+  if (!post.archivedAt) throw notFound('Archived post not found.');
+  const restored = await unarchivePost(actor.agencyId, post.id);
   if (!restored) throw notFound('Archived post not found.');
+  await audit({
+    agencyId: actor.agencyId,
+    actorType: actor.type,
+    actorId: actor.userId,
+    action: 'post.restore',
+    entityType: 'post',
+    entityId: post.id,
+    ip: req.ip,
+  });
   broadcastPortalRefresh(clientId);
   const [row] = await db
     .select()
     .from(contentPosts)
-    .where(eq(contentPosts.id, id));
-  ok(res, serializePost(row!));
+    .where(and(eq(contentPosts.id, post.id), eq(contentPosts.agencyId, actor.agencyId)));
+  ok(res, serializePost(row!, postCapabilities(actor, facts, row!.status)));
 });

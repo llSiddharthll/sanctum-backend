@@ -1,10 +1,11 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, asc, eq, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   agencies,
   clients,
+  projectMembers,
   projects,
   projectTasks,
   projectMilestones,
@@ -12,10 +13,11 @@ import {
 import { ok, created } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { notFound } from '../lib/errors.js';
-import { requireAuth } from '../middleware/auth.js';
-import { requireModuleRW } from '../middleware/permissions.js';
 import { aiLimiter } from '../middleware/rate-limit.js';
-import { getAuth } from '../middleware/tenant.js';
+import { authenticate, getStaffActor, requires } from '../authz/http.js';
+import { authorize, canOrg, check, type ObjectFacts } from '../authz/engine.js';
+import type { StaffActor } from '../authz/actor.js';
+import { clientFacts, clientScopeFilter } from '../authz/policies/clients.js';
 import {
   DOCUMENT_TYPES,
   REPURPOSE_TARGETS,
@@ -31,15 +33,19 @@ import { audit } from '../services/audit.js';
 
 /**
  * Agency-level AI assistant router. Distinct from the client-scoped
- * '/clients/:clientId/ai' router (content-calendar generation). Everything
- * here is requireAuth + agency-scoped via getAuth(req).agencyId.
+ * '/clients/:clientId/ai' router (content-calendar generation).
+ *
+ * Authorization: chat / document generation = ai.use_assistant, and grounding
+ * context only includes clients/projects the actor can view; captions /
+ * hashtags / ideas / repurpose = ai.generate_content (client grounding only for
+ * clients in scope); task breakdown = ai.task_breakdown + tasks.create +
+ * project_milestones.manage on the target project.
  *
  * All endpoints degrade gracefully without GEMINI_API_KEY (the service layer
  * returns templates / canned replies), so they never 500 on a missing key.
  */
 export const aiAssistantRouter = Router({ mergeParams: true });
-aiAssistantRouter.use(requireAuth);
-aiAssistantRouter.use(requireModuleRW('ai'));
+aiAssistantRouter.use(authenticate);
 
 const TASK_STATUSES = [
   'backlog',
@@ -51,38 +57,72 @@ const TASK_STATUSES = [
 const TASK_STATUS_SET = new Set<string>(TASK_STATUSES);
 
 /**
- * Resolve an optional clientId to its name, scoped to the caller's agency.
- * Returns undefined when no id is given or the client isn't in this agency —
- * the social helpers treat the brand name as optional grounding, so a missing
- * client should never 404; it just drops the grounding.
+ * Resolve an optional clientId to its name when the client is in the actor's
+ * scope for ai.generate_content. Out-of-scope or unknown ids just drop the
+ * grounding (no 404, so the endpoint is not an existence oracle).
  */
 async function resolveClientName(
-  ctx: ReturnType<typeof getAuth>,
+  actor: StaffActor,
   clientId?: string,
 ): Promise<string | undefined> {
   if (!clientId) return undefined;
+  const facts = await clientFacts(actor, clientId);
+  if (!check(actor, 'ai.generate_content', facts)) return undefined;
   const [row] = await db
     .select({ name: clients.name })
     .from(clients)
-    .where(and(eq(clients.id, clientId), eq(clients.agencyId, ctx.agencyId)))
+    .where(and(eq(clients.id, clientId), eq(clients.agencyId, actor.agencyId)))
     .limit(1);
   return row?.name;
 }
 
-/** Fetch a project scoped to the caller's agency, or throw 404. */
-async function getScopedProjectRow(
-  ctx: ReturnType<typeof getAuth>,
+/**
+ * Minimal project facts (tenant + membership via project_members).
+ * TODO(authz): replace with policies/projects.ts projectFacts once it lands.
+ */
+async function projectFactsLite(
+  actor: StaffActor,
   projectId: string,
-) {
+): Promise<{ row: typeof projects.$inferSelect; facts: ObjectFacts } | null> {
   const [row] = await db
     .select()
     .from(projects)
+    .where(and(eq(projects.id, projectId), eq(projects.agencyId, actor.agencyId)))
+    .limit(1);
+  if (!row) return null;
+  const [m] = await db
+    .select({ id: projectMembers.id })
+    .from(projectMembers)
     .where(
-      and(eq(projects.id, projectId), eq(projects.agencyId, ctx.agencyId)),
+      and(
+        eq(projectMembers.agencyId, actor.agencyId),
+        eq(projectMembers.projectId, projectId),
+        eq(projectMembers.userId, actor.userId),
+      ),
     )
     .limit(1);
-  if (!row) throw notFound('Project not found.');
-  return row;
+  const member = !!m;
+  return {
+    row,
+    facts: {
+      agencyId: row.agencyId,
+      assigned: member,
+      projectMember: member,
+      clientId: row.clientId,
+      projectId: row.id,
+    },
+  };
+}
+
+/** SQL filter: projects the actor can view (organization, or member when assigned). */
+async function visibleProjectsFilter(actor: StaffActor): Promise<SQL> {
+  if (canOrg(actor, 'projects.view')) return sql`1`;
+  if (!actor.grants.hasScope('projects.view', 'assigned')) return sql`0`;
+  const rows = await db
+    .select({ id: projectMembers.projectId })
+    .from(projectMembers)
+    .where(and(eq(projectMembers.agencyId, actor.agencyId), eq(projectMembers.userId, actor.userId)));
+  return rows.length ? inArray(projects.id, rows.map((r) => r.id)) : sql`0`;
 }
 
 // ============================================================
@@ -94,8 +134,8 @@ const generateDocumentSchema = z.object({
   context: z.string().min(1).max(10000),
 });
 
-aiAssistantRouter.post('/generate-document', aiLimiter, async (req, res) => {
-  const ctx = getAuth(req);
+aiAssistantRouter.post('/generate-document', requires('ai.use_assistant'), aiLimiter, async (req, res) => {
+  const ctx = getStaffActor(req);
   const body = generateDocumentSchema.parse(req.body);
 
   const result = await generateDocument({
@@ -106,7 +146,7 @@ aiAssistantRouter.post('/generate-document', aiLimiter, async (req, res) => {
 
   await audit({
     agencyId: ctx.agencyId,
-    actorType: ctx.role,
+    actorType: ctx.type,
     actorId: ctx.userId,
     action: 'ai.generate_document',
     entityType: 'ai_document',
@@ -134,9 +174,13 @@ const chatSchema = z.object({
   clientId: z.string().min(1).optional(),
 });
 
-/** Build a short grounding context string for the chat system prompt. */
+/**
+ * Build a short grounding context string for the chat system prompt. Only
+ * clients/projects the actor can view are included (the text goes to an
+ * external LLM and back to the actor).
+ */
 async function buildChatContext(
-  ctx: ReturnType<typeof getAuth>,
+  ctx: StaffActor,
   projectId?: string,
   clientId?: string,
 ): Promise<string> {
@@ -152,7 +196,7 @@ async function buildChatContext(
   const projectRows = await db
     .select({ name: projects.name, status: projects.status })
     .from(projects)
-    .where(eq(projects.agencyId, ctx.agencyId))
+    .where(and(eq(projects.agencyId, ctx.agencyId), await visibleProjectsFilter(ctx)))
     .orderBy(asc(projects.createdAt))
     .limit(10);
   if (projectRows.length) {
@@ -166,7 +210,12 @@ async function buildChatContext(
   const clientRows = await db
     .select({ name: clients.name, status: clients.status })
     .from(clients)
-    .where(eq(clients.agencyId, ctx.agencyId))
+    .where(
+      and(
+        eq(clients.agencyId, ctx.agencyId),
+        await clientScopeFilter(ctx, 'clients.view', clients.id),
+      ),
+    )
     .orderBy(asc(clients.createdAt))
     .limit(10);
   if (clientRows.length) {
@@ -177,7 +226,7 @@ async function buildChatContext(
     );
   }
 
-  if (projectId) {
+  if (projectId && check(ctx, 'projects.view', (await projectFactsLite(ctx, projectId))?.facts)) {
     const [proj] = await db
       .select({
         name: projects.name,
@@ -226,7 +275,7 @@ async function buildChatContext(
     }
   }
 
-  if (clientId) {
+  if (clientId && check(ctx, 'clients.view', await clientFacts(ctx, clientId))) {
     const [client] = await db
       .select({
         name: clients.name,
@@ -257,14 +306,16 @@ async function buildChatContext(
   return lines.join('\n');
 }
 
-aiAssistantRouter.post('/chat', aiLimiter, async (req, res) => {
-  const ctx = getAuth(req);
+aiAssistantRouter.post('/chat', requires('ai.use_assistant'), aiLimiter, async (req, res) => {
+  const ctx = getStaffActor(req);
   const body = chatSchema.parse(req.body);
 
   if (body.projectId) {
-    // Validate scope; throws 404 if the project isn't in this agency.
-    await getScopedProjectRow(ctx, body.projectId);
+    // 404 unless the project is in this agency AND visible to the actor.
+    const p = await projectFactsLite(ctx, body.projectId);
+    if (!p || !check(ctx, 'projects.view', p.facts)) throw notFound('Project not found.');
   }
+  // An out-of-scope clientId is silently dropped from the grounding.
 
   const systemContext = await buildChatContext(
     ctx,
@@ -287,117 +338,129 @@ const taskBreakdownSchema = z.object({
   prompt: z.string().max(5000).optional(),
 });
 
-aiAssistantRouter.post('/task-breakdown', aiLimiter, async (req, res) => {
-  const ctx = getAuth(req);
-  const body = taskBreakdownSchema.parse(req.body);
-  const project = await getScopedProjectRow(ctx, body.projectId);
+aiAssistantRouter.post(
+  '/task-breakdown',
+  requires('ai.task_breakdown', 'tasks.create', 'project_milestones.manage'),
+  aiLimiter,
+  async (req, res) => {
+    const ctx = getStaffActor(req);
+    const body = taskBreakdownSchema.parse(req.body);
+    const loaded = await projectFactsLite(ctx, body.projectId);
+    if (!loaded) throw notFound('Project not found.');
+    // Cross-module: writes milestones + tasks into the project.
+    for (const p of ['ai.task_breakdown', 'tasks.create', 'project_milestones.manage']) {
+      authorize(ctx, p, loaded.facts, { view: 'projects.view' });
+    }
+    const project = loaded.row;
 
-  const result = await generateTaskBreakdown({
-    projectName: project.name,
-    projectDescription: project.description,
-    prompt: body.prompt,
-  });
-
-  // Position new milestones / tasks after any existing ones in the project.
-  const [{ maxMsPos } = { maxMsPos: null }] = await db
-    .select({ maxMsPos: sql<number | null>`max(${projectMilestones.position})` })
-    .from(projectMilestones)
-    .where(
-      and(
-        eq(projectMilestones.agencyId, ctx.agencyId),
-        eq(projectMilestones.projectId, body.projectId),
-      ),
-    );
-  let milestonePosition = (maxMsPos ?? -1) + 1;
-
-  const [{ maxTaskPos } = { maxTaskPos: null }] = await db
-    .select({ maxTaskPos: sql<number | null>`max(${projectTasks.position})` })
-    .from(projectTasks)
-    .where(
-      and(
-        eq(projectTasks.agencyId, ctx.agencyId),
-        eq(projectTasks.projectId, body.projectId),
-      ),
-    );
-  let taskPosition = (maxTaskPos ?? -1) + 1;
-
-  const createdMilestones: Array<{
-    id: string;
-    title: string;
-    position: number;
-    tasks: Array<{
-      id: string;
-      title: string;
-      status: string;
-      position: number;
-    }>;
-  }> = [];
-
-  for (const ms of result.milestones) {
-    const milestoneId = newId('pms');
-    await db.insert(projectMilestones).values({
-      id: milestoneId,
-      agencyId: ctx.agencyId,
-      projectId: body.projectId,
-      title: ms.title,
-      position: milestonePosition++,
+    const result = await generateTaskBreakdown({
+      projectName: project.name,
+      projectDescription: project.description,
+      prompt: body.prompt,
     });
 
-    const tasks: Array<{
+    // Position new milestones / tasks after any existing ones in the project.
+    const [{ maxMsPos } = { maxMsPos: null }] = await db
+      .select({ maxMsPos: sql<number | null>`max(${projectMilestones.position})` })
+      .from(projectMilestones)
+      .where(
+        and(
+          eq(projectMilestones.agencyId, ctx.agencyId),
+          eq(projectMilestones.projectId, body.projectId),
+        ),
+      );
+    let milestonePosition = (maxMsPos ?? -1) + 1;
+
+    const [{ maxTaskPos } = { maxTaskPos: null }] = await db
+      .select({ maxTaskPos: sql<number | null>`max(${projectTasks.position})` })
+      .from(projectTasks)
+      .where(
+        and(
+          eq(projectTasks.agencyId, ctx.agencyId),
+          eq(projectTasks.projectId, body.projectId),
+        ),
+      );
+    let taskPosition = (maxTaskPos ?? -1) + 1;
+
+    const createdMilestones: Array<{
       id: string;
       title: string;
-      status: string;
       position: number;
+      tasks: Array<{
+        id: string;
+        title: string;
+        status: string;
+        position: number;
+      }>;
     }> = [];
-    for (const tk of ms.tasks) {
-      const taskId = newId('ptk');
-      const status =
-        tk.status && TASK_STATUS_SET.has(tk.status) ? tk.status : 'todo';
-      const position = taskPosition++;
-      await db.insert(projectTasks).values({
-        id: taskId,
+
+    for (const ms of result.milestones) {
+      const milestoneId = newId('pms');
+      await db.insert(projectMilestones).values({
+        id: milestoneId,
         agencyId: ctx.agencyId,
         projectId: body.projectId,
-        milestoneId,
-        title: tk.title,
-        status: status as (typeof TASK_STATUSES)[number],
-        position,
+        title: ms.title,
+        position: milestonePosition++,
       });
-      tasks.push({ id: taskId, title: tk.title, status, position });
+
+      const tasks: Array<{
+        id: string;
+        title: string;
+        status: string;
+        position: number;
+      }> = [];
+      for (const tk of ms.tasks) {
+        const taskId = newId('ptk');
+        const status =
+          tk.status && TASK_STATUS_SET.has(tk.status) ? tk.status : 'todo';
+        const position = taskPosition++;
+        await db.insert(projectTasks).values({
+          id: taskId,
+          agencyId: ctx.agencyId,
+          projectId: body.projectId,
+          milestoneId,
+          title: tk.title,
+          status: status as (typeof TASK_STATUSES)[number],
+          position,
+          createdBy: ctx.userId,
+        });
+        tasks.push({ id: taskId, title: tk.title, status, position });
+      }
+
+      createdMilestones.push({
+        id: milestoneId,
+        title: ms.title,
+        position: milestonePosition - 1,
+        tasks,
+      });
     }
 
-    createdMilestones.push({
-      id: milestoneId,
-      title: ms.title,
-      position: milestonePosition - 1,
-      tasks,
+    await audit({
+      agencyId: ctx.agencyId,
+      actorType: ctx.type,
+      actorId: ctx.userId,
+      action: 'ai.task_breakdown',
+      entityType: 'project',
+      entityId: body.projectId,
+      metadata: {
+        source: result.source,
+        milestonesCreated: createdMilestones.length,
+        tasksCreated: createdMilestones.reduce(
+          (n, m) => n + m.tasks.length,
+          0,
+        ),
+      },
+      ip: req.ip,
     });
-  }
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
-    action: 'ai.task_breakdown',
-    entityType: 'project',
-    entityId: body.projectId,
-    metadata: {
+    created(res, {
+      projectId: body.projectId,
       source: result.source,
-      milestonesCreated: createdMilestones.length,
-      tasksCreated: createdMilestones.reduce(
-        (n, m) => n + m.tasks.length,
-        0,
-      ),
-    },
-    ip: req.ip,
-  });
-
-  created(res, {
-    projectId: body.projectId,
-    source: result.source,
-    milestones: createdMilestones,
-  });
-});
+      milestones: createdMilestones,
+    });
+  },
+);
 
 // ============================================================
 //  POST /ai/captions — write/rewrite caption variations
@@ -411,8 +474,8 @@ const captionsSchema = z.object({
   variations: z.number().int().min(1).max(5).optional(),
 });
 
-aiAssistantRouter.post('/captions', aiLimiter, async (req, res) => {
-  const ctx = getAuth(req);
+aiAssistantRouter.post('/captions', requires('ai.generate_content'), aiLimiter, async (req, res) => {
+  const ctx = getStaffActor(req);
   const body = captionsSchema.parse(req.body);
   const brandName = await resolveClientName(ctx, body.clientId);
 
@@ -427,7 +490,7 @@ aiAssistantRouter.post('/captions', aiLimiter, async (req, res) => {
 
   await audit({
     agencyId: ctx.agencyId,
-    actorType: ctx.role,
+    actorType: ctx.type,
     actorId: ctx.userId,
     action: 'ai.captions',
     entityType: 'ai_caption',
@@ -453,8 +516,8 @@ const hashtagsSchema = z.object({
   clientId: z.string().min(1).optional(),
 });
 
-aiAssistantRouter.post('/hashtags', aiLimiter, async (req, res) => {
-  const ctx = getAuth(req);
+aiAssistantRouter.post('/hashtags', requires('ai.generate_content'), aiLimiter, async (req, res) => {
+  const ctx = getStaffActor(req);
   const body = hashtagsSchema.parse(req.body);
   const brandName = await resolveClientName(ctx, body.clientId);
 
@@ -466,7 +529,7 @@ aiAssistantRouter.post('/hashtags', aiLimiter, async (req, res) => {
 
   await audit({
     agencyId: ctx.agencyId,
-    actorType: ctx.role,
+    actorType: ctx.type,
     actorId: ctx.userId,
     action: 'ai.hashtags',
     entityType: 'ai_hashtags',
@@ -489,8 +552,8 @@ const contentIdeasSchema = z.object({
   clientId: z.string().min(1).optional(),
 });
 
-aiAssistantRouter.post('/content-ideas', aiLimiter, async (req, res) => {
-  const ctx = getAuth(req);
+aiAssistantRouter.post('/content-ideas', requires('ai.generate_content'), aiLimiter, async (req, res) => {
+  const ctx = getStaffActor(req);
   const body = contentIdeasSchema.parse(req.body);
   // If a clientId is given, prefer its name as the niche grounding.
   const brandName = await resolveClientName(ctx, body.clientId);
@@ -504,7 +567,7 @@ aiAssistantRouter.post('/content-ideas', aiLimiter, async (req, res) => {
 
   await audit({
     agencyId: ctx.agencyId,
-    actorType: ctx.role,
+    actorType: ctx.type,
     actorId: ctx.userId,
     action: 'ai.content_ideas',
     entityType: 'ai_ideas',
@@ -526,8 +589,8 @@ const repurposeSchema = z.object({
   clientId: z.string().min(1).optional(),
 });
 
-aiAssistantRouter.post('/repurpose', aiLimiter, async (req, res) => {
-  const ctx = getAuth(req);
+aiAssistantRouter.post('/repurpose', requires('ai.generate_content'), aiLimiter, async (req, res) => {
+  const ctx = getStaffActor(req);
   const body = repurposeSchema.parse(req.body);
   const brandName = await resolveClientName(ctx, body.clientId);
 
@@ -540,7 +603,7 @@ aiAssistantRouter.post('/repurpose', aiLimiter, async (req, res) => {
 
   await audit({
     agencyId: ctx.agencyId,
-    actorType: ctx.role,
+    actorType: ctx.type,
     actorId: ctx.userId,
     action: 'ai.repurpose',
     entityType: 'ai_repurpose',

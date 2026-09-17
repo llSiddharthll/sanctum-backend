@@ -28,9 +28,19 @@ function safeKey(key: string): string {
 }
 
 // ---- upload token (HMAC over key + expiry) ----
+/**
+ * Purpose-bound key: HMAC(secret, 'upload'). Uses UPLOAD_TOKEN_SECRET when set
+ * (TODO(env): declare it in env.ts), else the access-token secret — derived, so
+ * an upload signature is never interchangeable with any other token.
+ */
+const UPLOAD_KEY = crypto
+  .createHmac('sha256', process.env.UPLOAD_TOKEN_SECRET || env.JWT_ACCESS_SECRET)
+  .update('upload')
+  .digest();
+
 function sign(key: string, exp: number): string {
   return crypto
-    .createHmac('sha256', env.JWT_ACCESS_SECRET)
+    .createHmac('sha256', UPLOAD_KEY)
     .update(`${key}.${exp}`)
     .digest('base64url');
 }

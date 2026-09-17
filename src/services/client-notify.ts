@@ -10,6 +10,7 @@ import { db } from '../db/client.js';
 import { agencies, clients, clientContacts, portalTokens } from '../db/schema.js';
 import { newId, newOpaqueToken } from '../lib/ids.js';
 import { sendEmail, bannerHtml, BANNERS } from './email.js';
+import { systemRoleId } from '../authz/roles-store.js';
 
 async function recipientFor(
   agencyId: string,
@@ -30,7 +31,7 @@ async function recipientFor(
   const [client] = await db
     .select({ email: clients.contactEmail })
     .from(clients)
-    .where(eq(clients.id, clientId))
+    .where(and(eq(clients.id, clientId), eq(clients.agencyId, agencyId)))
     .limit(1);
   return client?.email ?? null;
 }
@@ -55,11 +56,26 @@ async function clientName(clientId: string): Promise<string> {
 
 import { getFrontendOrigin } from '../lib/frontend-url.js';
 
+/** Review links minted by notifications expire (share links are never permanent). */
+const AUTO_LINK_TTL_MS = 30 * 86_400_000;
+
 async function mintPortalUrl(
   agencyId: string,
   clientId: string,
   createdBy: string | null,
 ): Promise<string> {
+  // Bound to THIS client + agency; the link's role follows the client's portal
+  // role (reviewers can't approve).
+  const [client] = await db
+    .select({ portalRole: clients.portalRole })
+    .from(clients)
+    .where(and(eq(clients.id, clientId), eq(clients.agencyId, agencyId)))
+    .limit(1);
+  if (!client) throw new Error('client not in agency');
+  const roleId = await systemRoleId(
+    agencyId,
+    client.portalRole === 'reviewer' ? 'share_link_reviewer' : 'share_link',
+  );
   const { raw, hash } = newOpaqueToken();
   await db.insert(portalTokens).values({
     id: newId('ptk'),
@@ -68,6 +84,8 @@ async function mintPortalUrl(
     tokenHash: hash,
     label: 'auto-notify',
     createdBy: createdBy ?? null,
+    expiresAt: new Date(Date.now() + AUTO_LINK_TTL_MS),
+    roleId,
   });
   return `${getFrontendOrigin()}/portal/${raw}`;
 }
