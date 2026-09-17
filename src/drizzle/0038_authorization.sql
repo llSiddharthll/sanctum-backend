@@ -99,6 +99,23 @@ CREATE TABLE IF NOT EXISTS `sanctum_portal_token_projects` (
 	FOREIGN KEY (`project_id`) REFERENCES `sanctum_projects`(`id`) ON UPDATE no action ON DELETE cascade
 );
 --> statement-breakpoint
+CREATE TABLE IF NOT EXISTS `sanctum_document_links` (
+	`id` text PRIMARY KEY NOT NULL,
+	`agency_id` text NOT NULL,
+	`object_type` text NOT NULL CHECK (`object_type` IN ('proposal','agreement')),
+	`object_id` text NOT NULL,
+	`token_hash` text NOT NULL,
+	`expires_at` integer NOT NULL,
+	`revoked_at` integer,
+	`consumed_at` integer,
+	`created_by` text,
+	`created_at` integer DEFAULT (unixepoch()) NOT NULL,
+	FOREIGN KEY (`agency_id`) REFERENCES `sanctum_agencies`(`id`) ON UPDATE no action ON DELETE cascade,
+	FOREIGN KEY (`created_by`) REFERENCES `sanctum_users`(`id`) ON UPDATE no action ON DELETE set null
+);
+--> statement-breakpoint
+CREATE UNIQUE INDEX IF NOT EXISTS `ux_document_links_token` ON `sanctum_document_links` (`token_hash`);--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS `ix_document_links_object` ON `sanctum_document_links` (`agency_id`,`object_type`,`object_id`);--> statement-breakpoint
 ALTER TABLE `sanctum_agencies` ADD `authz_migrated_at` integer;--> statement-breakpoint
 ALTER TABLE `sanctum_portal_tokens` ADD `role_id` text REFERENCES sanctum_roles(id);--> statement-breakpoint
 ALTER TABLE `sanctum_portal_tokens` ADD `project_access` text DEFAULT 'all' NOT NULL;--> statement-breakpoint

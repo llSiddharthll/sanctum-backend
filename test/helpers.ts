@@ -189,3 +189,12 @@ export function data<T = any>(res: { body: { data: T } }): T {
 }
 
 export { db, schema };
+
+/** Id of a system role (owner, admin, employee, client_approver, …) in the caller's agency. */
+export async function systemRoleIdFor(agent: Agent, key: string): Promise<string> {
+  const res = await agent.get(`${BASE}/roles?includeArchived=false`);
+  if (res.status !== 200) throw new Error(`roles list failed ${res.status}`);
+  const role = (res.body.data as Array<{ id: string; key: string | null }>).find((r) => r.key === key);
+  if (!role) throw new Error(`system role ${key} not found`);
+  return role.id;
+}

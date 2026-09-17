@@ -567,6 +567,28 @@ authRouter.post('/logout', async (req, res) => {
 
 // GET /auth/me — identity + the authorization contract (design §I.5).
 authRouter.get('/me', authenticate, async (req, res) => {
+  const anyActor = getActor(req);
+  if (anyActor.type === 'portal_link') {
+    // Share-link session: no user record; identity is the link itself.
+    const [agency] = await db.select().from(agencies).where(eq(agencies.id, anyActor.agencyId)).limit(1);
+    return ok(res, {
+      user: null,
+      link: { id: anyActor.tokenId, clientId: anyActor.clientId },
+      agency: agency
+        ? { id: agency.id, name: agency.name, slug: agency.slug, themePreset: agency.themePreset }
+        : null,
+      plan: null,
+      authorization: {
+        version: `link.${CATALOG_VERSION}`,
+        actorType: anyActor.type,
+        roles: [],
+        grants: anyActor.grants.toJSON(),
+        projectAccess: anyActor.projectAccess,
+      },
+      persona: 'client',
+      permissions: legacyPermissionMap(anyActor),
+    });
+  }
   const actor = getUserActor(req);
   const [user] = await db
     .select()

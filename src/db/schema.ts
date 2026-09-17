@@ -2677,6 +2677,33 @@ export const portalTokenProjects = sqliteTable(
   (tbl) => [primaryKey({ columns: [tbl.tokenId, tbl.projectId] })],
 );
 
+/**
+ * Anonymous capability links for ONE proposal/agreement (replaces the plaintext
+ * proposals.token / agreements.token). Only sha256(token) is stored.
+ */
+export const documentLinks = sqliteTable(
+  t('document_links'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    objectType: text('object_type', { enum: ['proposal', 'agreement'] }).notNull(),
+    objectId: text('object_id').notNull(),
+    tokenHash: text('token_hash').notNull(),
+    expiresAt: ts('expires_at').notNull(),
+    revokedAt: ts('revoked_at'),
+    consumedAt: ts('consumed_at'),
+    createdBy: text('created_by').references(() => users.id, { onDelete: 'set null' }),
+    createdAt: ts('created_at').notNull().default(now),
+  },
+  (tbl) => [
+    uniqueIndex('ux_document_links_token').on(tbl.tokenHash),
+    index('ix_document_links_object').on(tbl.agencyId, tbl.objectType, tbl.objectId),
+  ],
+);
+
+export type DocumentLink = typeof documentLinks.$inferSelect;
 export type Role = typeof roles.$inferSelect;
 export type RolePermission = typeof rolePermissions.$inferSelect;
 export type UserRole = typeof userRoles.$inferSelect;
