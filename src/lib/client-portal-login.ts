@@ -3,39 +3,68 @@ import { randomBytes } from 'node:crypto';
 import { and, asc, eq, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { assignRoles, systemRoleId } from '../authz/roles-store.js';
-import { revokeUserSessions } from '../authz/sessions.js';
-import { bumpUsers } from '../authz/resolver.js';
 import { clients, users } from '../db/schema.js';
 import { hashPassword } from './password.js';
 import { newId } from './ids.js';
 import { badRequest, conflict } from './errors.js';
 import { sendEmail, basicHtml } from '../services/email.js';
+import { createPasswordReset } from '../services/password-reset.js';
 import { getFrontendOrigin } from './frontend-url.js';
 
 /**
- * Shared "secure client-portal login" primitives — the plumbing behind
- * clients.ts's own /portal-login + /portal-login-email routes, factored out
- * so proposals/agreements/invoices can mint-and-email the same real
- * email+password login when a record is document-mode (an uploaded file with
- * no in-app view worth linking to).
+ * Client-portal login provisioning — shared by clients.ts (/portal-login*) and
+ * the document-mode send flows (proposals / agreements / invoices).
+ *
+ * Credential-integrity rules (authz audit 06 §2.5):
+ *  - Accounts are identified by EMAIL within the brand. We never pick "the
+ *    oldest client user" and never rewrite another account's email.
+ *  - An existing account is never given a staff-chosen/generated password and
+ *    is never re-enabled. At most, the account holder gets a reset link at
+ *    their own address.
+ *  - Only a brand-new account gets a generated password, returned exactly once.
  */
 
 // Easy-to-type password: 8 lowercase-unambiguous chars (no i/l/o/0/1), grouped
-// 4-4 (e.g. "kmrp-2t9x"). All lowercase + digits so there's no case-switching
-// on a phone keyboard.
+// 4-4 (e.g. "kmrp-2t9x").
 const PW_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789';
 export function generatePortalPassword(): string {
   const bytes = randomBytes(8);
   let out = '';
   for (let i = 0; i < 8; i += 1) {
-    out += PW_ALPHABET[bytes[i] % PW_ALPHABET.length];
+    out += PW_ALPHABET[bytes[i]! % PW_ALPHABET.length];
     if (i === 3) out += '-';
   }
   return out;
 }
 
-/** The brand's canonical portal-login account (role:'client'), if any. */
+function isSyntheticPortalEmail(email: string): boolean {
+  return email.toLowerCase().endsWith('@portal.sanctum');
+}
+
+/** All real (non share-link) client login accounts of a brand, oldest first. */
+export async function listClientLogins(agencyId: string, clientId: string) {
+  const rows = await db
+    .select()
+    .from(users)
+    .where(
+      and(
+        eq(users.agencyId, agencyId),
+        eq(users.clientId, clientId),
+        eq(users.kind, 'client'),
+      ),
+    )
+    .orderBy(asc(users.createdAt));
+  return rows.filter((u) => !isSyntheticPortalEmail(u.email));
+}
+
+/** The brand's first real portal-login account (status display only), if any. */
 export async function findClientLogin(agencyId: string, clientId: string) {
+  const all = await listClientLogins(agencyId, clientId);
+  return all.find((u) => u.status === 'active') ?? all[0] ?? null;
+}
+
+/** The brand's client account with exactly this email, if any. */
+export async function findClientLoginByEmail(agencyId: string, clientId: string, email: string) {
   const [u] = await db
     .select()
     .from(users)
@@ -43,17 +72,36 @@ export async function findClientLogin(agencyId: string, clientId: string) {
       and(
         eq(users.agencyId, agencyId),
         eq(users.clientId, clientId),
-        eq(users.role, 'client'),
+        eq(users.kind, 'client'),
+        sql`lower(${users.email}) = ${email.toLowerCase().trim()}`,
       ),
     )
-    .orderBy(asc(users.createdAt))
     .limit(1);
   return u ?? null;
 }
 
+export interface PortalLoginResult {
+  userId: string;
+  email: string;
+  /** Plaintext password — ONLY for a brand-new account; undefined otherwise. */
+  password?: string;
+  created: boolean;
+  /** Existing account: status as found (never changed here). */
+  status: 'active' | 'disabled';
+  /** Existing active account: a reset link was emailed to the account's own address. */
+  resetSent: boolean;
+}
+
 /**
- * Create or reset the brand's secure portal login and return the plaintext
- * password (never persisted — this is the only place it's visible).
+ * Ensure a portal login exists for `email` on this brand.
+ *  - No client account with that email for the brand → create one (kind
+ *    'client', role by brand portalRole, all projects) with a generated
+ *    password returned once.
+ *  - One exists → nothing about the account changes. When `sendResetIfExists`
+ *    and the account is active, a password-reset link is emailed to the
+ *    account's own address.
+ * An email used by any other account (staff, another brand, another agency)
+ * is rejected with 409.
  */
 export async function mintClientPortalLogin(params: {
   agencyId: string;
@@ -61,52 +109,50 @@ export async function mintClientPortalLogin(params: {
   clientName: string;
   clientContactEmail?: string | null;
   email?: string;
+  /** Ignored (kept for call-site compatibility): staff never choose client passwords. */
   password?: string;
-}): Promise<{ email: string; password: string; created: boolean }> {
-  const existing = await findClientLogin(params.agencyId, params.clientId);
-  const email = (
-    params.email?.trim() ||
-    existing?.email ||
-    params.clientContactEmail ||
-    ''
-  )
-    .toLowerCase()
-    .trim();
+  sendResetIfExists?: boolean;
+  req?: Request;
+}): Promise<PortalLoginResult> {
+  const email = (params.email?.trim() || params.clientContactEmail || '').toLowerCase().trim();
   if (!email) {
     throw badRequest(
       'No email for this client — add a contact email or enter one to use as the login.',
     );
   }
+  if (isSyntheticPortalEmail(email)) throw badRequest('That email cannot be used as a login.');
 
+  const existing = await findClientLoginByEmail(params.agencyId, params.clientId, email);
+  if (existing) {
+    let resetSent = false;
+    if (params.sendResetIfExists && existing.status === 'active') {
+      await createPasswordReset(
+        { id: existing.id, agencyId: existing.agencyId, email: existing.email, fullName: existing.fullName },
+        { byAdmin: true, req: params.req },
+      );
+      resetSent = true;
+    }
+    return {
+      userId: existing.id,
+      email: existing.email,
+      created: false,
+      status: existing.status,
+      resetSent,
+    };
+  }
+
+  // Login resolves email globally, so the address must not belong to any other account.
   const [clash] = await db
     .select({ id: users.id })
     .from(users)
-    .where(
-      and(
-        eq(users.agencyId, params.agencyId),
-        sql`lower(${users.email}) = ${email}`,
-      ),
-    )
+    .where(sql`lower(${users.email}) = ${email}`)
     .limit(1);
-  if (clash && clash.id !== existing?.id) {
-    throw conflict(
-      'That email is already used by another account in your workspace. Use a different email.',
-    );
+  if (clash) {
+    throw conflict('That email is already used by another account. Use a different email.');
   }
 
-  const password = params.password?.trim() || generatePortalPassword();
+  const password = generatePortalPassword();
   const passwordHash = await hashPassword(password);
-
-  if (existing) {
-    await db
-      .update(users)
-      .set({ email, passwordHash, status: 'active' })
-      .where(eq(users.id, existing.id));
-    await revokeUserSessions(existing.id, 'credentials_reset');
-    await bumpUsers([existing.id]);
-    return { email, password, created: false };
-  }
-
   const userId = newId('usr');
   const [brand] = await db
     .select({ portalRole: clients.portalRole })
@@ -132,10 +178,10 @@ export async function mintClientPortalLogin(params: {
     });
     if (roleId) await assignRoles(tx, { agencyId: params.agencyId, userId, roleIds: [roleId] });
   });
-  return { email, password, created: true };
+  return { userId, email, password, created: true, status: 'active', resetSent: false };
 }
 
-/** Email the client their branded secure-login credentials (link + email + password). */
+/** Email the client their branded portal sign-in (link + email, and a password only for a new account). */
 export async function sendClientPortalLoginEmail(params: {
   req: Request;
   agencyName: string;
@@ -152,7 +198,7 @@ export async function sendClientPortalLoginEmail(params: {
     : `${params.agencyName} has set up your private client portal — follow your projects, view the content calendar, review proposals & agreements, see invoices, and download shared files, all in one place.`;
   const creds = params.password
     ? `Sign in with these details:<br><br><strong>Email:</strong> ${params.email}<br><strong>Password:</strong> ${params.password}<br><br>Keep these private — you can change your password after signing in.`
-    : `Sign in with your email (<strong>${params.email}</strong>) and your existing password. Forgot it? Ask ${params.agencyName} to reset it for you.`;
+    : `Sign in with your email (<strong>${params.email}</strong>) and your existing password. Forgot it? Use "Forgot password" on the sign-in page.`;
 
   await sendEmail({
     to: params.to,

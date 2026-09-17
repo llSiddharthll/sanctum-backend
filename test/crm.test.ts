@@ -7,14 +7,17 @@ import {
   uniqueEmail,
   type Agent,
 } from './helpers';
+import type { Grant } from '../src/authz/catalog.js';
+
+const g = (permission: string, scope: Grant['scope'] = 'organization'): Grant => ({ permission, scope });
 
 /**
  * CRM module (`/crm`) integration tests.
  *
- * CRM lives under the 'clients' module: reads need clients:view, writes need
- * clients:manage (enforced by requireModuleRW on the whole router). Most CRM
- * entities attach to a clientId and are additionally guarded by
- * requireClientAccess (members must be assigned; cross-tenant -> 404).
+ * Permissions: reads need clients.view (deals: deals.view); writes need
+ * contacts.manage / client_notes.* / tags.manage / deals.*. Every CRM entity
+ * inherits its client's scope (organization or assigned); cross-tenant -> 404.
+ * Scope-specific scenarios live in test/authz/clients.test.ts.
  */
 describe('crm workflow', () => {
   let owner: Agent;
@@ -317,7 +320,7 @@ describe('crm workflow', () => {
   it('sets a client account owner and surfaces ownerName on the detail', async () => {
     const { user } = await createMemberSession(owner, {
       fullName: 'Account Manager',
-      permissions: { clients: 'manage' },
+      grants: [g('clients.view'), g('clients.update')],
     });
     const set = await owner
       .patch(`${BASE}/clients/${clientId}`)
@@ -340,9 +343,9 @@ describe('crm workflow', () => {
   // ----------------------------------------------------------------
   // 7. PERMISSIONS
   // ----------------------------------------------------------------
-  it('lets a clients:view member READ agency-level crm but blocks writes (403)', async () => {
+  it('lets a view-only member READ agency-level crm but blocks writes (403)', async () => {
     const { agent } = await createMemberSession(owner, {
-      permissions: { clients: 'view' },
+      grants: [g('clients.view'), g('deals.view')],
     });
 
     // Agency-level reads succeed (they are not client-scoped).
@@ -350,7 +353,7 @@ describe('crm workflow', () => {
     expect((await agent.get(`${BASE}/crm/deals`)).status).toBe(200);
     expect((await agent.get(`${BASE}/crm/follow-ups`)).status).toBe(200);
 
-    // Writes require manage -> blocked by requireModuleRW before client access.
+    // Writes need tags.manage / contacts.manage / deals.create.
     const tag = await agent
       .post(`${BASE}/crm/tags`)
       .send({ name: `Nope-${uniqueEmail('t')}` });
@@ -367,9 +370,9 @@ describe('crm workflow', () => {
     expect(deal.status).toBe(403);
   });
 
-  it('denies a clients:none member even read access (403)', async () => {
+  it('denies a member without clients/deals permissions even read access (403)', async () => {
     const { agent } = await createMemberSession(owner, {
-      permissions: { clients: 'none' },
+      grants: [g('organization.view')],
     });
     expect((await agent.get(`${BASE}/crm/tags`)).status).toBe(403);
     expect((await agent.get(`${BASE}/crm/deals`)).status).toBe(403);
@@ -462,14 +465,14 @@ describe('crm workflow', () => {
     expect(note.status).toBe(404);
   });
 
-  it('404s when creating a deal with an owner from another agency', async () => {
-    // ownerId must belong to the caller's agency (assertAgencyUser -> 404).
+  it('rejects a deal owner from another agency (400)', async () => {
+    // ownerId must be active staff of the caller's agency (requireActiveStaff -> 400).
     const { user: foreignUser } = await signupAgency().then(async (b) => ({
       user: b.user,
     }));
     const res = await owner
       .post(`${BASE}/crm/clients/${clientId}/deals`)
       .send({ title: 'Foreign owner', ownerId: foreignUser.id });
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(400);
   });
 });

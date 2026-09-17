@@ -1,10 +1,15 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { BASE, signupAgency, createMemberSession, data, type Agent } from './helpers';
+import type { Grant } from '../src/authz/catalog.js';
+
+const g = (permission: string, scope: Grant['scope'] = 'organization'): Grant => ({ permission, scope });
 
 /**
  * Pinned messages: the handful of messages that explain a client account,
- * surfaced on the client overview so a newcomer can catch up. Also covers the
- * client activity feed, which is oversight-only (owner/admin + managers).
+ * surfaced on the client overview. Only pins from threads the caller
+ * participates in are returned (clients.view + messages.view; the AI summary
+ * also needs ai.use_assistant). Also covers the client activity feed
+ * (clients.view_activity).
  */
 describe('pinned messages + client activity visibility', () => {
   let owner: Agent;
@@ -81,22 +86,38 @@ describe('pinned messages + client activity visibility', () => {
     if (!out.summary) expect(out.message).toBeTruthy();
   });
 
-  it('never leaks another agency\'s pins', async () => {
+  it("never leaks another agency's pins", async () => {
     const other = (await signupAgency()).agent;
     const res = await other.get(`${BASE}/clients/${clientId}/pinned`);
-    expect([403, 404]).toContain(res.status);
+    expect(res.status).toBe(404);
   });
 
-  it('client activity is visible to a manager but not a plain employee', async () => {
-    // Manager tier = projects:manage (same signal the leaderboard uses).
+  it('a teammate who is not in the thread sees none of its pins', async () => {
+    const outsider = await createMemberSession(owner, {
+      grants: [g('clients.view'), g('messages.view', 'assigned'), g('ai.use_assistant')],
+    });
+    const res = await outsider.agent.get(`${BASE}/clients/${clientId}/pinned`);
+    expect(res.status).toBe(200);
+    expect(data(res)).toHaveLength(0);
+    const summary = await outsider.agent.post(`${BASE}/clients/${clientId}/pinned/summary`).send({});
+    expect(summary.status).toBe(200);
+    expect(data(summary).pinnedCount).toBe(0);
+  });
+
+  it('summary requires ai.use_assistant; pins require messages.view', async () => {
+    const noAi = await createMemberSession(owner, { grants: [g('clients.view'), g('messages.view', 'assigned')] });
+    expect((await noAi.agent.post(`${BASE}/clients/${clientId}/pinned/summary`).send({})).status).toBe(403);
+    const noMessages = await createMemberSession(owner, { grants: [g('clients.view')] });
+    expect((await noMessages.agent.get(`${BASE}/clients/${clientId}/pinned`)).status).toBe(403);
+  });
+
+  it('client activity requires clients.view_activity', async () => {
     const manager = await createMemberSession(owner, {
-      permissions: { clients: 'edit', projects: 'manage' },
+      grants: [g('clients.view'), g('clients.view_activity')],
     });
     expect((await manager.agent.get(`${BASE}/clients/${clientId}/activity`)).status).toBe(200);
 
-    const employee = await createMemberSession(owner, {
-      permissions: { clients: 'view', projects: 'edit' },
-    });
+    const employee = await createMemberSession(owner, { grants: [g('clients.view')] });
     expect((await employee.agent.get(`${BASE}/clients/${clientId}/activity`)).status).toBe(403);
   });
 });

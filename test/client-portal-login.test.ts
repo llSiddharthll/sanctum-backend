@@ -1,18 +1,17 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import supertest from 'supertest';
-import { app, BASE, signupAgency, data, type Agent } from './helpers';
+import { app, BASE, signupAgency, data, lastEmailTo, type Agent } from './helpers';
 
 /**
- * Secure client-portal login: the agency provisions a role:'client' account for
- * a brand with a returned password, the client logs in with it at /auth/login,
- * resetting rotates the password (old one stops working), and the login email
- * must be unique within the agency.
+ * Client-portal login provisioning (clients.manage_portal):
+ *  - POST creates a NEW client account for an email that has none on the brand
+ *    and returns the generated password once;
+ *  - for an existing account it changes nothing and emails a reset link to the
+ *    account's own address (no password is returned or set);
+ *  - staff can't choose passwords; login email must be globally unused;
+ *  - the login email can only go to the account's own address.
  */
-async function makeClient(
-  owner: Agent,
-  name = 'Login Co',
-  contactEmail?: string,
-): Promise<{ id: string; contactEmail?: string }> {
+async function makeClient(owner: Agent, name = 'Login Co', contactEmail?: string): Promise<{ id: string }> {
   const body: Record<string, unknown> = { name };
   if (contactEmail) body.contactEmail = contactEmail;
   return data(await owner.post(`${BASE}/clients`).send(body));
@@ -33,12 +32,11 @@ describe('secure client-portal login', () => {
     const email = `brandlogin.${Date.now()}@client.test`;
     const cli = await makeClient(owner, 'Sign-in Co', email);
 
-    // Status before: no login yet, email defaulted to the contact email.
     const before = data(await owner.get(`${BASE}/clients/${cli.id}/portal-login`));
     expect(before.exists).toBe(false);
     expect(before.email).toBe(email);
+    expect(before.accounts).toEqual([]);
 
-    // Provision: returns the plaintext password ONCE + a 201.
     const res = await owner.post(`${BASE}/clients/${cli.id}/portal-login`).send({});
     expect(res.status).toBe(201);
     const creds = data(res);
@@ -46,79 +44,92 @@ describe('secure client-portal login', () => {
     expect(typeof creds.password).toBe('string');
     expect(creds.password.length).toBeGreaterThanOrEqual(8);
     expect(creds.created).toBe(true);
+    expect(creds.userId).toMatch(/^usr_/);
 
-    // The client can log in with those credentials, as a 'client'.
     const good = await login(email, creds.password);
     expect(good.status).toBe(200);
     expect(good.body.data.user.role).toBe('client');
-    expect(good.body.data.tokens.access).toBeTruthy();
 
-    // A wrong password fails.
-    const bad = await login(email, 'not-the-password');
-    expect(bad.status).toBe(401);
+    expect((await login(email, 'not-the-password')).status).toBe(401);
 
-    // Status after: exists.
     const after = data(await owner.get(`${BASE}/clients/${cli.id}/portal-login`));
     expect(after.exists).toBe(true);
     expect(after.email).toBe(email);
+    expect(after.accounts).toHaveLength(1);
   });
 
-  it('emails a portal link with a password (new login) and without one (existing)', async () => {
-    const email = `emaillink.${Date.now()}@client.test`;
-    const cli = await makeClient(owner, 'Email Co', email);
-    await owner.post(`${BASE}/clients/${cli.id}/portal-login`).send({});
-
-    // With credentials (a note referencing the new document).
-    const withPw = await owner
-      .post(`${BASE}/clients/${cli.id}/portal-login-email`)
-      .send({ email, password: 'Secret123', note: 'A new invoice is ready to view in your portal.' });
-    expect(withPw.status).toBe(200);
-    expect(data(withPw).sent).toBe(true);
-
-    // Without a password (client already has a login) — must still succeed.
-    const noPw = await owner
-      .post(`${BASE}/clients/${cli.id}/portal-login-email`)
-      .send({ email, note: 'A new invoice is ready to view in your portal.' });
-    expect(noPw.status).toBe(200);
-    expect(data(noPw).sent).toBe(true);
-  });
-
-  it('resetting rotates the password — the old one stops working', async () => {
+  it('an existing account is never reset by staff: only a reset link to its own email', async () => {
     const email = `reset.${Date.now()}@client.test`;
     const cli = await makeClient(owner, 'Reset Co', email);
 
     const first = data(await owner.post(`${BASE}/clients/${cli.id}/portal-login`).send({}));
     expect((await login(email, first.password)).status).toBe(200);
 
-    // Reset → not "created", new password, same email.
     const res = await owner.post(`${BASE}/clients/${cli.id}/portal-login`).send({});
     expect(res.status).toBe(200);
     const second = data(res);
     expect(second.created).toBe(false);
-    expect(second.password).not.toBe(first.password);
+    expect(second.password).toBeNull();
+    expect(second.resetSent).toBe(true);
+    expect(second.userId).toBe(first.userId);
 
-    expect((await login(email, second.password)).status).toBe(200); // new works
-    expect((await login(email, first.password)).status).toBe(401); // old dead
+    // Password unchanged; a reset link went to the account's own address.
+    expect((await login(email, first.password)).status).toBe(200);
+    expect(lastEmailTo(email)?.text).toMatch(/reset-password\?token=/);
   });
 
-  it('accepts a custom email + password and rejects a duplicate email', async () => {
+  it('rejects staff-chosen passwords, a missing email and a duplicate email', async () => {
     const cli = await makeClient(owner, 'Custom Co'); // no contact email
-    // No email anywhere → 400.
-    const noEmail = await owner.post(`${BASE}/clients/${cli.id}/portal-login`).send({});
-    expect(noEmail.status).toBe(400);
+    expect((await owner.post(`${BASE}/clients/${cli.id}/portal-login`).send({})).status).toBe(400);
 
     const email = `custom.${Date.now()}@client.test`;
-    const created = await owner
+    const chosen = await owner
       .post(`${BASE}/clients/${cli.id}/portal-login`)
       .send({ email, password: 'MyChosenPass123' });
-    expect(created.status).toBe(201);
-    expect((await login(email, 'MyChosenPass123')).status).toBe(200);
+    expect(chosen.status).toBe(400);
 
-    // A second, different client can't take the same login email.
+    const createdRes = await owner.post(`${BASE}/clients/${cli.id}/portal-login`).send({ email });
+    expect(createdRes.status).toBe(201);
+
+    // Another client can't take the same login email.
     const other = await makeClient(owner, 'Other Co');
-    const clash = await owner
-      .post(`${BASE}/clients/${other.id}/portal-login`)
-      .send({ email });
+    const clash = await owner.post(`${BASE}/clients/${other.id}/portal-login`).send({ email });
     expect(clash.status).toBe(409);
+  });
+
+  it('emails login details only to the account itself, with its real password or none', async () => {
+    const email = `emaillink.${Date.now()}@client.test`;
+    const cli = await makeClient(owner, 'Email Co', email);
+    const creds = data(await owner.post(`${BASE}/clients/${cli.id}/portal-login`).send({}));
+
+    const withPw = await owner
+      .post(`${BASE}/clients/${cli.id}/portal-login-email`)
+      .send({ email, password: creds.password, note: 'A new invoice is ready to view in your portal.' });
+    expect(withPw.status).toBe(200);
+    expect(data(withPw).to).toBe(email);
+
+    const noPw = await owner
+      .post(`${BASE}/clients/${cli.id}/portal-login-email`)
+      .send({ email, note: 'A new invoice is ready to view in your portal.' });
+    expect(noPw.status).toBe(200);
+
+    // A made-up password is refused (no phishing with agency branding).
+    const fake = await owner
+      .post(`${BASE}/clients/${cli.id}/portal-login-email`)
+      .send({ email, password: 'Secret123' });
+    expect(fake.status).toBe(400);
+
+    // Arbitrary recipients are refused.
+    const redirect = await owner
+      .post(`${BASE}/clients/${cli.id}/portal-login-email`)
+      .send({ email, sendTo: 'attacker@evil.test' });
+    expect(redirect.status).toBe(400);
+    expect(lastEmailTo('attacker@evil.test')).toBeUndefined();
+
+    // Unknown account → 404.
+    const unknown = await owner
+      .post(`${BASE}/clients/${cli.id}/portal-login-email`)
+      .send({ email: `nobody.${Date.now()}@client.test` });
+    expect(unknown.status).toBe(404);
   });
 });
