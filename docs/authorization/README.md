@@ -782,7 +782,7 @@ Request
 
 | Job | Permissions (organization scope, per agency) |
 |---|---|
-| Monthly reports | `attendance.view_reports`, `time_logs.view`, `attendance.email_reports` |
+| Monthly reports | `attendance.view_reports`, `time_logs.view`, `tasks.view`, `attendance.email_reports` |
 | Month archive sweep | `tasks.archive`, `posts.archive` |
 | Timer shift-end sweep | `time_logs.create` (for others; system only) |
 | Media archive | `storage.archive` (platform agency) |

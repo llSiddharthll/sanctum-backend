@@ -4,8 +4,14 @@ import {
   signupAgency,
   createMemberSession,
   data,
+  systemRoleIdFor,
   type Agent,
 } from './helpers';
+
+/** A teammate holding the Employee system role (own-scope attendance access). */
+async function createEmployee(owner: Agent) {
+  return createMemberSession(owner, { roleIds: [await systemRoleIdFor(owner, 'employee')] });
+}
 
 /**
  * Integration coverage for the attendance domain:
@@ -18,10 +24,11 @@ import {
  *   - regularizations -> /api/v1/attendance/regularizations (sub-router)
  *   - notifications   -> /api/v1/notifications
  *
- * A default member (no permission overrides) gets FULL access, so they pass the
- * module gate. Admin-only actions are role-gated via requirePrivileged (owner/
- * admin), so a plain `member` is still rejected there. To exercise the module
- * gate's write-denial we use a member created with { attendance: 'view' }.
+ * Authorization is permission-based (src/authz). `createEmployee` gives the
+ * Employee system role (own-scope check-in, leave, regularization and checkout
+ * requests). A legacy `{ role: 'member' }` session is translated to explicit
+ * grants that still lack the privileged keys (policy, holidays, leave types,
+ * leave approval). Deeper scenarios live in test/authz/attendance.test.ts.
  *
  * Determinism: "today" is whatever the test DB clock says, but the route's
  * calendar classifies past/future relative to that clock. We anchor on months
@@ -225,29 +232,76 @@ describe('attendance: mandatory location (enforceGeo)', () => {
   });
 });
 
-describe('attendance: 500m check-out radius & 12 AM auto-reset', () => {
-  it('blocks check-out if more than 500m from check-in location (403)', async () => {
+describe('attendance: out-of-office check-out (office geofence)', () => {
+  it('holds a check-out outside the office radius for approval (202) and an approver settles it', async () => {
     const owner = (await signupAgency()).agent;
-    const member = (await createMemberSession(owner, { role: 'member' })).agent;
+    // Office fence at Mumbai Central, 500 m radius.
+    const put = await owner.put(`${ATT}/policy`).send({
+      enforceGeo: true,
+      geoLat: 18.9696,
+      geoLng: 72.8193,
+      geoRadiusM: 500,
+    });
+    expect(put.status).toBe(200);
+    const { agent: member, user } = await createEmployee(owner);
 
-    // Check in at Mumbai Central (18.9696, 72.8193)
     const checkInRes = await member
       .post(`${ATT}/check-in`)
       .send({ lat: 18.9696, lng: 72.8193, location: 'Mumbai Central' });
     expect(checkInRes.status).toBe(201);
 
-    // Try checking out from ~5 km away at Bandra (19.0596, 72.8295) -> > 500m
+    // ~10 km away at Bandra → not finalized: a pending checkout request.
     const farOut = await member
       .post(`${ATT}/check-out`)
-      .send({ lat: 19.0596, lng: 72.8295, location: 'Bandra' });
-    expect(farOut.status).toBe(403);
-    expect(farOut.body.error.message).toMatch(/500 meters/);
+      .send({ lat: 19.0596, lng: 72.8295, location: 'Bandra', reason: 'Client shoot' });
+    expect(farOut.status).toBe(202);
+    expect(data(farOut).pending).toBe(true);
+    const requestId = data(farOut).requestId;
+    expect(data(farOut).distanceM).toBeGreaterThan(500);
 
-    // Check out from within 100m (18.9700, 72.8193) -> <= 500m -> 200 OK
+    // A repeat is de-duplicated.
+    const again = await member.post(`${ATT}/check-out`).send({ lat: 19.0596, lng: 72.8295 });
+    expect(again.status).toBe(202);
+    expect(data(again).alreadyRequested).toBe(true);
+    expect(data(again).requestId).toBe(requestId);
+
+    // The employee cannot decide their own request.
+    const self = await member
+      .post(`${ATT}/checkout-requests/${requestId}/decide`)
+      .send({ decision: 'approved' });
+    expect(self.status).toBe(403);
+
+    const pending = await owner.get(`${ATT}/checkout-requests?scope=pending`);
+    expect(pending.status).toBe(200);
+    const row = data(pending).find((r: any) => r.id === requestId);
+    expect(row.userId).toBe(user.id);
+    expect(row.capabilities['checkout_requests.approve']).toBe(true);
+
+    const decide = await owner
+      .post(`${ATT}/checkout-requests/${requestId}/decide`)
+      .send({ decision: 'approved' });
+    expect(decide.status).toBe(200);
+    expect(data(decide).status).toBe('approved');
+
+    const today = await member.get(`${ATT}/today`);
+    expect(data(today).record.checkOutAt).toBeTruthy();
+  });
+
+  it('finalizes a check-out inside the office radius immediately (200)', async () => {
+    const owner = (await signupAgency()).agent;
+    await owner.put(`${ATT}/policy`).send({
+      enforceGeo: true,
+      geoLat: 18.9696,
+      geoLng: 72.8193,
+      geoRadiusM: 500,
+    });
+    const { agent: member } = await createEmployee(owner);
+    expect((await member.post(`${ATT}/check-in`).send({ lat: 18.9696, lng: 72.8193 })).status).toBe(201);
     const nearOut = await member
       .post(`${ATT}/check-out`)
-      .send({ lat: 18.9700, lng: 72.8193, location: 'Mumbai Central Gate' });
+      .send({ lat: 18.97, lng: 72.8193, location: 'Mumbai Central Gate' });
     expect(nearOut.status).toBe(200);
+    expect(data(nearOut).checkOutAt).toBeTruthy();
   });
 });
 
@@ -267,11 +321,9 @@ describe('attendance: who is in', () => {
     expect(['present', 'late']).toContain(me.status);
   });
 
-  it('a plain member cannot call who-is-in (403)', async () => {
+  it('an employee cannot call who-is-in (403)', async () => {
     const owner = (await signupAgency()).agent;
-    const { agent: member } = await createMemberSession(owner, {
-      role: 'member',
-    });
+    const { agent: member } = await createEmployee(owner);
     const res = await member.get(`${ATT}/whos-in`);
     expect(res.status).toBe(403);
   });
@@ -435,9 +487,12 @@ describe('attendance: leaves', () => {
     expect(data(res).every((r: any) => r.status !== undefined)).toBe(true);
   });
 
-  it('a member cannot list scope=all (admins only, 403)', async () => {
+  it('scope=all for an own-scope viewer lists only their own requests', async () => {
+    const me = await member.get(`${BASE}/auth/me`);
     const res = await member.get(`${LEAVES}/?scope=all`);
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(200);
+    expect(data(res).length).toBeGreaterThanOrEqual(1);
+    expect(data(res).every((r: any) => r.userId === data(me).user.id)).toBe(true);
   });
 
   it('admin approves a leave; requester is notified and request is approved', async () => {
@@ -515,7 +570,7 @@ describe('attendance: regularizations', () => {
 
   beforeAll(async () => {
     owner = (await signupAgency()).agent;
-    member = (await createMemberSession(owner, { role: 'member' })).agent;
+    member = (await createEmployee(owner)).agent;
   });
 
   it('member submits a regularization (201) and notifies the owner', async () => {
@@ -591,7 +646,7 @@ describe('attendance: regularizations', () => {
     expect(data(res).status).toBe('rejected');
   });
 
-  it('a member cannot decide a regularization (403)', async () => {
+  it('an employee cannot decide a regularization (403)', async () => {
     const sub = await member.post(`${REG}/`).send({
       day: '2025-03-25',
       type: 'late',

@@ -1,6 +1,10 @@
-import { and, eq, ne, or, gte, lte, inArray, sql } from 'drizzle-orm';
+import { and, eq, or, gte, lte, inArray, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { users, timeLogs, projectTasks, taskAssignees } from '../db/schema.js';
+import { roles, userRoles, users, timeLogs, projectTasks, taskAssignees } from '../db/schema.js';
+import { forbidden } from '../lib/errors.js';
+import type { Actor } from '../authz/actor.js';
+import { canOrg } from '../authz/engine.js';
+import { usersWithPermission } from '../authz/resolver.js';
 import { loadPolicy, buildRange, summarizeDays, daysInRange } from './attendance.js';
 import { sendEmployeeReport, sendTeamReport } from './email.js';
 
@@ -109,14 +113,13 @@ export async function buildEmployeeReport(
   };
 }
 
-/** Active non-client staff of an agency (for iterating report recipients). */
+/** Active staff of an agency (report subjects / recipients). */
 export async function activeStaff(agencyId: string) {
   return db
     .select({
       id: users.id,
       fullName: users.fullName,
       email: users.email,
-      role: users.role,
       weeklyCapacityHrs: users.weeklyCapacityHrs,
     })
     .from(users)
@@ -124,19 +127,42 @@ export async function activeStaff(agencyId: string) {
       and(
         eq(users.agencyId, agencyId),
         eq(users.status, 'active'),
-        ne(users.role, 'client'),
+        eq(users.kind, 'staff'),
       ),
     );
 }
 
-/** Build reports for every non-owner staff member over a range. */
+/** Holders of the agency's Owner role (they are not report subjects). */
+async function ownerHolderIds(agencyId: string): Promise<Set<string>> {
+  const rows = await db
+    .select({ userId: userRoles.userId })
+    .from(userRoles)
+    .innerJoin(roles, eq(roles.id, userRoles.roleId))
+    .where(and(eq(roles.agencyId, agencyId), eq(roles.key, 'owner')));
+  return new Set(rows.map((r) => r.userId));
+}
+
+function requireOrg(actor: Actor, permissions: string[]): void {
+  for (const p of permissions) {
+    if (!canOrg(actor, p)) throw forbidden("You don't have permission to do that.");
+  }
+}
+
+/**
+ * Build reports for every active staff member except Owner-role holders over a
+ * range. Requires `attendance.view_reports` (organization). Callers that expose
+ * the result must mask time/task data the actor may not see.
+ */
 export async function buildAgencyReports(
-  agencyId: string,
+  actor: Actor,
   fromKey: string,
   toKey: string,
 ): Promise<EmployeeReport[]> {
+  requireOrg(actor, ['attendance.view_reports']);
+  const agencyId = actor.agencyId;
   const policy = await loadPolicy(agencyId);
-  const staff = (await activeStaff(agencyId)).filter((u) => u.role !== 'owner');
+  const owners = await ownerHolderIds(agencyId);
+  const staff = (await activeStaff(agencyId)).filter((u) => !owners.has(u.id));
   const reports: EmployeeReport[] = [];
   for (const u of staff) {
     reports.push(
@@ -157,16 +183,30 @@ export async function buildAgencyReports(
   return reports;
 }
 
+/** Permissions (organization scope) a person needs to receive the team overview. */
+export const TEAM_OVERVIEW_PERMISSIONS = [
+  'attendance.view_reports',
+  'time_logs.view',
+  'tasks.view',
+] as const;
+
 /**
- * Email each employee their own report AND every owner a combined team
- * overview, for [fromKey, toKey]. Best-effort per recipient.
+ * Email each employee their own report AND a combined team overview to every
+ * active staff member holding TEAM_OVERVIEW_PERMISSIONS at organization scope
+ * (recipients by capability, not role), for [fromKey, toKey]. The actor (a user
+ * or the monthly system job) needs `attendance.email_reports` +
+ * `attendance.view_reports`. Best-effort per recipient.
+ *
+ * `owners` in the result counts overview recipients (name kept for API compat).
  */
 export async function emailEmployeeReports(
-  agencyId: string,
+  actor: Actor,
   fromKey: string,
   toKey: string,
 ): Promise<{ employees: number; owners: number }> {
-  const reports = await buildAgencyReports(agencyId, fromKey, toKey);
+  requireOrg(actor, ['attendance.email_reports', 'attendance.view_reports']);
+  const agencyId = actor.agencyId;
+  const reports = await buildAgencyReports(actor, fromKey, toKey);
   const periodLabel = formatPeriod(fromKey, toKey);
 
   let employees = 0;
@@ -175,19 +215,25 @@ export async function emailEmployeeReports(
     if (r.ok) employees++;
   }
 
-  const owners = (await activeStaff(agencyId)).filter((u) => u.role === 'owner');
-  let ownerCount = 0;
-  for (const o of owners) {
+  const holderSets = await Promise.all(
+    TEAM_OVERVIEW_PERMISSIONS.map(
+      async (p) => new Set(await usersWithPermission(agencyId, p, { scope: 'organization' })),
+    ),
+  );
+  const recipientIds = [...holderSets[0]!].filter((id) => holderSets.every((s) => s.has(id)));
+  const staff = await activeStaff(agencyId);
+  let overviewCount = 0;
+  for (const o of staff.filter((u) => recipientIds.includes(u.id))) {
     const r = await sendTeamReport({
       to: o.email,
       name: o.fullName ?? o.email,
       periodLabel,
       members: reports,
     });
-    if (r.ok) ownerCount++;
+    if (r.ok) overviewCount++;
   }
 
-  return { employees, owners: ownerCount };
+  return { employees, owners: overviewCount };
 }
 
 /** "1 Aug 2026 → 19 Aug 2026" style label from two day keys. */

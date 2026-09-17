@@ -1,28 +1,30 @@
 import { Router } from 'express';
-import type { Request } from 'express';
 import { z } from 'zod';
-import { and, desc, eq } from 'drizzle-orm';
+import { and, desc, eq, inArray } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { leaveRequests, leaveTypes, users } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
-import { conflict, forbidden, notFound, badRequest } from '../lib/errors.js';
-import { getAuth, isPrivileged } from '../middleware/tenant.js';
+import { conflict, notFound, badRequest } from '../lib/errors.js';
 import { audit } from '../services/audit.js';
-import {
-  notify,
-  notifyMany,
-  agencyApprovers,
-} from '../services/notifications.js';
+import { notify, notifyPermissionHolders } from '../services/notifications.js';
 import { loadPolicy, countLeaveDays, yearBounds } from '../services/attendance.js';
+import { getStaffActor, requires, requiresAny } from '../authz/http.js';
+import { authorize, canOrg } from '../authz/engine.js';
+import type { StaffActor } from '../authz/actor.js';
+import {
+  assertCancelAllowed,
+  decideCondition,
+  manageableUserIds,
+  requestCapabilities,
+  resolveSubjectForRead,
+  subjectFacts,
+  subjectScopeFilter,
+} from '../authz/policies/attendance.js';
 
+// Mounted under /attendance (which authenticates). Every route declares its
+// permission.
 export const leavesRouter = Router();
-
-function requirePrivileged(req: Request): void {
-  if (!isPrivileged(getAuth(req).role)) {
-    throw forbidden('Only owners/admins can do that.');
-  }
-}
 
 function serializeType(t: typeof leaveTypes.$inferSelect) {
   return {
@@ -36,18 +38,32 @@ function serializeType(t: typeof leaveTypes.$inferSelect) {
   };
 }
 
+async function loadType(actor: StaffActor, id: string) {
+  const [row] = await db
+    .select()
+    .from(leaveTypes)
+    .where(and(eq(leaveTypes.id, id), eq(leaveTypes.agencyId, actor.agencyId)))
+    .limit(1);
+  if (!row) throw notFound('Leave type not found.');
+  return row;
+}
+
 // ============================================================
 //  LEAVE TYPES
 // ============================================================
-leavesRouter.get('/types', async (req, res) => {
-  const ctx = getAuth(req);
-  const rows = await db
-    .select()
-    .from(leaveTypes)
-    .where(eq(leaveTypes.agencyId, ctx.agencyId))
-    .orderBy(leaveTypes.sortOrder, leaveTypes.name);
-  ok(res, rows.map(serializeType));
-});
+leavesRouter.get(
+  '/types',
+  requiresAny('leaves.request', 'leaves.view', 'leave_types.manage'),
+  async (req, res) => {
+    const actor = getStaffActor(req);
+    const rows = await db
+      .select()
+      .from(leaveTypes)
+      .where(eq(leaveTypes.agencyId, actor.agencyId))
+      .orderBy(leaveTypes.sortOrder, leaveTypes.name);
+    ok(res, rows.map(serializeType));
+  },
+);
 
 const typeSchema = z.object({
   name: z.string().trim().min(1).max(60),
@@ -58,21 +74,20 @@ const typeSchema = z.object({
   sortOrder: z.number().int().optional(),
 });
 
-leavesRouter.post('/types', async (req, res) => {
-  requirePrivileged(req);
-  const ctx = getAuth(req);
+leavesRouter.post('/types', requires('leave_types.manage'), async (req, res) => {
+  const actor = getStaffActor(req);
   const body = typeSchema.parse(req.body);
   const [dupe] = await db
     .select({ id: leaveTypes.id })
     .from(leaveTypes)
-    .where(and(eq(leaveTypes.agencyId, ctx.agencyId), eq(leaveTypes.name, body.name)))
+    .where(and(eq(leaveTypes.agencyId, actor.agencyId), eq(leaveTypes.name, body.name)))
     .limit(1);
   if (dupe) throw conflict('A leave type with that name already exists.');
 
   const id = newId('lvt');
   await db.insert(leaveTypes).values({
     id,
-    agencyId: ctx.agencyId,
+    agencyId: actor.agencyId,
     name: body.name,
     colorToken: body.colorToken ?? 'pine',
     paid: body.paid ?? true,
@@ -80,14 +95,24 @@ leavesRouter.post('/types', async (req, res) => {
     active: body.active ?? true,
     sortOrder: body.sortOrder ?? 0,
   });
-  const [row] = await db.select().from(leaveTypes).where(eq(leaveTypes.id, id));
-  created(res, serializeType(row!));
+  const row = await loadType(actor, id);
+  await audit({
+    agencyId: actor.agencyId,
+    actorType: actor.type,
+    actorId: actor.userId,
+    action: 'leave_type.create',
+    entityType: 'leave_type',
+    entityId: id,
+    metadata: { after: serializeType(row) },
+    ip: req.ip,
+  });
+  created(res, serializeType(row));
 });
 
-leavesRouter.patch('/types/:id', async (req, res) => {
-  requirePrivileged(req);
-  const ctx = getAuth(req);
+leavesRouter.patch('/types/:id', requires('leave_types.manage'), async (req, res) => {
+  const actor = getStaffActor(req);
   const id = param(req, 'id');
+  const before = await loadType(actor, id);
   const body = typeSchema.partial().parse(req.body);
   const patch: Partial<typeof leaveTypes.$inferInsert> = {};
   if (body.name !== undefined) patch.name = body.name;
@@ -96,32 +121,57 @@ leavesRouter.patch('/types/:id', async (req, res) => {
   if (body.annualQuota !== undefined) patch.annualQuota = body.annualQuota;
   if (body.active !== undefined) patch.active = body.active;
   if (body.sortOrder !== undefined) patch.sortOrder = body.sortOrder;
-  await db
-    .update(leaveTypes)
-    .set(patch)
-    .where(and(eq(leaveTypes.id, id), eq(leaveTypes.agencyId, ctx.agencyId)));
-  const [row] = await db.select().from(leaveTypes).where(eq(leaveTypes.id, id));
-  if (!row) throw notFound('Leave type not found.');
+  if (Object.keys(patch).length) {
+    await db
+      .update(leaveTypes)
+      .set(patch)
+      .where(and(eq(leaveTypes.id, id), eq(leaveTypes.agencyId, actor.agencyId)));
+  }
+  // Re-read is tenant-scoped: a foreign id is a 404, never another agency's row.
+  const row = await loadType(actor, id);
+  await audit({
+    agencyId: actor.agencyId,
+    actorType: actor.type,
+    actorId: actor.userId,
+    action: 'leave_type.update',
+    entityType: 'leave_type',
+    entityId: id,
+    metadata: { before: serializeType(before), after: serializeType(row) },
+    ip: req.ip,
+  });
   ok(res, serializeType(row));
 });
 
-leavesRouter.delete('/types/:id', async (req, res) => {
-  requirePrivileged(req);
-  const ctx = getAuth(req);
+leavesRouter.delete('/types/:id', requires('leave_types.manage'), async (req, res) => {
+  const actor = getStaffActor(req);
   const id = param(req, 'id');
+  await loadType(actor, id);
   // Soft-delete (deactivate) so historical requests keep their type.
   await db
     .update(leaveTypes)
     .set({ active: false })
-    .where(and(eq(leaveTypes.id, id), eq(leaveTypes.agencyId, ctx.agencyId)));
+    .where(and(eq(leaveTypes.id, id), eq(leaveTypes.agencyId, actor.agencyId)));
+  await audit({
+    agencyId: actor.agencyId,
+    actorType: actor.type,
+    actorId: actor.userId,
+    action: 'leave_type.deactivate',
+    entityType: 'leave_type',
+    entityId: id,
+    ip: req.ip,
+  });
   ok(res, { deactivated: true });
 });
 
 // ============================================================
 //  LEAVE REQUESTS
 // ============================================================
+type LeaveRow = typeof leaveRequests.$inferSelect;
+
 function serializeRequest(
-  r: typeof leaveRequests.$inferSelect,
+  actor: StaffActor,
+  r: LeaveRow,
+  manageable: boolean,
   typeName?: string | null,
   typeColor?: string | null,
   userName?: string | null,
@@ -144,22 +194,86 @@ function serializeRequest(
     decidedAt: toIso(r.decidedAt),
     decisionNote: r.decisionNote,
     createdAt: toIso(r.createdAt),
+    capabilities: requestCapabilities('leaves', actor, r, manageable),
   };
 }
 
-// GET /  — list (mine by default; ?scope=all|pending and ?userId for admins)
-leavesRouter.get('/', async (req, res) => {
-  const ctx = getAuth(req);
+async function loadLeave(actor: StaffActor, id: string): Promise<LeaveRow> {
+  const [lr] = await db
+    .select()
+    .from(leaveRequests)
+    .where(and(eq(leaveRequests.id, id), eq(leaveRequests.agencyId, actor.agencyId)))
+    .limit(1);
+  if (!lr) throw notFound('Leave request not found.');
+  return lr;
+}
+
+/** Serialize one request with its type + requester name (tenant-scoped joins). */
+async function serializeOne(actor: StaffActor, lr: LeaveRow, manageable: boolean) {
+  const [t] = await db
+    .select({ name: leaveTypes.name, colorToken: leaveTypes.colorToken })
+    .from(leaveTypes)
+    .where(and(eq(leaveTypes.id, lr.leaveTypeId), eq(leaveTypes.agencyId, actor.agencyId)))
+    .limit(1);
+  const [u] = await db
+    .select({ name: users.fullName, email: users.email })
+    .from(users)
+    .where(and(eq(users.id, lr.userId), eq(users.agencyId, actor.agencyId)))
+    .limit(1);
+  return serializeRequest(actor, lr, manageable, t?.name, t?.colorToken, u?.name ?? u?.email);
+}
+
+async function isManageableSubject(actor: StaffActor, userId: string): Promise<boolean> {
+  return (await manageableUserIds(actor, [userId])).has(userId);
+}
+
+/**
+ * Days of `leaveTypeId` a user has booked in `year` with the given statuses
+ * (requests starting within the year), optionally excluding one request.
+ */
+async function bookedDays(
+  agencyId: string,
+  userId: string,
+  leaveTypeId: string,
+  year: number,
+  statuses: Array<'pending' | 'approved'>,
+  excludeId?: string,
+): Promise<number> {
+  const { first, last } = yearBounds(year);
+  const rows = await db
+    .select({ id: leaveRequests.id, days: leaveRequests.days, startDay: leaveRequests.startDay })
+    .from(leaveRequests)
+    .where(
+      and(
+        eq(leaveRequests.agencyId, agencyId),
+        eq(leaveRequests.userId, userId),
+        eq(leaveRequests.leaveTypeId, leaveTypeId),
+        inArray(leaveRequests.status, statuses),
+      ),
+    );
+  return rows
+    .filter((r) => r.id !== excludeId && r.startDay >= first && r.startDay <= last)
+    .reduce((sum, r) => sum + r.days, 0);
+}
+
+// GET / — own requests by default; ?scope=all|pending lists what the actor may
+// view (own → own rows; organization → everyone's). ?userId (someone else)
+// needs leaves.view at organization scope.
+leavesRouter.get('/', requires('leaves.view'), async (req, res) => {
+  const actor = getStaffActor(req);
   const scope = (req.query.scope as string | undefined) ?? 'me';
-  const filters = [eq(leaveRequests.agencyId, ctx.agencyId)];
+  const filters = [eq(leaveRequests.agencyId, actor.agencyId)];
 
   if (scope === 'all' || scope === 'pending') {
-    if (!isPrivileged(ctx.role)) throw forbidden('Admins only.');
+    filters.push(subjectScopeFilter(actor, 'leaves.view', leaveRequests.userId));
     if (scope === 'pending') filters.push(eq(leaveRequests.status, 'pending'));
     const reqUser = (req.query.userId as string | undefined)?.trim();
-    if (reqUser) filters.push(eq(leaveRequests.userId, reqUser));
+    if (reqUser) {
+      await resolveSubjectForRead(actor, 'leaves.view', reqUser);
+      filters.push(eq(leaveRequests.userId, reqUser));
+    }
   } else {
-    filters.push(eq(leaveRequests.userId, ctx.userId));
+    filters.push(eq(leaveRequests.userId, actor.userId));
   }
 
   const rows = await db
@@ -177,54 +291,64 @@ leavesRouter.get('/', async (req, res) => {
     .orderBy(desc(leaveRequests.createdAt))
     .limit(200);
 
+  const manageable =
+    canOrg(actor, 'leaves.approve') || canOrg(actor, 'leaves.cancel')
+      ? await manageableUserIds(actor, rows.map((x) => (x.r as LeaveRow).userId))
+      : new Set<string>();
   ok(
     res,
     rows.map((x) =>
-      serializeRequest(x.r, x.typeName, x.typeColor, x.userName ?? x.userEmail),
+      serializeRequest(
+        actor,
+        x.r,
+        manageable.has((x.r as LeaveRow).userId),
+        x.typeName,
+        x.typeColor,
+        x.userName ?? x.userEmail,
+      ),
     ),
   );
 });
 
-// GET /balances?userId&year
-leavesRouter.get('/balances', async (req, res) => {
-  const ctx = getAuth(req);
-  const reqUser = (req.query.userId as string | undefined)?.trim();
-  const userId =
-    reqUser && reqUser !== ctx.userId
-      ? (isPrivileged(ctx.role)
-          ? reqUser
-          : (() => {
-              throw forbidden('Admins only.');
-            })())
-      : ctx.userId;
+// GET /balances?userId&year — `used` = approved days, `pending` = pending days,
+// `remaining` = quota − used − pending (what can still be requested).
+leavesRouter.get('/balances', requires('leaves.view'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const userId = await resolveSubjectForRead(
+    actor,
+    'leaves.view',
+    req.query.userId as string | undefined,
+  );
   const year = Number(req.query.year) || new Date().getFullYear();
   const { first, last } = yearBounds(year);
 
   const types = await db
     .select()
     .from(leaveTypes)
-    .where(and(eq(leaveTypes.agencyId, ctx.agencyId), eq(leaveTypes.active, true)))
+    .where(and(eq(leaveTypes.agencyId, actor.agencyId), eq(leaveTypes.active, true)))
     .orderBy(leaveTypes.sortOrder, leaveTypes.name);
 
-  // Sum approved days by type for requests starting within the year.
   const used = new Map<string, number>();
-  const approvedRows = await db
+  const pending = new Map<string, number>();
+  const rows = await db
     .select({
       leaveTypeId: leaveRequests.leaveTypeId,
       days: leaveRequests.days,
       startDay: leaveRequests.startDay,
+      status: leaveRequests.status,
     })
     .from(leaveRequests)
     .where(
       and(
-        eq(leaveRequests.agencyId, ctx.agencyId),
+        eq(leaveRequests.agencyId, actor.agencyId),
         eq(leaveRequests.userId, userId),
-        eq(leaveRequests.status, 'approved'),
+        inArray(leaveRequests.status, ['approved', 'pending']),
       ),
     );
-  for (const r of approvedRows) {
+  for (const r of rows) {
     if (r.startDay >= first && r.startDay <= last) {
-      used.set(r.leaveTypeId, (used.get(r.leaveTypeId) ?? 0) + r.days);
+      const m = r.status === 'approved' ? used : pending;
+      m.set(r.leaveTypeId, (m.get(r.leaveTypeId) ?? 0) + r.days);
     }
   }
 
@@ -233,6 +357,7 @@ leavesRouter.get('/balances', async (req, res) => {
     userId,
     balances: types.map((t) => {
       const u = used.get(t.id) ?? 0;
+      const p = pending.get(t.id) ?? 0;
       return {
         leaveTypeId: t.id,
         name: t.name,
@@ -240,7 +365,8 @@ leavesRouter.get('/balances', async (req, res) => {
         paid: t.paid,
         annualQuota: t.annualQuota,
         used: u,
-        remaining: t.annualQuota > 0 ? Math.max(0, t.annualQuota - u) : null,
+        pending: p,
+        remaining: t.annualQuota > 0 ? Math.max(0, t.annualQuota - u - p) : null,
       };
     }),
   });
@@ -255,8 +381,10 @@ const applySchema = z.object({
   reason: z.string().trim().max(500).optional(),
 });
 
-leavesRouter.post('/', async (req, res) => {
-  const ctx = getAuth(req);
+// POST / — request leave for YOURSELF (leaves.request is own-only).
+leavesRouter.post('/', requires('leaves.request'), async (req, res) => {
+  const actor = getStaffActor(req);
+  authorize(actor, 'leaves.request', subjectFacts(actor.agencyId, actor.userId));
   const body = applySchema.parse(req.body);
   if (body.startDay > body.endDay) {
     throw badRequest('Start date must be on or before end date.');
@@ -268,16 +396,16 @@ leavesRouter.post('/', async (req, res) => {
     .where(
       and(
         eq(leaveTypes.id, body.leaveTypeId),
-        eq(leaveTypes.agencyId, ctx.agencyId),
+        eq(leaveTypes.agencyId, actor.agencyId),
         eq(leaveTypes.active, true),
       ),
     )
     .limit(1);
   if (!type) throw notFound('Leave type not found.');
 
-  const policy = await loadPolicy(ctx.agencyId);
+  const policy = await loadPolicy(actor.agencyId);
   const days = await countLeaveDays(
-    ctx.agencyId,
+    actor.agencyId,
     policy,
     body.startDay,
     body.endDay,
@@ -288,27 +416,19 @@ leavesRouter.post('/', async (req, res) => {
     throw badRequest('That range has no working days to take as leave.');
   }
 
-  // Quota check (only when the type has a finite quota).
+  // Quota check (finite quotas only): approved AND pending requests count, so
+  // pending requests can't be stacked over the balance.
   if (type.annualQuota > 0) {
-    const year = Number(body.startDay.slice(0, 4));
-    const { first, last } = yearBounds(year);
-    const approvedRows = await db
-      .select({ days: leaveRequests.days, startDay: leaveRequests.startDay })
-      .from(leaveRequests)
-      .where(
-        and(
-          eq(leaveRequests.agencyId, ctx.agencyId),
-          eq(leaveRequests.userId, ctx.userId),
-          eq(leaveRequests.leaveTypeId, type.id),
-          eq(leaveRequests.status, 'approved'),
-        ),
-      );
-    const used = approvedRows
-      .filter((r) => r.startDay >= first && r.startDay <= last)
-      .reduce((sum, r) => sum + r.days, 0);
-    if (used + days > type.annualQuota) {
+    const booked = await bookedDays(
+      actor.agencyId,
+      actor.userId,
+      type.id,
+      Number(body.startDay.slice(0, 4)),
+      ['approved', 'pending'],
+    );
+    if (booked + days > type.annualQuota) {
       throw conflict(
-        `That exceeds your ${type.name} balance (${type.annualQuota - used} day(s) left).`,
+        `That exceeds your ${type.name} balance (${Math.max(0, type.annualQuota - booked)} day(s) left).`,
       );
     }
   }
@@ -316,8 +436,8 @@ leavesRouter.post('/', async (req, res) => {
   const id = newId('lvr');
   await db.insert(leaveRequests).values({
     id,
-    agencyId: ctx.agencyId,
-    userId: ctx.userId,
+    agencyId: actor.agencyId,
+    userId: actor.userId,
     leaveTypeId: type.id,
     startDay: body.startDay,
     endDay: body.endDay,
@@ -329,9 +449,9 @@ leavesRouter.post('/', async (req, res) => {
   });
 
   await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+    agencyId: actor.agencyId,
+    actorType: actor.type,
+    actorId: actor.userId,
     action: 'leave.request',
     entityType: 'leave_request',
     entityId: id,
@@ -339,25 +459,25 @@ leavesRouter.post('/', async (req, res) => {
     ip: req.ip,
   });
 
-  // Notify approvers.
-  const [me] = await db
-    .select({ name: users.fullName, email: users.email })
-    .from(users)
-    .where(eq(users.id, ctx.userId))
-    .limit(1);
-  const approvers = await agencyApprovers(ctx.agencyId, ctx.userId);
-  await notifyMany(approvers, {
-    agencyId: ctx.agencyId,
-    type: 'leave.requested',
-    title: 'Leave request',
-    body: `${me?.name ?? me?.email ?? 'A member'} requested ${days} day(s) of ${type.name}.`,
-    entityType: 'leave_request',
-    entityId: id,
-    link: '/attendance',
-  });
+  const out = await serializeOne(actor, await loadLeave(actor, id), false);
 
-  const [row] = await db.select().from(leaveRequests).where(eq(leaveRequests.id, id));
-  created(res, serializeRequest(row!, type.name, type.colorToken, me?.name ?? me?.email));
+  // Notify the people who can approve it (never the requester).
+  await notifyPermissionHolders(
+    actor.agencyId,
+    'leaves.approve',
+    {
+      agencyId: actor.agencyId,
+      type: 'leave.requested',
+      title: 'Leave request',
+      body: `${out.userName ?? 'A member'} requested ${days} day(s) of ${type.name}.`,
+      entityType: 'leave_request',
+      entityId: id,
+      link: '/attendance',
+    },
+    { excludeUserId: actor.userId },
+  );
+
+  created(res, out);
 });
 
 const decideSchema = z.object({
@@ -365,43 +485,75 @@ const decideSchema = z.object({
   note: z.string().trim().max(500).optional(),
 });
 
-leavesRouter.post('/:id/decide', async (req, res) => {
-  requirePrivileged(req);
-  const ctx = getAuth(req);
+// POST /:id/decide — approve/reject someone else's pending leave (never own;
+// the subject must be manageable). Quota is re-checked at approval.
+leavesRouter.post('/:id/decide', requires('leaves.approve'), async (req, res) => {
+  const actor = getStaffActor(req);
   const id = param(req, 'id');
   const body = decideSchema.parse(req.body);
 
-  const [lr] = await db
-    .select()
-    .from(leaveRequests)
-    .where(and(eq(leaveRequests.id, id), eq(leaveRequests.agencyId, ctx.agencyId)))
-    .limit(1);
-  if (!lr) throw notFound('Leave request not found.');
+  const lr = await loadLeave(actor, id);
+  const manageable = await isManageableSubject(actor, lr.userId);
+  authorize(actor, 'leaves.approve', subjectFacts(actor.agencyId, lr.userId), {
+    view: 'leaves.view',
+    condition: () => decideCondition(actor, lr, manageable),
+  });
   if (lr.status !== 'pending') throw conflict('This request was already decided.');
 
+  if (body.decision === 'approved') {
+    const [type] = await db
+      .select()
+      .from(leaveTypes)
+      .where(and(eq(leaveTypes.id, lr.leaveTypeId), eq(leaveTypes.agencyId, actor.agencyId)))
+      .limit(1);
+    if (type && type.annualQuota > 0) {
+      const approved = await bookedDays(
+        actor.agencyId,
+        lr.userId,
+        type.id,
+        Number(lr.startDay.slice(0, 4)),
+        ['approved'],
+        lr.id,
+      );
+      if (approved + lr.days > type.annualQuota) {
+        throw conflict(
+          `Approving this exceeds the ${type.name} balance (${Math.max(0, type.annualQuota - approved)} day(s) left).`,
+        );
+      }
+    }
+  }
+
+  const now = new Date();
   await db
     .update(leaveRequests)
     .set({
       status: body.decision,
-      decidedBy: ctx.userId,
-      decidedAt: new Date(),
+      decidedBy: actor.userId,
+      decidedAt: now,
       decisionNote: body.note ?? null,
-      updatedAt: new Date(),
+      updatedAt: now,
     })
-    .where(eq(leaveRequests.id, id));
+    .where(
+      and(
+        eq(leaveRequests.id, id),
+        eq(leaveRequests.agencyId, actor.agencyId),
+        eq(leaveRequests.status, 'pending'),
+      ),
+    );
 
   await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+    agencyId: actor.agencyId,
+    actorType: actor.type,
+    actorId: actor.userId,
     action: `leave.${body.decision}`,
     entityType: 'leave_request',
     entityId: id,
+    metadata: { subjectUserId: lr.userId, days: lr.days, startDay: lr.startDay },
     ip: req.ip,
   });
 
   await notify({
-    agencyId: ctx.agencyId,
+    agencyId: actor.agencyId,
     userId: lr.userId,
     type: `leave.${body.decision}`,
     title: `Leave ${body.decision}`,
@@ -414,28 +566,46 @@ leavesRouter.post('/:id/decide', async (req, res) => {
     link: '/attendance',
   });
 
-  const [row] = await db.select().from(leaveRequests).where(eq(leaveRequests.id, id));
-  ok(res, serializeRequest(row!));
+  ok(res, await serializeOne(actor, await loadLeave(actor, id), manageable));
 });
 
-leavesRouter.post('/:id/cancel', async (req, res) => {
-  const ctx = getAuth(req);
+// POST /:id/cancel — own: pending only. Someone else's pending request:
+// leaves.cancel (organization) + manageable. APPROVED leave: leaves.cancel +
+// leaves.approve on it (never own) + manageable.
+leavesRouter.post('/:id/cancel', requires('leaves.cancel'), async (req, res) => {
+  const actor = getStaffActor(req);
   const id = param(req, 'id');
-  const [lr] = await db
-    .select()
-    .from(leaveRequests)
-    .where(and(eq(leaveRequests.id, id), eq(leaveRequests.agencyId, ctx.agencyId)))
-    .limit(1);
-  if (!lr) throw notFound('Leave request not found.');
-  if (lr.userId !== ctx.userId && !isPrivileged(ctx.role)) {
-    throw forbidden('You can only cancel your own requests.');
-  }
-  if (lr.status === 'cancelled' || lr.status === 'rejected') {
-    throw conflict('This request can no longer be cancelled.');
-  }
+  const lr = await loadLeave(actor, id);
+  const manageable = await isManageableSubject(actor, lr.userId);
+  assertCancelAllowed('leaves', actor, lr, manageable);
+
   await db
     .update(leaveRequests)
     .set({ status: 'cancelled', updatedAt: new Date() })
-    .where(eq(leaveRequests.id, id));
+    .where(and(eq(leaveRequests.id, id), eq(leaveRequests.agencyId, actor.agencyId)));
+
+  await audit({
+    agencyId: actor.agencyId,
+    actorType: actor.type,
+    actorId: actor.userId,
+    action: 'leave.cancelled',
+    entityType: 'leave_request',
+    entityId: id,
+    metadata: { subjectUserId: lr.userId, previousStatus: lr.status, startDay: lr.startDay },
+    ip: req.ip,
+  });
+
+  if (lr.userId !== actor.userId) {
+    await notify({
+      agencyId: actor.agencyId,
+      userId: lr.userId,
+      type: 'leave.cancelled',
+      title: 'Leave cancelled',
+      body: `Your leave (${lr.startDay} → ${lr.endDay}) was cancelled.`,
+      entityType: 'leave_request',
+      entityId: id,
+      link: '/attendance',
+    });
+  }
   ok(res, { cancelled: true });
 });

@@ -2,7 +2,7 @@
  * Attendance data service: policy loading, holiday/leave overlays, and the
  * day-by-day month builder shared by the attendance + leave routers.
  */
-import { and, eq, gte, lte, inArray } from 'drizzle-orm';
+import { and, eq, gte, lte, lt, inArray, isNotNull, isNull } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   attendancePolicy,
@@ -384,10 +384,16 @@ export function yearBounds(year: number): { first: string; last: string } {
   return { first: `${year}-01-01`, last: `${year}-12-31` };
 }
 
+const AUTO_RESET_NOTE = 'Auto-reset after 12 AM: missing checkout marked half_day';
+
 /**
- * Automatically resets / settles unclosed punches from past days (after 12 AM midnight).
- * Any attendance record where checkInAt IS NOT NULL, checkOutAt IS NULL, and day < todayKey
- * is automatically marked as 'half_day' so the user can regularize it and check in fresh today.
+ * Settle unclosed punches from past days (after 12 AM midnight): any record with
+ * checkInAt set, checkOutAt NULL and day < today is marked 'half_day' so the
+ * user can regularize it and check in fresh today.
+ *
+ * Idempotent: a record already settled (carries the auto-reset note) is never
+ * touched again. This is a WRITE; call it only from write paths (check-in /
+ * check-out), never from a GET.
  */
 export async function autoResetStalePunches(
   agencyId: string,
@@ -402,14 +408,13 @@ export async function autoResetStalePunches(
       and(
         eq(attendanceRecords.agencyId, agencyId),
         ...(userId ? [eq(attendanceRecords.userId, userId)] : []),
-        lte(attendanceRecords.day, todayKey),
+        lt(attendanceRecords.day, todayKey),
+        isNotNull(attendanceRecords.checkInAt),
+        isNull(attendanceRecords.checkOutAt),
       ),
     );
 
-  const toReset = stale.filter(
-    (r) => r.day < todayKey && r.checkInAt != null && r.checkOutAt == null,
-  );
-
+  const toReset = stale.filter((r) => !(r.note ?? '').includes(AUTO_RESET_NOTE));
   if (toReset.length === 0) return 0;
 
   const now = new Date();
@@ -419,12 +424,10 @@ export async function autoResetStalePunches(
       .set({
         status: 'half_day',
         workedMinutes: 0,
-        note: r.note
-          ? `${r.note} (Auto-reset after 12 AM: missing checkout marked half_day)`
-          : 'Auto-reset after 12 AM: missing checkout marked half_day',
+        note: r.note ? `${r.note} (${AUTO_RESET_NOTE})` : AUTO_RESET_NOTE,
         updatedAt: now,
       })
-      .where(eq(attendanceRecords.id, r.id));
+      .where(and(eq(attendanceRecords.id, r.id), eq(attendanceRecords.agencyId, agencyId)));
   }
 
   return toReset.length;
