@@ -35,7 +35,8 @@ export interface ComputedTotals {
  * For each line: amount = round(quantity * rate); lineTax = round(amount * gstRate/100).
  * subtotal = Σ amount; taxTotal = Σ lineTax.
  * Interstate → igst = taxTotal (cgst = sgst = 0).
- * Intrastate → sgst = round(taxTotal/2); cgst = taxTotal - sgst (keeps the sum exact).
+ * Intrastate → cgst = round(taxTotal/2); sgst = taxTotal - cgst (keeps the sum exact;
+ * matches every invoice already stored by the routes and the Refrens import).
  * total = subtotal + taxTotal.
  */
 export function computeInvoiceTotals(
@@ -57,8 +58,8 @@ export function computeInvoiceTotals(
   if (isInterstate) {
     igst = taxTotal;
   } else {
-    sgst = Math.round(taxTotal / 2);
-    cgst = taxTotal - sgst;
+    cgst = Math.round(taxTotal / 2);
+    sgst = taxTotal - cgst;
   }
 
   const total = subtotal + taxTotal;

@@ -1,5 +1,19 @@
 import { describe, it, expect, beforeAll } from 'vitest';
-import { BASE, signupAgency, data, type Agent } from './helpers';
+import supertest from 'supertest';
+import { app, BASE, signupAgency, data, type Agent } from './helpers';
+
+/** Send (mints the public link) and accept through it, as the client would. */
+async function sendAndAccept(owner: Agent, proposalId: string) {
+  const sent = await owner
+    .post(`${BASE}/proposals/${proposalId}/send`)
+    .send({ recipientEmail: 'buyer@client.test' });
+  expect(sent.status).toBe(200);
+  const token = String(data(sent).publicUrl).split('/').pop();
+  const acc = await supertest(app)
+    .post(`${BASE}/proposals/public/${token}/accept`)
+    .send({ acceptedBy: 'Buyer' });
+  expect(acc.status).toBe(200);
+}
 
 /**
  * Proposal → Agreement conversion, end-to-end: a client-linked proposal converts
@@ -36,9 +50,18 @@ describe('proposal → agreement conversion', () => {
       }),
     );
 
+    // Only an accepted proposal converts.
+    const early = await owner.post(`${BASE}/proposals/${proposal.id}/convert-to-agreement`).send({});
+    expect(early.status).toBe(409);
+    await sendAndAccept(owner, proposal.id);
+
     const res = await owner.post(`${BASE}/proposals/${proposal.id}/convert-to-agreement`).send({});
     expect([200, 201]).toContain(res.status);
     const { agreementId, agreementNumber } = data(res);
+
+    // Exactly once.
+    const again = await owner.post(`${BASE}/proposals/${proposal.id}/convert-to-agreement`).send({});
+    expect(again.status).toBe(409);
     expect(agreementId).toBeTruthy();
     expect(agreementNumber).toMatch(/^AGR-/);
 
@@ -72,6 +95,7 @@ describe('proposal → agreement conversion', () => {
         content: { sections: [], deliverables: [], terms: [] },
       }),
     );
+    await sendAndAccept(owner, proposal.id);
     const res = await owner.post(`${BASE}/proposals/${proposal.id}/convert-to-agreement`).send({});
     expect(res.status).toBe(400);
     expect(String(res.body?.error?.message ?? '')).toMatch(/client/i);

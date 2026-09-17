@@ -1,32 +1,52 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, desc, eq } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   agreements,
   agreementTemplates,
   clients,
   agencies,
+  projects,
+  proposals,
   users,
 } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
-import { newId, newOpaqueToken } from '../lib/ids.js';
-import { notFound, badRequest } from '../lib/errors.js';
-import { requireAuth } from '../middleware/auth.js';
-import { requireModuleRW } from '../middleware/permissions.js';
-import { getAuth, requireClientAccess } from '../middleware/tenant.js';
+import { newId } from '../lib/ids.js';
+import { notFound, forbidden, conflict, invalidState } from '../lib/errors.js';
 import { audit } from '../services/audit.js';
 import { broadcastPortalRefresh } from '../realtime/io.js';
-import { notifyMany, agencyOwners } from '../services/notifications.js';
+import { notifyMany } from '../services/notifications.js';
 import { sendEmail } from '../services/email.js';
 import { getFrontendOrigin } from '../lib/frontend-url.js';
+import { authenticate, getStaffActor, requires, requiresAny } from '../authz/http.js';
+import { authorize, canOrg, capabilities, check } from '../authz/engine.js';
+import { actorAuditId, type Actor } from '../authz/actor.js';
+import { requireInAgency } from '../authz/tenancy.js';
 import {
-  mintClientPortalLogin,
-  sendClientPortalLoginEmail,
-} from '../lib/client-portal-login.js';
+  activeLinkExpiry,
+  agreementFactsOf,
+  assertAgreementSignable,
+  assertAgreementUnsigned,
+  assertSignatureDataUrl,
+  consumeDocumentLink,
+  containsMoney,
+  defaultLinkExpiry,
+  deliverViaPortalLogin,
+  escapeHtml,
+  loadAgreement,
+  mintDocumentLink,
+  objectViewerIds,
+  ownScopeFilter,
+  redactMoney,
+  resolveAgreementLink,
+  revokeDocumentLinks,
+} from '../authz/policies/business.js';
 import { generateAiAgreementDraft, enhanceTextWithAi } from '../services/ai.js';
 
 export const agreementsRouter = Router();
+
+type AgreementRow = typeof agreements.$inferSelect;
 
 function safeJson(s: string): unknown {
   try {
@@ -37,17 +57,34 @@ function safeJson(s: string): unknown {
 }
 
 // ============================================================
-//  PUBLIC DIGITAL SIGNING (Client view & sign by token)
+//  PUBLIC DIGITAL SIGNING (client view & sign by document link)
 // ============================================================
-agreementsRouter.get('/public/:token', async (req, res) => {
-  const token = param(req, 'token');
-  const [a] = await db
-    .select()
-    .from(agreements)
-    .where(eq(agreements.token, token))
-    .limit(1);
 
-  if (!a) throw notFound('Agreement not found or link has expired.');
+/**
+ * Minimal anonymous DTO: no signer IP/email/signature image, no staff ids,
+ * project/proposal ids or tokens.
+ */
+function publicAgreement(a: AgreementRow) {
+  return {
+    id: a.id,
+    agreementNumber: a.agreementNumber,
+    title: a.title,
+    status: a.status,
+    currency: a.currency,
+    retainerPaise: a.retainerPaise,
+    totalValuePaise: a.totalValuePaise,
+    effectiveDate: toIso(a.effectiveDate),
+    expirationDate: toIso(a.expirationDate),
+    terms: safeJson(a.termsJson),
+    fileUrl: a.fileUrl,
+    sentAt: toIso(a.sentAt),
+    signedAt: toIso(a.signedAt),
+    signerName: a.signerName,
+  };
+}
+
+agreementsRouter.get('/public/:token', async (req, res) => {
+  const { row: a } = await resolveAgreementLink(param(req, 'token'));
 
   const [agency] = await db
     .select({ name: agencies.name, logoUrl: agencies.logoUrl, brandColor: agencies.brandColor })
@@ -56,15 +93,17 @@ agreementsRouter.get('/public/:token', async (req, res) => {
     .limit(1);
 
   const [client] = await db
-    .select({ name: clients.name, contactEmail: clients.contactEmail, billingAddress: clients.billingAddress })
+    .select({ name: clients.name, billingAddress: clients.billingAddress })
     .from(clients)
-    .where(eq(clients.id, a.clientId))
+    .where(and(eq(clients.id, a.clientId), eq(clients.agencyId, a.agencyId)))
     .limit(1);
 
+  const signed = !!a.signedAt || a.status !== 'sent';
   ok(res, {
-    ...serializeAgreement(a, true),
+    ...publicAgreement(a),
     agency,
-    client,
+    // Party details are shown for signing only; never on an executed contract.
+    client: client ? { name: client.name, ...(signed ? {} : { billingAddress: client.billingAddress }) } : null,
   });
 });
 
@@ -75,47 +114,48 @@ const signSchema = z.object({
 });
 
 agreementsRouter.post('/public/:token/sign', async (req, res) => {
-  const token = param(req, 'token');
   const body = signSchema.parse(req.body);
+  assertSignatureDataUrl(body.signatureDataUrl);
+  const { link, row: a } = await resolveAgreementLink(param(req, 'token'));
+  if (link.consumedAt) throw conflict('This agreement has already been signed.');
+  assertAgreementSignable(a);
 
-  const [a] = await db
-    .select()
-    .from(agreements)
-    .where(eq(agreements.token, token))
-    .limit(1);
-
-  if (!a) throw notFound('Agreement not found.');
-  if (a.status === 'signed' || a.status === 'active') {
-    return ok(res, { message: 'Agreement is already signed.' });
-  }
-
-  await db
+  const signedAt = new Date();
+  const updated = await db
     .update(agreements)
     .set({
       status: 'signed',
-      signedAt: new Date(),
+      signedAt,
       signerName: body.signerName,
       signerEmail: body.signerEmail,
       signerIp: req.ip ?? 'unknown',
       signatureDataUrl: body.signatureDataUrl,
-      updatedAt: new Date(),
+      updatedAt: signedAt,
     })
-    .where(eq(agreements.id, a.id));
+    .where(
+      and(
+        eq(agreements.id, a.id),
+        eq(agreements.agencyId, a.agencyId),
+        eq(agreements.status, 'sent'),
+        isNull(agreements.signedAt),
+      ),
+    )
+    .returning({ id: agreements.id });
+  if (!updated.length) throw conflict('This agreement has already been signed.');
+  await consumeDocumentLink(link.id);
 
   await audit({
     agencyId: a.agencyId,
-    actorType: 'client',
-    actorId: body.signerEmail,
+    actorType: 'portal_link',
+    actorId: `document_link:${link.id}`,
     action: 'agreement.sign',
     entityType: 'agreement',
     entityId: a.id,
-    metadata: { signerName: body.signerName, signerIp: req.ip },
+    metadata: { signerName: body.signerName, signerEmail: body.signerEmail, signerIp: req.ip },
     ip: req.ip,
   });
 
-  // Notify the owner(s) in real time (bell + socket + push). Agreements are an
-  // owner-only Business module, so only owners are alerted.
-  await notifyMany(await agencyOwners(a.agencyId), {
+  await notifyMany(await objectViewerIds(a.agencyId, 'agreements.view', a.createdBy), {
     agencyId: a.agencyId,
     type: 'agreement.signed',
     title: `Agreement signed — ${a.title}`,
@@ -125,22 +165,43 @@ agreementsRouter.post('/public/:token/sign', async (req, res) => {
     link: '/agreements',
   });
 
-  ok(res, { signed: true, signedAt: new Date().toISOString() });
+  ok(res, { signed: true, signedAt: signedAt.toISOString() });
 });
 
 // ============================================================
 //  AUTHENTICATED AGENCY ROUTES
 // ============================================================
 const authRouter = Router();
-authRouter.use(requireAuth);
-// Owner-only Business module (public sign routes are mounted above).
-authRouter.use(requireModuleRW('business'));
+authRouter.use(authenticate);
+
+const AGREEMENT_CAPABILITIES = [
+  'agreements.update',
+  'agreements.delete',
+  'agreements.send',
+  'agreements.view_pricing',
+];
+
+function auditAgreement(actor: Actor, action: string, id: string, ip: string | undefined, metadata?: Record<string, unknown>) {
+  return audit({
+    agencyId: actor.agencyId,
+    actorType: actor.type,
+    actorId: actorAuditId(actor),
+    action,
+    entityType: 'agreement',
+    entityId: id,
+    metadata,
+    ip,
+  });
+}
 
 function serializeAgreement(
-  a: typeof agreements.$inferSelect,
-  showFinance = false,
-  extra?: { clientName?: string | null; createdByName?: string | null },
+  actor: Actor,
+  a: AgreementRow,
+  extra?: { clientName?: string | null; createdByName?: string | null; linkExpiresAt?: Date | null },
 ) {
+  const facts = agreementFactsOf(a);
+  const showPricing = check(actor, 'agreements.view_pricing', facts);
+  const terms = safeJson(a.termsJson);
   return {
     id: a.id,
     agreementNumber: a.agreementNumber,
@@ -152,12 +213,15 @@ function serializeAgreement(
     templateId: a.templateId,
     status: a.status,
     currency: a.currency,
-    retainerPaise: showFinance ? a.retainerPaise : null,
-    totalValuePaise: showFinance ? a.totalValuePaise : null,
+    retainerPaise: showPricing ? a.retainerPaise : null,
+    totalValuePaise: showPricing ? a.totalValuePaise : null,
     effectiveDate: toIso(a.effectiveDate),
     expirationDate: toIso(a.expirationDate),
-    terms: safeJson(a.termsJson),
-    token: a.token,
+    terms: showPricing ? terms : redactMoney(terms),
+    pricingRedacted: !showPricing,
+    // Public links are hashed and only delivered by email on send.
+    token: null,
+    publicLinkExpiresAt: extra?.linkExpiresAt !== undefined ? toIso(extra.linkExpiresAt) : undefined,
     sentAt: toIso(a.sentAt),
     signedAt: toIso(a.signedAt),
     signerName: a.signerName,
@@ -169,28 +233,43 @@ function serializeAgreement(
     createdByName: extra?.createdByName ?? null,
     createdAt: toIso(a.createdAt),
     updatedAt: toIso(a.updatedAt),
+    capabilities: capabilities(actor, facts, AGREEMENT_CAPABILITIES),
   };
 }
 
+async function checkRefs(
+  actor: Actor,
+  refs: { clientId?: string | null; proposalId?: string | null; projectId?: string | null; templateId?: string | null },
+) {
+  if (refs.clientId) await requireInAgency(clients, actor.agencyId, refs.clientId, 'Client');
+  if (refs.proposalId) await requireInAgency(proposals, actor.agencyId, refs.proposalId, 'Proposal');
+  if (refs.projectId) await requireInAgency(projects, actor.agencyId, refs.projectId, 'Project');
+  if (refs.templateId) await requireInAgency(agreementTemplates, actor.agencyId, refs.templateId, 'Template');
+}
+
 // ---- TEMPLATES ----
-authRouter.get('/templates', async (req, res) => {
-  const ctx = getAuth(req);
+authRouter.get('/templates', requires('agreements.view'), async (req, res) => {
+  const actor = getStaffActor(req);
   const rows = await db
     .select()
     .from(agreementTemplates)
-    .where(eq(agreementTemplates.agencyId, ctx.agencyId))
+    .where(eq(agreementTemplates.agencyId, actor.agencyId))
     .orderBy(desc(agreementTemplates.createdAt));
+  const showPricing = canOrg(actor, 'agreements.view_pricing');
 
   ok(
     res,
-    rows.map((t) => ({
-      id: t.id,
-      name: t.name,
-      type: t.type,
-      description: t.description,
-      terms: safeJson(t.termsJson),
-      createdAt: toIso(t.createdAt),
-    })),
+    rows.map((t) => {
+      const terms = safeJson(t.termsJson);
+      return {
+        id: t.id,
+        name: t.name,
+        type: t.type,
+        description: t.description,
+        terms: showPricing ? terms : redactMoney(terms),
+        createdAt: toIso(t.createdAt),
+      };
+    }),
   );
 });
 
@@ -201,21 +280,27 @@ const createTemplateSchema = z.object({
   terms: z.record(z.string(), z.any()),
 });
 
-authRouter.post('/templates', async (req, res) => {
-  const ctx = getAuth(req);
+authRouter.post('/templates', requires('agreements.manage_templates'), async (req, res) => {
+  const actor = getStaffActor(req);
   const body = createTemplateSchema.parse(req.body);
+  if (containsMoney(body.terms) && !canOrg(actor, 'agreements.view_pricing')) {
+    throw forbidden("You don't have permission to set agreement values.");
+  }
   const id = newId('atpl');
 
   await db.insert(agreementTemplates).values({
     id,
-    agencyId: ctx.agencyId,
+    agencyId: actor.agencyId,
     name: body.name,
     type: body.type ?? 'msa',
     description: body.description ?? null,
     termsJson: JSON.stringify(body.terms),
   });
 
-  const [row] = await db.select().from(agreementTemplates).where(eq(agreementTemplates.id, id));
+  const [row] = await db
+    .select()
+    .from(agreementTemplates)
+    .where(and(eq(agreementTemplates.id, id), eq(agreementTemplates.agencyId, actor.agencyId)));
   created(res, {
     id: row!.id,
     name: row!.name,
@@ -227,12 +312,14 @@ authRouter.post('/templates', async (req, res) => {
 });
 
 // ---- LIST AGREEMENTS ----
-authRouter.get('/', async (req, res) => {
-  const ctx = getAuth(req);
-  const isOwner = ctx.role === 'owner';
+authRouter.get('/', requires('agreements.view'), async (req, res) => {
+  const actor = getStaffActor(req);
   const clientId = req.query.clientId as string | undefined;
 
-  const filters = [eq(agreements.agencyId, ctx.agencyId)];
+  const filters = [
+    eq(agreements.agencyId, actor.agencyId),
+    ownScopeFilter(actor, 'agreements.view', agreements.createdBy),
+  ];
   if (clientId) filters.push(eq(agreements.clientId, clientId));
 
   const rows = await db
@@ -242,15 +329,15 @@ authRouter.get('/', async (req, res) => {
       createdByName: users.fullName,
     })
     .from(agreements)
-    .leftJoin(clients, eq(clients.id, agreements.clientId))
-    .leftJoin(users, eq(users.id, agreements.createdBy))
+    .leftJoin(clients, and(eq(clients.id, agreements.clientId), eq(clients.agencyId, agreements.agencyId)))
+    .leftJoin(users, and(eq(users.id, agreements.createdBy), eq(users.agencyId, agreements.agencyId)))
     .where(and(...filters))
     .orderBy(desc(agreements.createdAt));
 
   ok(
     res,
     rows.map((r) =>
-      serializeAgreement(r.a, isOwner, {
+      serializeAgreement(actor, r.a, {
         clientName: r.clientName,
         createdByName: r.createdByName,
       }),
@@ -273,18 +360,24 @@ const createAgreementSchema = z.object({
   terms: z.record(z.string(), z.any()),
 });
 
-authRouter.post('/', async (req, res) => {
-  const ctx = getAuth(req);
+authRouter.post('/', requires('agreements.create'), async (req, res) => {
+  const actor = getStaffActor(req);
   const body = createAgreementSchema.parse(req.body);
-  const id = newId('agr');
-  const token = newOpaqueToken().raw;
+  await checkRefs(actor, body);
 
+  const setsMoney =
+    body.retainerPaise !== undefined || body.totalValuePaise !== undefined || containsMoney(body.terms);
+  if (setsMoney && !check(actor, 'agreements.view_pricing', { agencyId: actor.agencyId, ownerIds: [actor.userId] })) {
+    throw forbidden("You don't have permission to set agreement values.");
+  }
+
+  const id = newId('agr');
   const year = new Date().getFullYear();
   const agreementNumber = `AGR-${year}-${String(Date.now() % 10000).padStart(4, '0')}`;
 
   await db.insert(agreements).values({
     id,
-    agencyId: ctx.agencyId,
+    agencyId: actor.agencyId,
     clientId: body.clientId,
     proposalId: body.proposalId ?? null,
     projectId: body.projectId ?? null,
@@ -298,100 +391,94 @@ authRouter.post('/', async (req, res) => {
     totalValuePaise: body.totalValuePaise ?? 0,
     currency: body.currency ?? 'INR',
     termsJson: JSON.stringify(body.terms),
-    token,
-    createdBy: ctx.userId,
+    // No public token at creation: links are minted (hashed) on send.
+    token: null,
+    createdBy: actor.userId,
   });
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
-    action: 'agreement.create',
-    entityType: 'agreement',
-    entityId: id,
-    ip: req.ip,
-  });
+  await auditAgreement(actor, 'agreement.create', id, req.ip);
 
-  const [row] = await db.select().from(agreements).where(eq(agreements.id, id));
-  created(res, serializeAgreement(row!, ctx.role === 'owner'));
+  const loaded = await loadAgreement(actor, id);
+  created(res, serializeAgreement(actor, loaded!.row));
 });
 
 // ---- DETAIL ----
-authRouter.get('/:id', async (req, res) => {
-  const ctx = getAuth(req);
-  const [row] = await db
-    .select({
-      a: agreements,
-      clientName: clients.name,
-      createdByName: users.fullName,
-    })
+authRouter.get('/:id', requires('agreements.view'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const loaded = await loadAgreement(actor, param(req, 'id'));
+  authorize(actor, 'agreements.view', loaded?.facts);
+  const a = loaded!.row;
+  const [names] = await db
+    .select({ clientName: clients.name, createdByName: users.fullName })
     .from(agreements)
-    .leftJoin(clients, eq(clients.id, agreements.clientId))
-    .leftJoin(users, eq(users.id, agreements.createdBy))
-    .where(and(eq(agreements.id, param(req, 'id')), eq(agreements.agencyId, ctx.agencyId)))
+    .leftJoin(clients, and(eq(clients.id, agreements.clientId), eq(clients.agencyId, agreements.agencyId)))
+    .leftJoin(users, and(eq(users.id, agreements.createdBy), eq(users.agencyId, agreements.agencyId)))
+    .where(eq(agreements.id, a.id))
     .limit(1);
 
-  if (!row) throw notFound('Agreement not found.');
   ok(
     res,
-    serializeAgreement(row.a, ctx.role === 'owner', {
-      clientName: row.clientName,
-      createdByName: row.createdByName,
+    serializeAgreement(actor, a, {
+      clientName: names?.clientName ?? null,
+      createdByName: names?.createdByName ?? null,
+      linkExpiresAt: await activeLinkExpiry(actor.agencyId, 'agreement', a.id),
     }),
   );
 });
 
 // ---- SEND AGREEMENT FOR SIGNING ----
-authRouter.post('/:id/send', async (req, res) => {
-  const ctx = getAuth(req);
-  const agreementId = param(req, 'id');
-  const body = z.object({ recipientEmail: z.string().email(), message: z.string().optional() }).parse(req.body);
+authRouter.post('/:id/send', requires('agreements.send'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const body = z.object({ recipientEmail: z.string().email(), message: z.string().max(2000).optional() }).parse(req.body);
+  const loaded = await loadAgreement(actor, param(req, 'id'));
+  authorize(actor, 'agreements.send', loaded?.facts, { view: 'agreements.view' });
+  const a = loaded!.row;
+  assertAgreementUnsigned(a);
+  if (a.expirationDate && a.expirationDate.getTime() <= Date.now()) {
+    throw invalidState('This agreement is past its expiration date. Update it before sending.');
+  }
 
-  const [a] = await db
-    .select()
-    .from(agreements)
-    .where(and(eq(agreements.id, agreementId), eq(agreements.agencyId, ctx.agencyId)))
-    .limit(1);
-
-  if (!a) throw notFound('Agreement not found.');
-
-  const [agency] = await db.select().from(agencies).where(eq(agencies.id, ctx.agencyId)).limit(1);
-  const signUrl = `${getFrontendOrigin(req)}/agreements/sign/${a.token}`;
+  const [agency] = await db.select().from(agencies).where(eq(agencies.id, actor.agencyId)).limit(1);
   const agencyName = agency?.name ?? 'Creative Monk';
+  const safeTitle = escapeHtml(a.title);
+  const safeMessage = body.message ? escapeHtml(body.message) : '';
 
-  // Document-mode agreements (an uploaded file, no in-app terms) have
-  // nothing for the bare token link to render — mail the client their
-  // portal sign-in instead, so they can actually open the file.
+  // Document-mode agreements (an uploaded file, no in-app terms) are delivered
+  // through the client portal.
   const viaPortalLogin = !!(a.fileUrl && a.clientId);
+  let signUrl: string | null = null;
+  let linkExpiresAt: Date | null = null;
   if (viaPortalLogin) {
-    const client = await requireClientAccess(ctx, a.clientId);
-    const login = await mintClientPortalLogin({
-      agencyId: ctx.agencyId,
-      clientId: client.id,
-      clientName: client.name,
-      clientContactEmail: client.contactEmail,
-      email: body.recipientEmail,
-    });
-    await sendClientPortalLoginEmail({
+    await deliverViaPortalLogin({
+      actor,
       req,
+      clientId: a.clientId,
+      recipientEmail: body.recipientEmail,
       agencyName,
-      clientName: client.name,
-      to: body.recipientEmail,
-      email: login.email,
-      password: login.password,
-      note: `${body.message ? `${body.message} ` : ''}A new agreement — "${a.title}" — is ready to review and sign in your portal.`.trim(),
+      note: `${safeMessage ? `${safeMessage} ` : ''}A new agreement — "${safeTitle}" — is ready to review and sign in your portal.`.trim(),
     });
+    await revokeDocumentLinks(actor.agencyId, 'agreement', a.id);
   } else {
+    const link = await mintDocumentLink({
+      agencyId: actor.agencyId,
+      objectType: 'agreement',
+      objectId: a.id,
+      expiresAt: defaultLinkExpiry(a.expirationDate),
+      createdBy: actor.userId,
+    });
+    linkExpiresAt = link.expiresAt;
+    signUrl = `${getFrontendOrigin(req)}/agreements/sign/${link.raw}`;
+    const safeAgency = escapeHtml(agencyName);
     await sendEmail({
       to: body.recipientEmail,
       subject: `Action Required: Please sign ${a.title} with ${agencyName}`,
       text: `Hello, Your agreement "${a.title}" is ready for review and digital signature: ${signUrl}`,
       html: `
         <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #0c0d0e; color: #f3f4f6; border-radius: 12px;">
-          <h2 style="color: #ff6b00; margin-top: 0;">${agencyName} Agreement</h2>
+          <h2 style="color: #ff6b00; margin-top: 0;">${safeAgency} Agreement</h2>
           <p>Hello,</p>
-          <p>Your agreement <strong>${a.title}</strong> is ready for review and digital signature.</p>
-          ${body.message ? `<p style="background: #18191b; padding: 12px; border-radius: 8px; color: #d1d5db;">${body.message}</p>` : ''}
+          <p>Your agreement <strong>${safeTitle}</strong> is ready for review and digital signature.</p>
+          ${safeMessage ? `<p style="background: #18191b; padding: 12px; border-radius: 8px; color: #d1d5db;">${safeMessage}</p>` : ''}
           <div style="margin: 30px 0; text-align: center;">
             <a href="${signUrl}" style="background: #ff6b00; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-weight: bold; display: inline-block;">
               Review & Sign Agreement &rarr;
@@ -410,20 +497,15 @@ authRouter.post('/:id/send', async (req, res) => {
       sentAt: new Date(),
       updatedAt: new Date(),
     })
-    .where(eq(agreements.id, a.id));
+    .where(and(eq(agreements.id, a.id), eq(agreements.agencyId, actor.agencyId)));
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
-    action: 'agreement.send',
-    entityType: 'agreement',
-    entityId: a.id,
-    metadata: { recipientEmail: body.recipientEmail, viaPortalLogin },
-    ip: req.ip,
+  await auditAgreement(actor, 'agreement.send', a.id, req.ip, {
+    recipientEmail: body.recipientEmail,
+    viaPortalLogin,
+    linkExpiresAt: linkExpiresAt?.toISOString() ?? null,
   });
 
-  ok(res, { sent: true, signUrl });
+  ok(res, { sent: true, signUrl, linkExpiresAt: toIso(linkExpiresAt) });
 });
 
 // ---- AI AGREEMENT GENERATION ----
@@ -434,7 +516,8 @@ const aiGenerateAgreementSchema = z.object({
   retainerRupees: z.number().int().min(0).optional(),
 });
 
-authRouter.post('/ai/generate', async (req, res) => {
+authRouter.post('/ai/generate', requires('agreements.create'), async (req, res) => {
+  const actor = getStaffActor(req);
   const body = aiGenerateAgreementSchema.parse(req.body);
   const result = await generateAiAgreementDraft({
     prompt: body.prompt,
@@ -442,7 +525,7 @@ authRouter.post('/ai/generate', async (req, res) => {
     agreementType: body.agreementType,
     retainerRupees: body.retainerRupees,
   });
-  ok(res, result);
+  ok(res, canOrg(actor, 'agreements.view_pricing') ? result : redactMoney(result));
 });
 
 // ---- AI TEXT ENHANCEMENT ----
@@ -452,7 +535,7 @@ const aiEnhanceAgreementSchema = z.object({
   instruction: z.string().trim().max(500).optional(),
 });
 
-authRouter.post('/ai/enhance', async (req, res) => {
+authRouter.post('/ai/enhance', requiresAny('agreements.create', 'agreements.update'), async (req, res) => {
   const body = aiEnhanceAgreementSchema.parse(req.body);
   const result = await enhanceTextWithAi({
     text: body.text,
@@ -476,18 +559,23 @@ const updateAgreementSchema = z.object({
   terms: z.record(z.string(), z.any()).optional(),
 });
 
-authRouter.put('/:id', async (req, res) => {
-  const ctx = getAuth(req);
-  const agreementId = param(req, 'id');
+authRouter.put('/:id', requires('agreements.update'), async (req, res) => {
+  const actor = getStaffActor(req);
   const body = updateAgreementSchema.parse(req.body);
+  const loaded = await loadAgreement(actor, param(req, 'id'));
+  authorize(actor, 'agreements.update', loaded?.facts, { view: 'agreements.view' });
+  const a = loaded!.row;
+  assertAgreementUnsigned(a);
+  await checkRefs(actor, body);
 
-  const [a] = await db
-    .select()
-    .from(agreements)
-    .where(and(eq(agreements.id, agreementId), eq(agreements.agencyId, ctx.agencyId)))
-    .limit(1);
-
-  if (!a) throw notFound('Agreement not found.');
+  if (!check(actor, 'agreements.view_pricing', loaded!.facts)) {
+    const setsMoney = body.retainerPaise !== undefined || body.totalValuePaise !== undefined;
+    const touchesPricedTerms =
+      body.terms !== undefined && (containsMoney(body.terms) || containsMoney(safeJson(a.termsJson)));
+    if (setsMoney || touchesPricedTerms) {
+      throw forbidden("You don't have permission to change agreement values.");
+    }
+  }
 
   const patch: Partial<typeof agreements.$inferInsert> = {
     updatedAt: new Date(),
@@ -504,42 +592,48 @@ authRouter.put('/:id', async (req, res) => {
   if (body.currency !== undefined) patch.currency = body.currency;
   if (body.terms !== undefined) patch.termsJson = JSON.stringify(body.terms);
 
-  await db.update(agreements).set(patch).where(eq(agreements.id, a.id));
+  // Re-targeting the agreement to another client kills any link already sent.
+  if (body.clientId !== undefined && body.clientId !== a.clientId) {
+    await revokeDocumentLinks(actor.agencyId, 'agreement', a.id);
+  }
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
-    action: 'agreement.update',
-    entityType: 'agreement',
-    entityId: a.id,
-    ip: req.ip,
+  const updated = await db
+    .update(agreements)
+    .set(patch)
+    .where(
+      and(
+        eq(agreements.id, a.id),
+        eq(agreements.agencyId, actor.agencyId),
+        inArray(agreements.status, ['draft', 'sent']),
+        isNull(agreements.signedAt),
+      ),
+    )
+    .returning({ id: agreements.id });
+  if (!updated.length) throw invalidState('This agreement was signed and can no longer be changed.');
+
+  await auditAgreement(actor, 'agreement.update', a.id, req.ip, {
+    fields: Object.keys(patch).filter((k) => k !== 'updatedAt'),
   });
 
-  const [updated] = await db.select().from(agreements).where(eq(agreements.id, a.id));
-  ok(res, serializeAgreement(updated!, ctx.role === 'owner'));
+  const reloaded = await loadAgreement(actor, a.id);
+  ok(res, serializeAgreement(actor, reloaded!.row));
 });
 
 // DELETE /agreements/:id — remove a not-yet-executed agreement. Signed/active
-// contracts are legally binding and cannot be deleted (delete needs manage).
-authRouter.delete('/:id', async (req, res) => {
-  const ctx = getAuth(req);
-  const agreementId = param(req, 'id');
-  const [a] = await db
-    .select()
-    .from(agreements)
-    .where(and(eq(agreements.id, agreementId), eq(agreements.agencyId, ctx.agencyId)))
-    .limit(1);
-  if (!a) throw notFound('Agreement not found.');
-  // Only an un-executed agreement may be removed. Once it has been signed it is
-  // a binding record (and `terminated`/`expired` are the history of one), so
-  // those are kept for the audit trail.
+// contracts are legally binding and cannot be deleted.
+authRouter.delete('/:id', requires('agreements.delete'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const loaded = await loadAgreement(actor, param(req, 'id'));
+  if (!loaded) throw notFound('Agreement not found.');
+  authorize(actor, 'agreements.delete', loaded.facts, { view: 'agreements.view' });
+  const a = loaded.row;
   if (a.status !== 'draft' && a.status !== 'sent') {
-    throw badRequest(
+    throw invalidState(
       `Only draft or unsigned agreements can be deleted — this one is ${a.status}.`,
     );
   }
-  await db.delete(agreements).where(eq(agreements.id, a.id));
+  await revokeDocumentLinks(actor.agencyId, 'agreement', a.id);
+  await db.delete(agreements).where(and(eq(agreements.id, a.id), eq(agreements.agencyId, actor.agencyId)));
 
   // A 'sent' agreement is visible in the client portal, so tell any open portal
   // session to refetch immediately rather than showing a document that is gone.
@@ -549,17 +643,8 @@ authRouter.delete('/:id', async (req, res) => {
       agreementId: a.id,
     });
   }
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
-    action: 'agreement.delete',
-    entityType: 'agreement',
-    entityId: a.id,
-    ip: req.ip,
-  });
+  await auditAgreement(actor, 'agreement.delete', a.id, req.ip, { status: a.status, title: a.title });
   ok(res, { deleted: true, id: a.id });
 });
 
 agreementsRouter.use('/', authRouter);
-

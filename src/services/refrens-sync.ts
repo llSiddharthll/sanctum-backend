@@ -288,6 +288,11 @@ export async function pullInvoices(
     counters.errors.push('Refrens is not configured.');
     return counters;
   }
+  // The credentials belong to ONE tenant: never import its ledger elsewhere.
+  if (!refrensBoundTo(agencyId)) {
+    counters.errors.push(REFRENS_NOT_BOUND);
+    return counters;
+  }
 
   const max = opts.max ?? Number.POSITIVE_INFINITY;
   const clientCache = await loadClientCache(agencyId);
@@ -371,6 +376,7 @@ export async function pushInvoice(
   invoiceId: string,
 ): Promise<{ ok: boolean; refrensId?: string; error?: string }> {
   if (!refrensConfigured()) return { ok: false, error: 'Refrens is not configured.' };
+  if (!refrensBoundTo(agencyId)) return { ok: false, error: REFRENS_NOT_BOUND };
   try {
     const [inv] = await db
       .select()
@@ -382,14 +388,14 @@ export async function pushInvoice(
     const [client] = await db
       .select()
       .from(clients)
-      .where(eq(clients.id, inv.clientId))
+      .where(and(eq(clients.id, inv.clientId), eq(clients.agencyId, agencyId)))
       .limit(1);
     if (!client) return { ok: false, error: 'Client not found.' };
 
     const items = await db
       .select()
       .from(invoiceItems)
-      .where(eq(invoiceItems.invoiceId, inv.id));
+      .where(and(eq(invoiceItems.invoiceId, inv.id), eq(invoiceItems.agencyId, agencyId)));
     if (!items.length) return { ok: false, error: 'Invoice has no line items.' };
 
     const payload = buildPayload(inv, items, client);
@@ -410,7 +416,7 @@ export async function pushInvoice(
         refrensSyncError: null,
         updatedAt: new Date(),
       })
-      .where(eq(invoices.id, inv.id));
+      .where(and(eq(invoices.id, inv.id), eq(invoices.agencyId, agencyId)));
 
     // Adopt the Refrens client key so the client matches on later pulls.
     const refClientKey = result?.billedTo?.clientId ?? null;
@@ -418,7 +424,7 @@ export async function pushInvoice(
       await db
         .update(clients)
         .set({ refrensClientId: refClientKey, updatedAt: new Date() })
-        .where(eq(clients.id, client.id));
+        .where(and(eq(clients.id, client.id), eq(clients.agencyId, agencyId)));
     }
     return { ok: true, refrensId: refrensId ?? undefined };
   } catch (e) {
@@ -426,7 +432,7 @@ export async function pushInvoice(
     await db
       .update(invoices)
       .set({ refrensSyncError: error, updatedAt: new Date() })
-      .where(eq(invoices.id, invoiceId))
+      .where(and(eq(invoices.id, invoiceId), eq(invoices.agencyId, agencyId)))
       .catch(() => {});
     return { ok: false, error };
   }
@@ -444,6 +450,10 @@ export async function refreshInvoice(agencyId: string, refrensId: string) {
     ignored: 0,
     errors: [],
   };
+  if (!refrensBoundTo(agencyId)) {
+    counters.errors.push(REFRENS_NOT_BOUND);
+    return counters;
+  }
   const r = await getInvoice(refrensId);
   await upsertInvoice(agencyId, r, counters, await loadClientCache(agencyId));
   return counters;
@@ -451,14 +461,32 @@ export async function refreshInvoice(agencyId: string, refrensId: string) {
 
 // --------------------------------------------------------------- plumbing ---
 
+export const REFRENS_NOT_BOUND = 'Refrens is not configured for this workspace';
+
 /**
- * Which agency the poller syncs into. The Refrens credentials belong to ONE
- * business, so: an explicit env pin, else the only agency, else nothing.
+ * The tenant that owns the (single, server-wide) Refrens credentials —
+ * `REFRENS_AGENCY_ID`. Unset → no tenant may sync or push.
+ */
+export function refrensAgencyId(): string | null {
+  const id = env.REFRENS_AGENCY_ID?.trim();
+  return id ? id : null;
+}
+
+/** True only for the agency bound to the Refrens credentials. */
+export function refrensBoundTo(agencyId: string): boolean {
+  const bound = refrensAgencyId();
+  return !!bound && bound === agencyId;
+}
+
+/**
+ * Which agency the poller syncs into: the explicit env pin only (never "the
+ * only agency"), and only when that agency exists.
  */
 export async function syncAgencyId(): Promise<string | null> {
-  const rows = await db.select({ id: agencies.id }).from(agencies).limit(2);
-  if (rows.length === 1) return rows[0]!.id;
-  return null;
+  const bound = refrensAgencyId();
+  if (!bound) return null;
+  const [row] = await db.select({ id: agencies.id }).from(agencies).where(eq(agencies.id, bound)).limit(1);
+  return row?.id ?? null;
 }
 
 export function refrensSyncEnabled(): boolean {
@@ -485,9 +513,10 @@ export async function syncStatus(agencyId: string) {
       and(eq(invoices.agencyId, agencyId), isNotNull(invoices.refrensSyncError)),
     );
   return {
-    configured: refrensConfigured(),
-    syncEnabled: refrensSyncEnabled(),
-    autoPush: refrensAutoPushEnabled(),
+    configured: refrensConfigured() && refrensBoundTo(agencyId),
+    boundToThisWorkspace: refrensBoundTo(agencyId),
+    syncEnabled: refrensSyncEnabled() && refrensBoundTo(agencyId),
+    autoPush: refrensAutoPushEnabled() && refrensBoundTo(agencyId),
     mirrored: Number(row?.mirrored ?? 0),
     failed: Number(errRow?.failed ?? 0),
     lastSyncedAt: row?.lastSyncedAt ? new Date(Number(row.lastSyncedAt) * 1000).toISOString() : null,

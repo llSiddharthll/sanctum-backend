@@ -6,16 +6,17 @@ import { clients, expenses, projects, users } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { notFound } from '../lib/errors.js';
-import { requireAuth, requireRole } from '../middleware/auth.js';
-import { requireModuleRW } from '../middleware/permissions.js';
-import { getAuth } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
+import { authenticate, getStaffActor, requires } from '../authz/http.js';
+import { authorize, capabilities } from '../authz/engine.js';
+import { actorAuditId, type Actor } from '../authz/actor.js';
+import { requireInAgency } from '../authz/tenancy.js';
+import { expenseFactsOf, ownScopeFilter } from '../authz/policies/business.js';
 
 export const expensesRouter = Router();
-expensesRouter.use(requireAuth);
-expensesRouter.use(requireModuleRW('finance'));
-// Money is owner ONLY (hard backstop over the finance module gate).
-expensesRouter.use(requireRole('owner'));
+expensesRouter.use(authenticate);
+
+const EXPENSE_CAPABILITIES = ['expenses.update', 'expenses.delete'];
 
 const EXPENSE_CATEGORIES = [
   'software',
@@ -30,26 +31,17 @@ const EXPENSE_CATEGORIES = [
   'other',
 ] as const;
 
-type AuthCtx = ReturnType<typeof getAuth>;
-
-async function requireAgencyClient(ctx: AuthCtx, clientId: string) {
-  const [row] = await db
-    .select({ id: clients.id })
-    .from(clients)
-    .where(and(eq(clients.id, clientId), eq(clients.agencyId, ctx.agencyId)))
-    .limit(1);
-  if (!row) throw notFound('Client not found.');
-}
-
-async function requireAgencyProject(ctx: AuthCtx, projectId: string) {
-  const [row] = await db
-    .select({ id: projects.id })
-    .from(projects)
-    .where(
-      and(eq(projects.id, projectId), eq(projects.agencyId, ctx.agencyId)),
-    )
-    .limit(1);
-  if (!row) throw notFound('Project not found.');
+function auditExpense(actor: Actor, action: string, id: string, ip: string | undefined, metadata?: Record<string, unknown>) {
+  return audit({
+    agencyId: actor.agencyId,
+    actorType: actor.type,
+    actorId: actorAuditId(actor),
+    action,
+    entityType: 'expense',
+    entityId: id,
+    metadata,
+    ip,
+  });
 }
 
 // ---- Selection joining names for list/detail responses ----
@@ -67,7 +59,7 @@ type ExpenseJoinRow = {
   loggedByName: string | null;
 };
 
-function serializeExpense(r: ExpenseJoinRow) {
+function serializeExpense(actor: Actor, r: ExpenseJoinRow) {
   const e = r.exp;
   return {
     id: e.id,
@@ -87,25 +79,28 @@ function serializeExpense(r: ExpenseJoinRow) {
     loggedByName: r.loggedByName,
     createdAt: toIso(e.createdAt),
     updatedAt: toIso(e.updatedAt),
+    capabilities: capabilities(actor, expenseFactsOf(e), EXPENSE_CAPABILITIES),
   };
 }
 
-async function getScopedExpense(
-  ctx: AuthCtx,
-  expenseId: string,
-): Promise<ExpenseJoinRow> {
+/** Load an expense in the tenant (joined names) or null. */
+async function findExpense(actor: Actor, expenseId: string): Promise<ExpenseJoinRow | null> {
   const [row] = await db
     .select(expenseSelection)
     .from(expenses)
-    .leftJoin(projects, eq(projects.id, expenses.projectId))
-    .leftJoin(clients, eq(clients.id, expenses.clientId))
-    .leftJoin(users, eq(users.id, expenses.loggedBy))
-    .where(
-      and(eq(expenses.id, expenseId), eq(expenses.agencyId, ctx.agencyId)),
-    )
+    .leftJoin(projects, and(eq(projects.id, expenses.projectId), eq(projects.agencyId, expenses.agencyId)))
+    .leftJoin(clients, and(eq(clients.id, expenses.clientId), eq(clients.agencyId, expenses.agencyId)))
+    .leftJoin(users, and(eq(users.id, expenses.loggedBy), eq(users.agencyId, expenses.agencyId)))
+    .where(and(eq(expenses.id, expenseId), eq(expenses.agencyId, actor.agencyId)))
     .limit(1);
-  if (!row) throw notFound('Expense not found.');
-  return row as ExpenseJoinRow;
+  return (row as ExpenseJoinRow | undefined) ?? null;
+}
+
+/** Load + authorize an expense for `permission` (404 when not visible). */
+async function authorizedExpense(actor: Actor, expenseId: string, permission: string): Promise<ExpenseJoinRow> {
+  const row = await findExpense(actor, expenseId);
+  authorize(actor, permission, row ? expenseFactsOf(row.exp) : null, { view: 'expenses.view' });
+  return row!;
 }
 
 // ============================================================
@@ -120,11 +115,14 @@ const listQuery = z.object({
   search: z.string().optional(),
 });
 
-expensesRouter.get('/', async (req, res) => {
-  const ctx = getAuth(req);
+expensesRouter.get('/', requires('expenses.view'), async (req, res) => {
+  const actor = getStaffActor(req);
   const q = listQuery.parse(req.query);
 
-  const filters = [eq(expenses.agencyId, ctx.agencyId)];
+  const filters = [
+    eq(expenses.agencyId, actor.agencyId),
+    ownScopeFilter(actor, 'expenses.view', expenses.loggedBy),
+  ];
   if (q.category) filters.push(eq(expenses.category, q.category));
   if (q.projectId) filters.push(eq(expenses.projectId, q.projectId));
   if (q.clientId) filters.push(eq(expenses.clientId, q.clientId));
@@ -148,13 +146,13 @@ expensesRouter.get('/', async (req, res) => {
   const rows = await db
     .select(expenseSelection)
     .from(expenses)
-    .leftJoin(projects, eq(projects.id, expenses.projectId))
-    .leftJoin(clients, eq(clients.id, expenses.clientId))
-    .leftJoin(users, eq(users.id, expenses.loggedBy))
+    .leftJoin(projects, and(eq(projects.id, expenses.projectId), eq(projects.agencyId, expenses.agencyId)))
+    .leftJoin(clients, and(eq(clients.id, expenses.clientId), eq(clients.agencyId, expenses.agencyId)))
+    .leftJoin(users, and(eq(users.id, expenses.loggedBy), eq(users.agencyId, expenses.agencyId)))
     .where(and(...filters))
     .orderBy(desc(expenses.expenseDate), desc(expenses.createdAt));
 
-  ok(res, (rows as ExpenseJoinRow[]).map(serializeExpense));
+  ok(res, (rows as ExpenseJoinRow[]).map((r) => serializeExpense(actor, r)));
 });
 
 // ============================================================
@@ -182,17 +180,17 @@ const createSchema = z.object({
   gstAmount: z.number().int().min(0).nullable().optional(), // paise
 });
 
-expensesRouter.post('/', async (req, res) => {
-  const ctx = getAuth(req);
+expensesRouter.post('/', requires('expenses.create'), async (req, res) => {
+  const actor = getStaffActor(req);
   const body = createSchema.parse(req.body);
 
-  if (body.projectId) await requireAgencyProject(ctx, body.projectId);
-  if (body.clientId) await requireAgencyClient(ctx, body.clientId);
+  if (body.projectId) await requireInAgency(projects, actor.agencyId, body.projectId, 'Project');
+  if (body.clientId) await requireInAgency(clients, actor.agencyId, body.clientId, 'Client');
 
   const id = newId('exp');
   await db.insert(expenses).values({
     id,
-    agencyId: ctx.agencyId,
+    agencyId: actor.agencyId,
     ...(body.category !== undefined ? { category: body.category } : {}),
     ...(body.expenseType !== undefined
       ? { expenseType: body.expenseType }
@@ -207,28 +205,22 @@ expensesRouter.post('/', async (req, res) => {
       ? { gstDeductible: body.gstDeductible }
       : {}),
     gstAmount: body.gstAmount ?? null,
-    loggedBy: ctx.userId,
+    loggedBy: actor.userId,
   });
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
-    action: 'expense.create',
-    entityType: 'expense',
-    entityId: id,
-    ip: req.ip,
-  });
+  await auditExpense(actor, 'expense.create', id, req.ip, { amount: body.amount, category: body.category ?? 'other' });
 
-  created(res, serializeExpense(await getScopedExpense(ctx, id)));
+  const row = await findExpense(actor, id);
+  if (!row) throw notFound('Expense not found.');
+  created(res, serializeExpense(actor, row));
 });
 
 // ============================================================
 //  DETAIL
 // ============================================================
-expensesRouter.get('/:id', async (req, res) => {
-  const ctx = getAuth(req);
-  ok(res, serializeExpense(await getScopedExpense(ctx, param(req, 'id'))));
+expensesRouter.get('/:id', requires('expenses.view'), async (req, res) => {
+  const actor = getStaffActor(req);
+  ok(res, serializeExpense(actor, await authorizedExpense(actor, param(req, 'id'), 'expenses.view')));
 });
 
 // ============================================================
@@ -249,14 +241,14 @@ const updateSchema = z.object({
   gstAmount: z.number().int().min(0).nullable().optional(),
 });
 
-expensesRouter.patch('/:id', async (req, res) => {
-  const ctx = getAuth(req);
+expensesRouter.patch('/:id', requires('expenses.update'), async (req, res) => {
+  const actor = getStaffActor(req);
   const expenseId = param(req, 'id');
-  await getScopedExpense(ctx, expenseId);
+  const before = await authorizedExpense(actor, expenseId, 'expenses.update');
   const body = updateSchema.parse(req.body);
 
-  if (body.projectId) await requireAgencyProject(ctx, body.projectId);
-  if (body.clientId) await requireAgencyClient(ctx, body.clientId);
+  if (body.projectId) await requireInAgency(projects, actor.agencyId, body.projectId, 'Project');
+  if (body.clientId) await requireInAgency(clients, actor.agencyId, body.clientId, 'Client');
 
   const patch: Partial<typeof expenses.$inferInsert> = {
     updatedAt: new Date(),
@@ -277,44 +269,36 @@ expensesRouter.patch('/:id', async (req, res) => {
     .update(expenses)
     .set(patch)
     .where(
-      and(eq(expenses.id, expenseId), eq(expenses.agencyId, ctx.agencyId)),
+      and(eq(expenses.id, expenseId), eq(expenses.agencyId, actor.agencyId)),
     );
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
-    action: 'expense.update',
-    entityType: 'expense',
-    entityId: expenseId,
-    ip: req.ip,
+  await auditExpense(actor, 'expense.update', expenseId, req.ip, {
+    fields: Object.keys(patch).filter((k) => k !== 'updatedAt'),
+    ...(patch.amount !== undefined ? { amountBefore: before.exp.amount, amountAfter: patch.amount } : {}),
   });
 
-  ok(res, serializeExpense(await getScopedExpense(ctx, expenseId)));
+  const row = await findExpense(actor, expenseId);
+  ok(res, serializeExpense(actor, row!));
 });
 
 // ============================================================
 //  DELETE
 // ============================================================
-expensesRouter.delete('/:id', async (req, res) => {
-  const ctx = getAuth(req);
+expensesRouter.delete('/:id', requires('expenses.delete'), async (req, res) => {
+  const actor = getStaffActor(req);
   const expenseId = param(req, 'id');
-  await getScopedExpense(ctx, expenseId);
+  const before = await authorizedExpense(actor, expenseId, 'expenses.delete');
 
   await db
     .delete(expenses)
     .where(
-      and(eq(expenses.id, expenseId), eq(expenses.agencyId, ctx.agencyId)),
+      and(eq(expenses.id, expenseId), eq(expenses.agencyId, actor.agencyId)),
     );
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
-    action: 'expense.delete',
-    entityType: 'expense',
-    entityId: expenseId,
-    ip: req.ip,
+  await auditExpense(actor, 'expense.delete', expenseId, req.ip, {
+    amount: before.exp.amount,
+    category: before.exp.category,
+    loggedBy: before.exp.loggedBy,
   });
   ok(res, { deleted: true });
 });

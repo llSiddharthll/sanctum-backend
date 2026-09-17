@@ -2,6 +2,12 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import supertest from 'supertest';
 import { app, BASE, signupAgency, data, type Agent } from './helpers';
 
+async function sendForToken(owner: Agent, id: string): Promise<string> {
+  const sent = await owner.post(`${BASE}/proposals/${id}/send`).send({ recipientEmail: 'buyer@client.test' });
+  expect(sent.status).toBe(200);
+  return String(data(sent).publicUrl).split('/').pop()!;
+}
+
 /**
  * Proposals now carry custom rich-text sections (content.sections[]) and a
  * per-line billing flag (deliverables[].billing = 'monthly' | 'one_time') that
@@ -43,7 +49,8 @@ describe('proposals: custom sections + per-line billing', () => {
     };
 
     const created = data(await owner.post(`${BASE}/proposals`).send(payload));
-    expect(created.token).toBeTruthy();
+    // Tokens are never returned by the staff API; links are minted on send.
+    expect(created.token).toBeNull();
     expect(created.content.sections).toHaveLength(2);
     expect(created.billingType).toBe('retainer');
 
@@ -56,9 +63,14 @@ describe('proposals: custom sections + per-line billing', () => {
     expect(mine.recurringPaise).toBe(5_000_000);
 
     // Public (unauthenticated) proposal view exposes the sections + retainer.
-    const pub = data(
-      await supertest(app).get(`${BASE}/proposals/public/${created.token}`),
-    );
+    const token = await sendForToken(owner, created.id);
+    const pubRes = await supertest(app).get(`${BASE}/proposals/public/${token}`);
+    expect(pubRes.status).toBe(200);
+    const pub = data(pubRes);
+    // Minimal anonymous view: no staff/lead ids, no token.
+    expect(pub.createdBy).toBeUndefined();
+    expect(pub.leadId).toBeUndefined();
+    expect(pub.token).toBeUndefined();
     expect(pub.content.sections).toHaveLength(2);
     expect(pub.content.sections[1].html).toContain('<li>');
     expect(pub.billingType).toBe('retainer');
@@ -108,7 +120,8 @@ describe('proposals: custom sections + per-line billing', () => {
       }),
     );
     expect(created.billingType).toBe('one_time');
-    const pub = data(await supertest(app).get(`${BASE}/proposals/public/${created.token}`));
+    const token = await sendForToken(owner, created.id);
+    const pub = data(await supertest(app).get(`${BASE}/proposals/public/${token}`));
     expect(pub.content.deliverables.every((d: any) => d.billing === 'one_time')).toBe(true);
   });
 
@@ -130,6 +143,10 @@ describe('proposals: custom sections + per-line billing', () => {
         },
       }),
     );
+    const token = await sendForToken(owner, created.id);
+    expect(
+      (await supertest(app).post(`${BASE}/proposals/public/${token}/accept`).send({ acceptedBy: 'Buyer' })).status,
+    ).toBe(200);
     const res = await owner.post(`${BASE}/proposals/${created.id}/convert-to-agreement`).send({});
     expect([200, 201]).toContain(res.status);
     const agr = data(res);

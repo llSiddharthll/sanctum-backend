@@ -143,6 +143,8 @@ describe('Refrens sync — pull + push', () => {
     (env as any).REFRENS_URL_KEY = 'creative-monk';
     (env as any).REFRENS_APP_ID = 'creative-monk-TEST';
     (env as any).REFRENS_PRIVATE_KEY = privateKey as string;
+    // The credentials are bound to exactly one tenant.
+    (env as any).REFRENS_AGENCY_ID = agencyId;
   });
 
   afterEach(() => vi.unstubAllGlobals());
@@ -256,6 +258,28 @@ describe('Refrens sync — pull + push', () => {
     expect(row!.refrensId).toBe('r_pushed_1');
     expect(row!.invoiceNumber).toBe('A00501'); // Refrens owns the real number
     expect(row!.refrensSyncError).toBeNull();
+  });
+
+  it('refuses pull and push for an agency not bound to the credentials', async () => {
+    const other = await signupAgency();
+    const calls = stubRefrens([refrensInvoice({ _id: 'r_foreign' })]);
+    const pulled = await pullInvoices(other.agency.id);
+    expect(pulled.created).toBe(0);
+    expect(pulled.errors.join(' ')).toMatch(/not configured for this workspace/);
+    expect(calls.filter((c) => c.url.includes('/invoices'))).toHaveLength(0);
+
+    const cli = data(await other.agent.post(`${BASE}/clients`).send({ name: 'Foreign Co' }));
+    const inv = data(
+      await other.agent.post(`${BASE}/invoices`).send({
+        clientId: cli.id,
+        items: [{ description: 'X', quantity: 1, rate: 1000, gstRate: 18 }],
+      }),
+    );
+    const pushed = await pushInvoice(other.agency.id, inv.id);
+    expect(pushed.ok).toBe(false);
+    const http = await other.agent.post(`${BASE}/refrens/sync`).send({});
+    expect(http.status).toBe(403);
+    expect(http.body.error.message).toBe('Refrens is not configured for this workspace');
   });
 
   it('records the error instead of throwing when Refrens is down', async () => {

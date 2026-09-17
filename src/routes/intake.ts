@@ -1,17 +1,21 @@
+import crypto from 'node:crypto';
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, eq } from 'drizzle-orm';
+import { eq } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { leads, users } from '../db/schema.js';
+import { agencies, leads } from '../db/schema.js';
 import { newId } from '../lib/ids.js';
 import { ok } from '../lib/http.js';
-import { notifyMany, agencyOwners } from '../services/notifications.js';
+import { audit } from '../services/audit.js';
+import { notifyPermissionHolders } from '../services/notifications.js';
+import { actorAuditId, integrationActor } from '../authz/actor.js';
+import { requirePermission } from '../authz/engine.js';
 
 /**
- * Public lead intake — used by the Creative Monk marketing website to push a
- * contact-form submission straight into the Sanctum CRM. Machine-to-machine, so
- * it's guarded by a shared secret header (`X-Intake-Key` === LEAD_INTAKE_SECRET)
- * rather than a user JWT. Target agency comes from INTAKE_AGENCY_ID.
+ * Public lead intake — used by the marketing website to push a contact-form
+ * submission into the CRM. Machine-to-machine: the `X-Intake-Key` header must
+ * match LEAD_INTAKE_SECRET (constant-time). The request then acts as
+ * integrationActor('lead-intake', INTAKE_AGENCY_ID, [leads.create]).
  */
 export const intakeRouter = Router();
 
@@ -26,26 +30,33 @@ const leadSchema = z.object({
   source: z.string().trim().max(120).optional().or(z.literal('')),
 });
 
+/** Constant-time comparison of the presented key against the secret. */
+export function intakeKeyMatches(presented: string | undefined, secret: string | undefined): boolean {
+  if (!secret || !presented) return false;
+  const a = crypto.createHash('sha256').update(presented).digest();
+  const b = crypto.createHash('sha256').update(secret).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
 intakeRouter.post('/lead', async (req, res) => {
-  const secret = process.env.LEAD_INTAKE_SECRET;
-  if (!secret || req.header('x-intake-key') !== secret) {
-    return res.status(401).json({ error: { message: 'Unauthorized' } });
+  if (!intakeKeyMatches(req.header('x-intake-key'), process.env.LEAD_INTAKE_SECRET)) {
+    return res.status(401).json({ error: { code: 'UNAUTHENTICATED', message: 'Unauthorized' } });
   }
   const agencyId = process.env.INTAKE_AGENCY_ID;
   if (!agencyId) {
     return res.status(500).json({ error: { message: 'INTAKE_AGENCY_ID not configured' } });
   }
+  const [agency] = await db.select({ id: agencies.id }).from(agencies).where(eq(agencies.id, agencyId)).limit(1);
+  if (!agency) {
+    return res.status(500).json({ error: { message: 'INTAKE_AGENCY_ID not configured' } });
+  }
+  const actor = integrationActor('lead-intake', agencyId, [
+    { permission: 'leads.create', scope: 'organization' },
+  ]);
+  requirePermission(actor, 'leads.create');
   const body = leadSchema.parse(req.body);
 
-  const [owner] = await db
-    .select({ id: users.id })
-    .from(users)
-    .where(and(eq(users.agencyId, agencyId), eq(users.role, 'owner')))
-    .limit(1);
-  const ownerId = owner?.id ?? null;
-
-  // Create a LEAD (stage = new) — it enters the pipeline and only becomes a
-  // client once someone converts it. Website enquiry text is preserved.
+  // A LEAD (stage = new), unassigned: whoever holds leads.assign routes it.
   const leadId = newId('led');
   await db.insert(leads).values({
     id: leadId,
@@ -58,15 +69,25 @@ intakeRouter.post('/lead', async (req, res) => {
     service: body.service || null,
     budget: body.budget || null,
     message: body.message || null,
-    ownerId,
+    ownerId: null,
     stage: 'new',
     lastActivityAt: new Date(),
   });
 
-  // Leads are owner-only (Business module) — notify OWNERS only (in-app + push).
+  await audit({
+    agencyId,
+    actorType: actor.type,
+    actorId: actorAuditId(actor),
+    action: 'lead.create',
+    entityType: 'lead',
+    entityId: leadId,
+    metadata: { source: body.source || 'website-contact' },
+    ip: req.ip,
+  });
+
+  // Notify people who can see leads (by capability, never by role).
   try {
-    const recipients = await agencyOwners(agencyId);
-    await notifyMany(recipients, {
+    await notifyPermissionHolders(agencyId, 'leads.view', {
       agencyId,
       type: 'lead.created',
       title: 'New website lead',

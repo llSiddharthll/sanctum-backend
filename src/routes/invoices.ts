@@ -13,25 +13,43 @@ import {
 } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
-import { notFound, badRequest } from '../lib/errors.js';
-import { requireAuth, requireRole } from '../middleware/auth.js';
-import { requireModuleRW } from '../middleware/permissions.js';
-import { getAuth, requireClientAccess } from '../middleware/tenant.js';
+import { notFound, badRequest, invalidState } from '../lib/errors.js';
 import { audit } from '../services/audit.js';
+import { computeInvoiceTotals, statusAfterPayment } from '../lib/finance.js';
 import {
-  mintClientPortalLogin,
-  sendClientPortalLoginEmail,
-} from '../lib/client-portal-login.js';
-import { pushInvoice, refrensAutoPushEnabled } from '../services/refrens-sync.js';
+  pushInvoice,
+  refrensAutoPushEnabled,
+  refrensBoundTo,
+} from '../services/refrens-sync.js';
+import { authenticate, getStaffActor, requires } from '../authz/http.js';
+import { authorize, capabilities } from '../authz/engine.js';
+import { actorAuditId, type Actor } from '../authz/actor.js';
+import { requireInAgency } from '../authz/tenancy.js';
+import {
+  assertInvoiceEditable,
+  deliverViaPortalLogin,
+  escapeHtml,
+  invoiceFactsOf,
+  invoiceScopeFilter,
+  invoiceTransitionError,
+  loadInvoice,
+} from '../authz/policies/business.js';
 
 export const invoicesRouter = Router();
-invoicesRouter.use(requireAuth);
-invoicesRouter.use(requireModuleRW('finance'));
-// Invoicing management is strictly OWNER ONLY.
-invoicesRouter.use(requireRole('owner'));
+invoicesRouter.use(authenticate);
+
+const INVOICE_CAPABILITIES = [
+  'invoices.update',
+  'invoices.change_status',
+  'invoices.record_payment',
+  'invoices.send',
+  'invoices.sync',
+];
+const INVOICE_STATUSES = ['draft', 'sent', 'partially_paid', 'paid', 'cancelled'] as const;
 
 const invoiceSelection = {
   id: invoices.id,
+  agencyId: invoices.agencyId,
   invoiceNumber: invoices.invoiceNumber,
   clientId: invoices.clientId,
   projectId: invoices.projectId,
@@ -60,6 +78,7 @@ const invoiceSelection = {
 
 type InvoiceSelectedRow = {
   id: string;
+  agencyId: string;
   invoiceNumber: string | null;
   clientId: string;
   projectId: string | null;
@@ -87,6 +106,7 @@ type InvoiceSelectedRow = {
 };
 
 function serializeInvoice(
+  actor: Actor,
   inv: InvoiceSelectedRow | typeof invoices.$inferSelect,
   extra?: {
     clientName?: string | null;
@@ -155,7 +175,53 @@ function serializeInvoice(
     createdByName,
     createdAt: toIso(inv.createdAt),
     updatedAt: toIso(inv.updatedAt),
+    capabilities: capabilities(actor, invoiceFactsOf(inv), INVOICE_CAPABILITIES),
   };
+}
+
+function auditInvoice(actor: Actor, action: string, id: string, ip: string | undefined, metadata?: Record<string, unknown>) {
+  return audit({
+    agencyId: actor.agencyId,
+    actorType: actor.type,
+    actorId: actorAuditId(actor),
+    action,
+    entityType: 'invoice',
+    entityId: id,
+    metadata,
+    ip,
+  });
+}
+
+/** Tenant-bound references; a project must also belong to the invoice's client. */
+async function checkRefs(actor: Actor, clientId: string, projectId: string | null | undefined) {
+  await requireInAgency(clients, actor.agencyId, clientId, 'Client');
+  if (projectId) {
+    const [p] = await db
+      .select({ clientId: projects.clientId })
+      .from(projects)
+      .where(and(eq(projects.id, projectId), eq(projects.agencyId, actor.agencyId)))
+      .limit(1);
+    if (!p) throw notFound('Project not found.');
+    if (p.clientId && p.clientId !== clientId) {
+      throw badRequest('That project belongs to a different client.');
+    }
+  }
+}
+
+async function paidTotal(agencyId: string, invoiceId: string): Promise<number> {
+  const [row] = await db
+    .select({ total: sum(invoicePayments.amount) })
+    .from(invoicePayments)
+    .where(and(eq(invoicePayments.invoiceId, invoiceId), eq(invoicePayments.agencyId, agencyId)));
+  return Number(row?.total ?? 0);
+}
+
+async function maybePush(actor: Actor, invoiceId: string, onlyIfLinked: string | null | undefined | true) {
+  if (onlyIfLinked === null || onlyIfLinked === undefined) return;
+  // Auto-push only for the tenant bound to the Refrens credentials.
+  if (refrensAutoPushEnabled() && refrensBoundTo(actor.agencyId)) {
+    await pushInvoice(actor.agencyId, invoiceId).catch(() => undefined);
+  }
 }
 
 /**
@@ -163,8 +229,6 @@ function serializeInvoice(
  *
  * A bare `YYYY-MM-DD` is treated as a UTC day so the result never depends on
  * the server's timezone: `to=2026-06-30` covers through 23:59:59.999Z that day.
- * (Using local setHours put the bound at 18:29Z under IST and silently dropped
- * invoices issued later on the final day.)
  */
 const DATE_ONLY = /^(\d{4})-(\d{2})-(\d{2})$/;
 
@@ -183,18 +247,21 @@ function rangeEnd(v: string): Date | null {
 }
 
 // ---- LIST INVOICES ----
-invoicesRouter.get('/', async (req, res) => {
-  const ctx = getAuth(req);
+invoicesRouter.get('/', requires('invoices.view'), async (req, res) => {
+  const actor = getStaffActor(req);
   const clientId = req.query.clientId as string | undefined;
   const projectId = req.query.projectId as string | undefined;
   const status = req.query.status as string | undefined;
   const search = (req.query.search as string | undefined)?.trim();
 
-  const filters = [eq(invoices.agencyId, ctx.agencyId)];
+  const filters = [eq(invoices.agencyId, actor.agencyId), invoiceScopeFilter(actor)];
   if (clientId) filters.push(eq(invoices.clientId, clientId));
   if (projectId) filters.push(eq(invoices.projectId, projectId));
   if (status && status !== 'all') {
-    filters.push(eq(invoices.status, status as typeof invoices.$inferSelect.status));
+    if (!(INVOICE_STATUSES as readonly string[]).includes(status)) {
+      throw badRequest('Unknown invoice status.');
+    }
+    filters.push(eq(invoices.status, status as (typeof INVOICE_STATUSES)[number]));
   }
   const from = req.query.from ? rangeStart(String(req.query.from)) : null;
   const to = req.query.to ? rangeEnd(String(req.query.to)) : null;
@@ -207,8 +274,7 @@ invoicesRouter.get('/', async (req, res) => {
     );
   }
 
-  // Pagination is OPT-IN: only when an explicit `limit` is given, so existing
-  // clients (the shipped mobile app) keep receiving the full list.
+  // Pagination is OPT-IN: only when an explicit `limit` is given.
   const rawLimit = req.query.limit ? Number(req.query.limit) : null;
   const limit =
     rawLimit && Number.isFinite(rawLimit)
@@ -219,19 +285,18 @@ invoicesRouter.get('/', async (req, res) => {
   const baseQuery = db
     .select(invoiceSelection)
     .from(invoices)
-    .leftJoin(clients, eq(clients.id, invoices.clientId))
-    .leftJoin(projects, eq(projects.id, invoices.projectId))
-    .leftJoin(users, eq(users.id, invoices.createdBy))
+    .leftJoin(clients, and(eq(clients.id, invoices.clientId), eq(clients.agencyId, invoices.agencyId)))
+    .leftJoin(projects, and(eq(projects.id, invoices.projectId), eq(projects.agencyId, invoices.agencyId)))
+    .leftJoin(users, and(eq(users.id, invoices.createdBy), eq(users.agencyId, invoices.agencyId)))
     .where(and(...filters))
     .orderBy(desc(invoices.issueDate), desc(invoices.createdAt));
 
   const rows = limit ? await baseQuery.limit(limit).offset(offset) : await baseQuery;
 
-  // Total matching rows, so the UI can render page controls.
   const [countRow] = await db
     .select({ n: sql<number>`count(*)` })
     .from(invoices)
-    .leftJoin(clients, eq(clients.id, invoices.clientId))
+    .leftJoin(clients, and(eq(clients.id, invoices.clientId), eq(clients.agencyId, invoices.agencyId)))
     .where(and(...filters));
   const total = Number(countRow?.n ?? 0);
 
@@ -245,7 +310,7 @@ invoicesRouter.get('/', async (req, res) => {
         totalPaid: sum(invoicePayments.amount),
       })
       .from(invoicePayments)
-      .where(inArray(invoicePayments.invoiceId, invoiceIds))
+      .where(and(eq(invoicePayments.agencyId, actor.agencyId), inArray(invoicePayments.invoiceId, invoiceIds)))
       .groupBy(invoicePayments.invoiceId);
 
     for (const r of payRows) {
@@ -256,7 +321,7 @@ invoicesRouter.get('/', async (req, res) => {
   ok(
     res,
     rows.map((r) =>
-      serializeInvoice(r, {
+      serializeInvoice(actor, r, {
         paidAmount: paymentSums.get(r.id) ?? 0,
       }),
     ),
@@ -267,11 +332,10 @@ invoicesRouter.get('/', async (req, res) => {
 
 // ---- SUMMARY (KPIs over ALL invoices, not just the current page) ----
 // Must be registered before '/:id' or Express matches it as an invoice id.
-invoicesRouter.get('/summary', async (req, res) => {
-  const ctx = getAuth(req);
+invoicesRouter.get('/summary', requires('invoices.view'), async (req, res) => {
+  const actor = getStaffActor(req);
 
-  // The KPI tiles must describe the same slice the table is showing.
-  const sFilters = [eq(invoices.agencyId, ctx.agencyId)];
+  const sFilters = [eq(invoices.agencyId, actor.agencyId), invoiceScopeFilter(actor)];
   const sFrom = req.query.from ? rangeStart(String(req.query.from)) : null;
   const sTo = req.query.to ? rangeEnd(String(req.query.to)) : null;
   if (sFrom) sFilters.push(gte(invoices.issueDate, sFrom));
@@ -294,7 +358,7 @@ invoicesRouter.get('/summary', async (req, res) => {
       totalPaid: sum(invoicePayments.amount),
     })
     .from(invoicePayments)
-    .where(eq(invoicePayments.agencyId, ctx.agencyId))
+    .where(eq(invoicePayments.agencyId, actor.agencyId))
     .groupBy(invoicePayments.invoiceId);
   for (const p of payRows) paidByInvoice.set(p.invoiceId, Number(p.totalPaid ?? 0));
 
@@ -308,8 +372,7 @@ invoicesRouter.get('/summary', async (req, res) => {
 
   for (const r of rows) {
     const paid = paidByInvoice.get(r.id) ?? 0;
-    // A cancelled invoice is not a receivable — it must not inflate
-    // outstanding, overdue or total invoiced.
+    // A cancelled invoice is not a receivable.
     if (r.status === 'cancelled') continue;
     issuedCount += 1;
     totalInvoiced += r.total;
@@ -342,6 +405,25 @@ const itemSchema = z.object({
   gstRate: z.number().min(0).max(100).default(18),
 });
 
+type ItemInput = z.infer<typeof itemSchema>;
+
+function prepareItems(agencyId: string, invoiceId: string, items: ItemInput[], isInterstate: boolean) {
+  const totals = computeInvoiceTotals(items, isInterstate);
+  const prepared = items.map((it, idx) => ({
+    id: newId('itm'),
+    agencyId,
+    invoiceId,
+    description: it.description,
+    quantity: it.quantity,
+    unit: it.unit,
+    rate: it.rate,
+    gstRate: it.gstRate,
+    amount: totals.lines[idx]!.amount,
+    position: idx,
+  }));
+  return { totals, prepared };
+}
+
 const createInvoiceSchema = z.object({
   clientId: z.string().min(1),
   projectId: z.string().optional(),
@@ -355,128 +437,82 @@ const createInvoiceSchema = z.object({
   items: z.array(itemSchema).min(1),
 });
 
-invoicesRouter.post('/', async (req, res) => {
-  const ctx = getAuth(req);
+invoicesRouter.post('/', requires('invoices.create'), async (req, res) => {
+  const actor = getStaffActor(req);
   const body = createInvoiceSchema.parse(req.body);
+  await checkRefs(actor, body.clientId, body.projectId);
 
   const invoiceId = newId('inv');
   const year = new Date().getFullYear();
   const invoiceNumber = `INV-${year}-${String(Date.now() % 10000).padStart(4, '0')}`;
+  const { totals, prepared } = prepareItems(actor.agencyId, invoiceId, body.items, body.isInterstate);
 
-  let subtotal = 0;
-  let taxTotal = 0;
-
-  const preparedItems = body.items.map((it, idx) => {
-    const amount = Math.round(it.quantity * it.rate);
-    const itemTax = Math.round((amount * it.gstRate) / 100);
-    subtotal += amount;
-    taxTotal += itemTax;
-    return {
-      id: newId('itm'),
-      agencyId: ctx.agencyId,
-      invoiceId,
-      description: it.description,
-      quantity: it.quantity,
-      unit: it.unit,
-      rate: it.rate,
-      gstRate: it.gstRate,
-      amount,
-      position: idx,
-    };
+  await db.transaction(async (tx) => {
+    await tx.insert(invoices).values({
+      id: invoiceId,
+      agencyId: actor.agencyId,
+      clientId: body.clientId,
+      projectId: body.projectId ?? null,
+      invoiceNumber,
+      status: 'draft',
+      issueDate: body.issueDate ?? new Date(),
+      dueDate: body.dueDate ?? null,
+      isInterstate: body.isInterstate,
+      currency: body.currency,
+      subtotal: totals.subtotal,
+      taxTotal: totals.taxTotal,
+      cgst: totals.cgst,
+      sgst: totals.sgst,
+      igst: totals.igst,
+      total: totals.total,
+      notes: body.notes ?? null,
+      terms: body.terms ?? null,
+      bankDetails: body.bankDetails ?? null,
+      createdBy: actor.userId,
+    });
+    for (const itm of prepared) await tx.insert(invoiceItems).values(itm);
   });
 
-  const cgst = body.isInterstate ? 0 : Math.round(taxTotal / 2);
-  const sgst = body.isInterstate ? 0 : taxTotal - cgst;
-  const igst = body.isInterstate ? taxTotal : 0;
-  const total = subtotal + taxTotal;
+  await auditInvoice(actor, 'invoice.create', invoiceId, req.ip, { total: totals.total, clientId: body.clientId });
 
-  await db.insert(invoices).values({
-    id: invoiceId,
-    agencyId: ctx.agencyId,
-    clientId: body.clientId,
-    projectId: body.projectId ?? null,
-    invoiceNumber,
-    status: 'draft',
-    issueDate: body.issueDate ?? new Date(),
-    dueDate: body.dueDate ?? null,
-    isInterstate: body.isInterstate,
-    currency: body.currency,
-    subtotal,
-    taxTotal,
-    cgst,
-    sgst,
-    igst,
-    total,
-    notes: body.notes ?? null,
-    terms: body.terms ?? null,
-    bankDetails: body.bankDetails ?? null,
-    createdBy: ctx.userId,
-  });
+  // Mirror the new invoice up to Refrens (bound tenant only; best-effort).
+  await maybePush(actor, invoiceId, true);
 
-  for (const itm of preparedItems) {
-    await db.insert(invoiceItems).values(itm);
-  }
-
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
-    action: 'invoice.create',
-    entityType: 'invoice',
-    entityId: invoiceId,
-    ip: req.ip,
-  });
-
-  // Mirror the new invoice up to Refrens (the accounting system of record).
-  // Best-effort and awaited only long enough to capture the Refrens number:
-  // a Refrens outage records refrens_sync_error on the row instead of failing
-  // the user's request, and the poller/"Sync now" will retry it later.
-  if (refrensAutoPushEnabled()) {
-    await pushInvoice(ctx.agencyId, invoiceId).catch(() => undefined);
-  }
-
-  const [row] = await db.select().from(invoices).where(eq(invoices.id, invoiceId));
-  created(res, serializeInvoice(row!, { items: preparedItems as any }));
+  const loaded = await loadInvoice(actor, invoiceId);
+  created(res, serializeInvoice(actor, loaded!.row, { items: prepared as any }));
 });
 
 // ---- DETAIL ----
-invoicesRouter.get('/:id', async (req, res) => {
-  const ctx = getAuth(req);
+invoicesRouter.get('/:id', requires('invoices.view'), async (req, res) => {
+  const actor = getStaffActor(req);
   const invoiceId = param(req, 'id');
 
   const [row] = await db
     .select(invoiceSelection)
     .from(invoices)
-    .leftJoin(clients, eq(clients.id, invoices.clientId))
-    .leftJoin(projects, eq(projects.id, invoices.projectId))
-    .leftJoin(users, eq(users.id, invoices.createdBy))
-    .where(and(eq(invoices.id, invoiceId), eq(invoices.agencyId, ctx.agencyId)))
+    .leftJoin(clients, and(eq(clients.id, invoices.clientId), eq(clients.agencyId, invoices.agencyId)))
+    .leftJoin(projects, and(eq(projects.id, invoices.projectId), eq(projects.agencyId, invoices.agencyId)))
+    .leftJoin(users, and(eq(users.id, invoices.createdBy), eq(users.agencyId, invoices.agencyId)))
+    .where(and(eq(invoices.id, invoiceId), eq(invoices.agencyId, actor.agencyId)))
     .limit(1);
 
-  if (!row) throw notFound('Invoice not found.');
+  authorize(actor, 'invoices.view', row ? invoiceFactsOf(row) : null);
 
   const items = await db
     .select()
     .from(invoiceItems)
-    .where(eq(invoiceItems.invoiceId, invoiceId))
+    .where(and(eq(invoiceItems.invoiceId, invoiceId), eq(invoiceItems.agencyId, actor.agencyId)))
     .orderBy(invoiceItems.position);
 
   const payments = await db
     .select()
     .from(invoicePayments)
-    .where(eq(invoicePayments.invoiceId, invoiceId))
+    .where(and(eq(invoicePayments.invoiceId, invoiceId), eq(invoicePayments.agencyId, actor.agencyId)))
     .orderBy(desc(invoicePayments.paidAt));
 
   const paidAmount = payments.reduce((acc, p) => acc + p.amount, 0);
 
-  ok(
-    res,
-    serializeInvoice(row, {
-      items,
-      payments,
-      paidAmount,
-    }),
-  );
+  ok(res, serializeInvoice(actor, row!, { items, payments, paidAmount }));
 });
 
 // ---- RECORD PAYMENT ----
@@ -488,64 +524,66 @@ const paymentSchema = z.object({
   notes: z.string().trim().max(500).optional(),
 });
 
-invoicesRouter.post('/:id/payments', async (req, res) => {
-  const ctx = getAuth(req);
-  const invoiceId = param(req, 'id');
+invoicesRouter.post('/:id/payments', requires('invoices.record_payment'), async (req, res) => {
+  const actor = getStaffActor(req);
   const body = paymentSchema.parse(req.body);
+  const loaded = await loadInvoice(actor, param(req, 'id'));
+  authorize(actor, 'invoices.record_payment', loaded?.facts, { view: 'invoices.view' });
+  const inv = loaded!.row;
 
-  const [inv] = await db
-    .select()
-    .from(invoices)
-    .where(and(eq(invoices.id, invoiceId), eq(invoices.agencyId, ctx.agencyId)))
-    .limit(1);
-
-  if (!inv) throw notFound('Invoice not found.');
+  if (inv.status === 'cancelled' || inv.status === 'paid') {
+    throw invalidState(`Payments cannot be recorded on a ${inv.status} invoice.`);
+  }
+  if (body.paidAt && body.paidAt.getTime() > Date.now() + 86_400_000) {
+    throw badRequest('A payment date cannot be in the future.');
+  }
 
   const payId = newId('pay');
-  await db.insert(invoicePayments).values({
-    id: payId,
-    agencyId: ctx.agencyId,
-    invoiceId,
+  const result = await db.transaction(async (tx) => {
+    const [paySum] = await tx
+      .select({ total: sum(invoicePayments.amount) })
+      .from(invoicePayments)
+      .where(and(eq(invoicePayments.invoiceId, inv.id), eq(invoicePayments.agencyId, actor.agencyId)));
+    const before = Number(paySum?.total ?? 0);
+    const balance = Math.max(0, inv.total - before);
+    if (body.amount > balance) {
+      throw invalidState(`Payment exceeds the balance due (${balance} paise).`);
+    }
+    await tx.insert(invoicePayments).values({
+      id: payId,
+      agencyId: actor.agencyId,
+      invoiceId: inv.id,
+      amount: body.amount,
+      paidAt: body.paidAt ?? new Date(),
+      method: body.method,
+      reference: body.reference ?? null,
+      notes: body.notes ?? null,
+      recordedBy: actor.userId,
+    });
+    const totalPaid = before + body.amount;
+    const newStatus = statusAfterPayment(inv.status, totalPaid, inv.total, inv.status !== 'draft');
+    await tx
+      .update(invoices)
+      .set({ status: newStatus, updatedAt: new Date() })
+      .where(and(eq(invoices.id, inv.id), eq(invoices.agencyId, actor.agencyId)));
+    return { totalPaid, newStatus, balanceBefore: balance };
+  });
+
+  await auditInvoice(actor, 'invoice.record_payment', inv.id, req.ip, {
+    paymentId: payId,
     amount: body.amount,
-    paidAt: body.paidAt ?? new Date(),
     method: body.method,
-    reference: body.reference ?? null,
-    notes: body.notes ?? null,
-    recordedBy: ctx.userId,
+    statusBefore: inv.status,
+    statusAfter: result.newStatus,
+    balanceBefore: result.balanceBefore,
   });
 
-  // Calculate new total paid
-  const [paySum] = await db
-    .select({ total: sum(invoicePayments.amount) })
-    .from(invoicePayments)
-    .where(eq(invoicePayments.invoiceId, invoiceId));
-
-  const totalPaid = Number(paySum?.total ?? 0);
-  const newStatus = totalPaid >= inv.total ? 'paid' : totalPaid > 0 ? 'partially_paid' : inv.status;
-
-  await db
-    .update(invoices)
-    .set({ status: newStatus, updatedAt: new Date() })
-    .where(eq(invoices.id, invoiceId));
-
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
-    action: 'invoice.record_payment',
-    entityType: 'invoice',
-    entityId: invoiceId,
-    metadata: { paymentId: payId, amount: body.amount },
-    ip: req.ip,
-  });
-
-  ok(res, { paymentId: payId, status: newStatus, totalPaid });
+  ok(res, { paymentId: payId, status: result.newStatus, totalPaid: result.totalPaid });
 });
 
 // ---- EDIT INVOICE ----
 // Full field edit. When `items` is supplied the line items are replaced and all
-// money is recomputed server-side. Any edit to an invoice linked to Refrens is
-// pushed back up, which is what makes editing genuinely two-way.
+// money is recomputed server-side. Paid and cancelled invoices are immutable.
 const updateInvoiceSchema = z.object({
   clientId: z.string().min(1).optional(),
   projectId: z.string().nullable().optional(),
@@ -559,19 +597,18 @@ const updateInvoiceSchema = z.object({
   items: z.array(itemSchema).min(1).optional(),
 });
 
-invoicesRouter.patch('/:id', async (req, res) => {
-  const ctx = getAuth(req);
-  const invoiceId = param(req, 'id');
+invoicesRouter.patch('/:id', requires('invoices.update'), async (req, res) => {
+  const actor = getStaffActor(req);
   const body = updateInvoiceSchema.parse(req.body);
+  const loaded = await loadInvoice(actor, param(req, 'id'));
+  authorize(actor, 'invoices.update', loaded?.facts, { view: 'invoices.view' });
+  const existing = loaded!.row;
+  assertInvoiceEditable(existing);
 
-  const [existing] = await db
-    .select()
-    .from(invoices)
-    .where(and(eq(invoices.id, invoiceId), eq(invoices.agencyId, ctx.agencyId)))
-    .limit(1);
-  if (!existing) throw notFound('Invoice not found.');
-  if (existing.status === 'cancelled') {
-    throw badRequest('A cancelled invoice cannot be edited.');
+  const nextClientId = body.clientId ?? existing.clientId;
+  const nextProjectId = body.projectId !== undefined ? body.projectId : existing.projectId;
+  if (body.clientId !== undefined || body.projectId !== undefined) {
+    await checkRefs(actor, nextClientId, nextProjectId);
   }
 
   const patch: Partial<typeof invoices.$inferInsert> = { updatedAt: new Date() };
@@ -587,15 +624,22 @@ invoicesRouter.patch('/:id', async (req, res) => {
   const isInterstate = body.isInterstate ?? existing.isInterstate;
   if (body.isInterstate !== undefined) patch.isInterstate = body.isInterstate;
 
+  const paid = await paidTotal(actor.agencyId, existing.id);
+  if (paid > 0 && body.clientId !== undefined && body.clientId !== existing.clientId) {
+    throw invalidState('An invoice with payments cannot be moved to another client.');
+  }
+
+  let prepared: ReturnType<typeof prepareItems>['prepared'] | null = null;
   // Recompute money whenever the lines or the tax treatment change.
   if (body.items || body.isInterstate !== undefined) {
-    const items =
+    const items: ItemInput[] =
       body.items ??
       (
         await db
           .select()
           .from(invoiceItems)
-          .where(eq(invoiceItems.invoiceId, existing.id))
+          .where(and(eq(invoiceItems.invoiceId, existing.id), eq(invoiceItems.agencyId, actor.agencyId)))
+          .orderBy(invoiceItems.position)
       ).map((it) => ({
         description: it.description,
         quantity: it.quantity,
@@ -604,149 +648,150 @@ invoicesRouter.patch('/:id', async (req, res) => {
         gstRate: it.gstRate,
       }));
 
-    let subtotal = 0;
-    let taxTotal = 0;
-    const prepared = items.map((it, idx) => {
-      const amount = Math.round(it.quantity * it.rate);
-      subtotal += amount;
-      taxTotal += Math.round((amount * it.gstRate) / 100);
-      return {
-        id: newId('itm'),
-        agencyId: ctx.agencyId,
-        invoiceId: existing.id,
-        description: it.description,
-        quantity: it.quantity,
-        unit: it.unit,
-        rate: it.rate,
-        gstRate: it.gstRate,
-        amount,
-        position: idx,
-      };
-    });
-
-    patch.subtotal = subtotal;
-    patch.taxTotal = taxTotal;
-    patch.cgst = isInterstate ? 0 : Math.round(taxTotal / 2);
-    patch.sgst = isInterstate ? 0 : taxTotal - Math.round(taxTotal / 2);
-    patch.igst = isInterstate ? taxTotal : 0;
-    patch.total = subtotal + taxTotal;
-
-    await db.delete(invoiceItems).where(eq(invoiceItems.invoiceId, existing.id));
-    for (const itm of prepared) await db.insert(invoiceItems).values(itm);
+    const r = prepareItems(actor.agencyId, existing.id, items, isInterstate);
+    if (r.totals.total < paid) {
+      throw invalidState('The new total would be less than the payments already recorded.');
+    }
+    prepared = r.prepared;
+    patch.subtotal = r.totals.subtotal;
+    patch.taxTotal = r.totals.taxTotal;
+    patch.cgst = r.totals.cgst;
+    patch.sgst = r.totals.sgst;
+    patch.igst = r.totals.igst;
+    patch.total = r.totals.total;
   }
 
-  await db.update(invoices).set(patch).where(eq(invoices.id, existing.id));
-
-  // Two-way: mirror the edit onto the linked Refrens invoice.
-  if (existing.refrensId && refrensAutoPushEnabled()) {
-    await pushInvoice(ctx.agencyId, existing.id).catch(() => undefined);
-  }
-
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
-    action: 'invoice.update',
-    entityType: 'invoice',
-    entityId: existing.id,
-    ip: req.ip,
+  await db.transaction(async (tx) => {
+    if (prepared && body.items) {
+      await tx
+        .delete(invoiceItems)
+        .where(and(eq(invoiceItems.invoiceId, existing.id), eq(invoiceItems.agencyId, actor.agencyId)));
+      for (const itm of prepared) await tx.insert(invoiceItems).values(itm);
+    }
+    await tx
+      .update(invoices)
+      .set(patch)
+      .where(and(eq(invoices.id, existing.id), eq(invoices.agencyId, actor.agencyId)));
   });
 
-  const [row] = await db.select().from(invoices).where(eq(invoices.id, existing.id));
+  // Two-way: mirror the edit onto the linked Refrens invoice.
+  await maybePush(actor, existing.id, existing.refrensId);
+
+  const bankChanged = body.bankDetails !== undefined && body.bankDetails !== existing.bankDetails;
+  await auditInvoice(actor, 'invoice.update', existing.id, req.ip, {
+    fields: Object.keys(patch).filter((k) => k !== 'updatedAt'),
+    ...(patch.total !== undefined ? { totalBefore: existing.total, totalAfter: patch.total } : {}),
+  });
+  if (bankChanged) {
+    // Payment-redirection risk: always keep the before/after of bank details.
+    await auditInvoice(actor, 'invoice.bank_details.update', existing.id, req.ip, {
+      before: existing.bankDetails,
+      after: body.bankDetails,
+    });
+  }
+
+  const reloaded = await loadInvoice(actor, existing.id);
   const items = await db
     .select()
     .from(invoiceItems)
-    .where(eq(invoiceItems.invoiceId, existing.id))
+    .where(and(eq(invoiceItems.invoiceId, existing.id), eq(invoiceItems.agencyId, actor.agencyId)))
     .orderBy(invoiceItems.position);
-  ok(res, serializeInvoice(row!, { items }));
+  ok(res, serializeInvoice(actor, reloaded!.row, { items, paidAmount: paid }));
 });
 
-// ---- UPDATE STATUS ----
-invoicesRouter.patch('/:id/status', async (req, res) => {
-  const ctx = getAuth(req);
-  const invoiceId = param(req, 'id');
-  const body = z.object({ status: z.enum(['draft', 'sent', 'cancelled', 'paid']) }).parse(req.body);
+// ---- UPDATE STATUS (explicit state machine) ----
+const statusSchema = z.object({
+  status: z.enum(['draft', 'sent', 'cancelled', 'paid']),
+  /** Mark paid although recorded payments do not cover the total (audited). */
+  override: z.boolean().optional(),
+  reason: z.string().trim().max(500).optional(),
+});
 
-  const [existing] = await db
-    .select({ id: invoices.id, refrensId: invoices.refrensId })
-    .from(invoices)
-    .where(and(eq(invoices.id, invoiceId), eq(invoices.agencyId, ctx.agencyId)))
-    .limit(1);
-  if (!existing) throw notFound('Invoice not found.');
+invoicesRouter.patch('/:id/status', requires('invoices.change_status'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const body = statusSchema.parse(req.body);
+  const loaded = await loadInvoice(actor, param(req, 'id'));
+  authorize(actor, 'invoices.change_status', loaded?.facts, { view: 'invoices.view' });
+  const existing = loaded!.row;
 
-  await db
-    .update(invoices)
-    .set({ status: body.status, updatedAt: new Date() })
-    .where(and(eq(invoices.id, invoiceId), eq(invoices.agencyId, ctx.agencyId)));
+  const paid = await paidTotal(actor.agencyId, existing.id);
+  const reason = invoiceTransitionError({
+    from: existing.status,
+    to: body.status,
+    paid,
+    total: existing.total,
+    override: body.override === true,
+  });
+  if (reason) throw invalidState(reason);
 
-  // Two-way: mirror the new status onto the linked Refrens invoice.
-  if (existing.refrensId && refrensAutoPushEnabled()) {
-    await pushInvoice(ctx.agencyId, invoiceId).catch(() => undefined);
+  if (body.status !== existing.status) {
+    const updated = await db
+      .update(invoices)
+      .set({ status: body.status, updatedAt: new Date() })
+      .where(
+        and(
+          eq(invoices.id, existing.id),
+          eq(invoices.agencyId, actor.agencyId),
+          eq(invoices.status, existing.status),
+        ),
+      )
+      .returning({ id: invoices.id });
+    if (!updated.length) throw invalidState('The invoice changed meanwhile. Reload and try again.');
+
+    const overridden = body.status === 'paid' && paid < existing.total;
+    await auditInvoice(actor, overridden ? 'invoice.status.override_paid' : 'invoice.status', existing.id, req.ip, {
+      before: existing.status,
+      after: body.status,
+      paid,
+      total: existing.total,
+      ...(overridden ? { override: true, reason: body.reason ?? null } : {}),
+    });
+
+    // Two-way: mirror the new status onto the linked Refrens invoice.
+    await maybePush(actor, existing.id, existing.refrensId);
   }
 
   ok(res, { status: body.status });
 });
 
 // ---- SEND INVOICE ----
-// Invoices have no public no-login view page — the client's only way to see
-// one online is the logged-in client portal — so sending an invoice always
-// mails the client their portal sign-in (link + email + password), the same
-// credential email used for document-mode proposals/agreements.
-invoicesRouter.post('/:id/send', async (req, res) => {
-  const ctx = getAuth(req);
-  const invoiceId = param(req, 'id');
+// Invoices have no public no-login view page — the client sees them in the
+// client portal, so sending delivers portal access (never overwriting an
+// existing client login).
+invoicesRouter.post('/:id/send', requires('invoices.send'), async (req, res) => {
+  const actor = getStaffActor(req);
   const body = z
-    .object({ recipientEmail: z.string().email(), message: z.string().optional() })
+    .object({ recipientEmail: z.string().email(), message: z.string().max(2000).optional() })
     .parse(req.body);
+  const loaded = await loadInvoice(actor, param(req, 'id'));
+  authorize(actor, 'invoices.send', loaded?.facts, { view: 'invoices.view' });
+  const inv = loaded!.row;
+  if (inv.status === 'cancelled') throw invalidState('A cancelled invoice cannot be sent.');
 
-  const [inv] = await db
-    .select()
-    .from(invoices)
-    .where(and(eq(invoices.id, invoiceId), eq(invoices.agencyId, ctx.agencyId)))
-    .limit(1);
-  if (!inv) throw notFound('Invoice not found.');
-
-  const client = await requireClientAccess(ctx, inv.clientId);
-  const [agency] = await db.select({ name: agencies.name }).from(agencies).where(eq(agencies.id, ctx.agencyId)).limit(1);
+  const [agency] = await db.select({ name: agencies.name }).from(agencies).where(eq(agencies.id, actor.agencyId)).limit(1);
   const agencyName = agency?.name ?? 'Creative Monk';
 
-  const login = await mintClientPortalLogin({
-    agencyId: ctx.agencyId,
-    clientId: client.id,
-    clientName: client.name,
-    clientContactEmail: client.contactEmail,
-    email: body.recipientEmail,
-  });
-
   const amountLabel = `₹${(inv.total / 100).toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
-  const invoiceLabel = inv.invoiceNumber ? `Invoice ${inv.invoiceNumber}` : 'A new invoice';
-  await sendClientPortalLoginEmail({
+  const invoiceLabel = inv.invoiceNumber ? `Invoice ${escapeHtml(inv.invoiceNumber)}` : 'A new invoice';
+  const delivered = await deliverViaPortalLogin({
+    actor,
     req,
+    clientId: inv.clientId,
+    recipientEmail: body.recipientEmail,
     agencyName,
-    clientName: client.name,
-    to: body.recipientEmail,
-    email: login.email,
-    password: login.password,
-    note: `${body.message ? `${body.message} ` : ''}${invoiceLabel} for ${amountLabel} is ready to view in your portal.`.trim(),
+    note: `${body.message ? `${escapeHtml(body.message)} ` : ''}${invoiceLabel} for ${amountLabel} is ready to view in your portal.`.trim(),
   });
 
+  const newStatus = inv.status === 'draft' ? 'sent' : inv.status;
   await db
     .update(invoices)
-    .set({
-      status: inv.status === 'draft' ? 'sent' : inv.status,
-      updatedAt: new Date(),
-    })
-    .where(eq(invoices.id, inv.id));
+    .set({ status: newStatus, updatedAt: new Date() })
+    .where(and(eq(invoices.id, inv.id), eq(invoices.agencyId, actor.agencyId)));
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
-    action: 'invoice.send',
-    entityType: 'invoice',
-    entityId: inv.id,
-    metadata: { recipientEmail: body.recipientEmail },
-    ip: req.ip,
+  await auditInvoice(actor, 'invoice.send', inv.id, req.ip, {
+    recipientEmail: body.recipientEmail,
+    portalLoginCreated: delivered.created,
+    ...(newStatus !== inv.status ? { statusBefore: inv.status, statusAfter: newStatus } : {}),
   });
 
   ok(res, { sent: true });

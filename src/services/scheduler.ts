@@ -2,6 +2,8 @@ import cron from 'node-cron';
 import { db } from '../db/client.js';
 import { agencies } from '../db/schema.js';
 import { emailEmployeeReports } from './reports.js';
+import { audit } from './audit.js';
+import { actorAuditId, systemActor } from '../authz/actor.js';
 import { sweepStaleTimers } from '../routes/timers.js';
 import { runMediaArchive } from './media-archive.js';
 import { sweepEndedMonths } from './archive.js';
@@ -23,13 +25,34 @@ export function previousMonthRange(now: Date): { from: string; to: string } {
   };
 }
 
-/** Email last month's per-employee reports for every agency. */
-async function runMonthlyReports(): Promise<void> {
-  const { from, to } = previousMonthRange(new Date());
+/** Explicit, minimal grants of the monthly reports job (design §I.4). */
+export const MONTHLY_REPORTS_GRANTS = [
+  'attendance.view_reports',
+  'attendance.email_reports',
+  'time_logs.view',
+  'tasks.view',
+].map((permission) => ({ permission, scope: 'organization' as const }));
+
+/**
+ * Email last month's per-employee reports for every agency. Runs as a per-agency
+ * system actor (never as a user) and is audited with actorType 'system'.
+ */
+export async function runMonthlyReports(now = new Date()): Promise<void> {
+  const { from, to } = previousMonthRange(now);
   const rows = await db.select({ id: agencies.id }).from(agencies);
   for (const a of rows) {
     try {
-      const r = await emailEmployeeReports(a.id, from, to);
+      const actor = systemActor('monthly_reports', a.id, MONTHLY_REPORTS_GRANTS);
+      const r = await emailEmployeeReports(actor, from, to);
+      await audit({
+        agencyId: a.id,
+        actorType: actor.type,
+        actorId: actorAuditId(actor),
+        action: 'attendance.reports.emailed',
+        entityType: 'agency',
+        entityId: a.id,
+        metadata: { from, to, ...r, job: actor.job },
+      });
       console.log(
         `[reports] monthly ${from}..${to} agency=${a.id} employees=${r.employees} owners=${r.owners}`,
       );
@@ -75,7 +98,9 @@ export function startScheduler(): void {
   setTimeout(() => void runMonthArchiveSweep('startup backfill'), 20_000);
 
   // Every 15 min: auto-close timers left running past their shift end (for
-  // people who forgot to stop the timer AND to check out).
+  // people who forgot to stop the timer AND to check out). The sweep acts per
+  // agency as systemActor('timer_sweep', agency, [time_logs.create:organization])
+  // (routes/timers.ts) — never as the timer's owner — audited as 'system'.
   cron.schedule('*/15 * * * *', () => {
     void sweepStaleTimers()
       .then((n) => {
@@ -87,10 +112,12 @@ export function startScheduler(): void {
 
   // Weekly (Sun 22:00): archive + delete self-hosted media past the retention
   // window. Off unless MEDIA_AUTODELETE_ENABLED — local files are only removed
-  // after their archive copy to Drive succeeds.
+  // after their archive copy to Drive succeeds. Runs as
+  // systemActor('media-archive', agency, ['storage.archive']) per agency, only
+  // within PLATFORM_AGENCY_ID when that is set; audited as actorType 'system'.
   if (env.MEDIA_AUTODELETE_ENABLED) {
     cron.schedule('0 22 * * 0', () => {
-      void runMediaArchive()
+      void runMediaArchive({ agencyId: env.PLATFORM_AGENCY_ID })
         .then((r) => {
           if (r.archived > 0 || r.errors > 0) {
             console.log(
@@ -105,15 +132,40 @@ export function startScheduler(): void {
 
   // Every 15 min: pull invoices from Refrens (it has no webhooks, so polling is
   // the only option). Off unless REFRENS_SYNC_ENABLED and credentials are set.
+  // Only for the agency bound to the credentials (REFRENS_AGENCY_ID), as
+  // systemActor('refrens-pull', agency, [invoices.sync, invoices.create]);
+  // every run is audited with actorType 'system'.
   if (refrensSyncEnabled()) {
     cron.schedule('*/15 * * * *', () => {
       void (async () => {
         const agencyId = await syncAgencyId();
         if (!agencyId) {
-          console.warn('[refrens] skipped: could not resolve a single agency to sync into');
+          console.warn('[refrens] skipped: REFRENS_AGENCY_ID is not set to an existing agency');
           return;
         }
-        const r = await pullInvoices(agencyId);
+        const actor = systemActor('refrens-pull', agencyId, [
+          { permission: 'invoices.sync', scope: 'organization' },
+          { permission: 'invoices.create', scope: 'organization' },
+        ]);
+        if (!actor.grants.has('invoices.sync') || !actor.grants.has('invoices.create')) return;
+        const r = await pullInvoices(actor.agencyId);
+        await audit({
+          agencyId: actor.agencyId,
+          actorType: actor.type,
+          actorId: actorAuditId(actor),
+          action: 'refrens.sync',
+          entityType: 'agency',
+          entityId: actor.agencyId,
+          metadata: {
+            job: actor.job,
+            scanned: r.scanned,
+            created: r.created,
+            updated: r.updated,
+            clientsCreated: r.clientsCreated,
+            paymentsAdded: r.paymentsAdded,
+            errors: r.errors.length,
+          },
+        });
         if (r.created || r.updated || r.errors.length) {
           console.log(
             `[refrens] pulled ${r.scanned}: +${r.created} new, ${r.updated} updated, ` +
@@ -127,7 +179,9 @@ export function startScheduler(): void {
 
   // Every 5 min: publish approved/scheduled posts that came due to the client's
   // connected Instagram / Facebook accounts. Off unless SOCIAL_PUBLISH_ENABLED
-  // and the Meta app credentials are set.
+  // and the Meta app credentials are set. Runs as
+  // systemActor('social-auto-publish', agency, ['posts.publish']) and only
+  // publishes posts whose client approval is still valid; audited as 'system'.
   if (socialPublishEnabled()) {
     cron.schedule('*/5 * * * *', () => {
       void runDuePublishing()

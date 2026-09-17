@@ -117,7 +117,7 @@ describe('invoices: pagination, summary, edit', () => {
     const inv = await makeInvoice(100_000);
     await owner.patch(`${BASE}/invoices/${inv.id}/status`).send({ status: 'cancelled' });
     const res = await owner.patch(`${BASE}/invoices/${inv.id}`).send({ notes: 'x' });
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(409);
     expect(String(res.body?.error?.message ?? '')).toMatch(/cancelled/i);
   });
 

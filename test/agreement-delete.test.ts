@@ -72,7 +72,7 @@ describe('agreement delete', () => {
     expect((await owner.get(`${BASE}/agreements/${a.id}`)).status).toBe(404);
   });
 
-  it('refuses to delete terminated or expired agreements (executed history)', async () => {
+  it('refuses to delete terminated or expired agreements (executed history, 409)', async () => {
     for (const status of ['terminated', 'expired'] as const) {
       const a = data(
         await owner.post(`${BASE}/agreements`).send({
@@ -89,7 +89,7 @@ describe('agreement delete', () => {
       await db.update(agreements).set({ status }).where(eq(agreements.id, a.id));
 
       const res = await owner.delete(`${BASE}/agreements/${a.id}`);
-      expect(res.status).toBe(400);
+      expect(res.status).toBe(409);
       expect(String(res.body?.error?.message ?? '')).toMatch(new RegExp(status, 'i'));
     }
   });
@@ -102,8 +102,13 @@ describe('agreement delete', () => {
         terms: { scope: 'work', clauses: ['1. Clause'] },
       }),
     );
-    // Client signs it via the public token route.
-    const signed = await supertest(app).post(`${BASE}/agreements/public/${a.token}/sign`).send({
+    // Sending mints the (hashed) public link; the client signs through it.
+    const sent = await owner
+      .post(`${BASE}/agreements/${a.id}/send`)
+      .send({ recipientEmail: 'jane@client.com' });
+    expect(sent.status).toBe(200);
+    const token = String(data(sent).signUrl).split('/').pop();
+    const signed = await supertest(app).post(`${BASE}/agreements/public/${token}/sign`).send({
       signerName: 'Jane Client',
       signerEmail: 'jane@client.com',
       signatureDataUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAhowever',
@@ -111,7 +116,7 @@ describe('agreement delete', () => {
     expect([200, 201]).toContain(signed.status);
 
     const del = await owner.delete(`${BASE}/agreements/${a.id}`);
-    expect(del.status).toBe(400);
+    expect(del.status).toBe(409);
     expect(String(del.body?.error?.message ?? '')).toMatch(/signed|active|cannot/i);
   });
 });

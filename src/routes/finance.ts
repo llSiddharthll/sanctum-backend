@@ -12,16 +12,12 @@ import {
   users,
 } from '../db/schema.js';
 import { ok, param, toIso } from '../lib/http.js';
-import { notFound } from '../lib/errors.js';
-import { requireAuth, requireRole } from '../middleware/auth.js';
-import { requireModuleRW } from '../middleware/permissions.js';
-import { getAuth } from '../middleware/tenant.js';
+import { authenticate, getStaffActor, requires } from '../authz/http.js';
+import { authorize, canOrg } from '../authz/engine.js';
+import { clientFacts } from '../authz/policies/clients.js';
 
 export const financeRouter = Router();
-financeRouter.use(requireAuth);
-financeRouter.use(requireModuleRW('finance'));
-// Money is owner ONLY — hard role backstop so nobody except the owner can reach financial data.
-financeRouter.use(requireRole('owner'));
+financeRouter.use(authenticate);
 
 /**
  * GET /finance/overview?from&to
@@ -45,8 +41,8 @@ function currentFinancialYear(nowMs = Date.now()): { from: Date; to: Date } {
   };
 }
 
-financeRouter.get('/overview', async (req, res) => {
-  const ctx = getAuth(req);
+financeRouter.get('/overview', requires('finance.view_overview'), async (req, res) => {
+  const ctx = getStaffActor(req);
   const q = overviewQuery.parse(req.query);
   const fy = currentFinancialYear();
   const from = q.from ?? fy.from;
@@ -96,20 +92,21 @@ financeRouter.get('/overview', async (req, res) => {
 });
 
 /**
- * GET /finance/clients/:clientId — a single client's financial rollup (owner/
- * admin only, inherited from the router gates). All money = INTEGER PAISE.
- * Surfaced on the client detail page's Financials section.
+ * GET /finance/clients/:clientId — a single client's financial rollup. Needs
+ * finance.view_reports + clients.view_financials on that client; the deal
+ * pipeline value additionally needs deals.view_value. All money = INTEGER PAISE.
  */
-financeRouter.get('/clients/:clientId', async (req, res) => {
-  const ctx = getAuth(req);
+financeRouter.get('/clients/:clientId', requires('finance.view_reports', 'clients.view_financials'), async (req, res) => {
+  const ctx = getStaffActor(req);
   const clientId = param(req, 'clientId');
 
+  const facts = await clientFacts(ctx, clientId);
+  authorize(ctx, 'clients.view_financials', facts, { view: 'clients.view' });
   const [client] = await db
     .select({ id: clients.id, name: clients.name })
     .from(clients)
     .where(and(eq(clients.id, clientId), eq(clients.agencyId, ctx.agencyId)))
     .limit(1);
-  if (!client) throw notFound('Client not found.');
 
   // Invoices for this client (exclude cancelled from billed).
   const inv = await db
@@ -129,7 +126,7 @@ financeRouter.get('/clients/:clientId', async (req, res) => {
     const [payRow] = await db
       .select({ v: sum(invoicePayments.amount) })
       .from(invoicePayments)
-      .where(inArray(invoicePayments.invoiceId, invoiceIds));
+      .where(and(eq(invoicePayments.agencyId, ctx.agencyId), inArray(invoicePayments.invoiceId, invoiceIds)));
     paid = Number(payRow?.v ?? 0);
   }
 
@@ -149,26 +146,28 @@ financeRouter.get('/clients/:clientId', async (req, res) => {
     );
   const dealPipelineValue = Number(dealRow?.v ?? 0);
 
+  const canSeeDeals = canOrg(ctx, 'deals.view_value');
   ok(res, {
-    clientId: client.id,
-    clientName: client.name,
+    clientId: client!.id,
+    clientName: client!.name,
     invoiceCount: inv.length,
     billed, // paise
     paid, // paise
     outstanding: Math.max(0, billed - paid), // paise
     expenses: expensesTotal, // paise
-    dealPipelineValue, // paise
+    dealPipelineValue: canSeeDeals ? dealPipelineValue : null, // paise
   });
 });
 
 /**
- * GET /finance/owner-snapshot — the owner's money at a glance. All paise.
- * Revenue (collected) + outstanding, total expenses, recurring monthly payroll,
- * a rough monthly net, plus recent invoices/expenses and the per-member salary
- * roster. Owner-only (router gate).
+ * GET /finance/owner-snapshot — money at a glance. All paise.
+ * Needs finance.view_overview. Payroll, the monthly net that includes payroll,
+ * and the per-member salary roster additionally need users.view_compensation
+ * (organization); otherwise they are null.
  */
-financeRouter.get('/owner-snapshot', async (req, res) => {
-  const ctx = getAuth(req);
+financeRouter.get('/owner-snapshot', requires('finance.view_overview'), async (req, res) => {
+  const ctx = getStaffActor(req);
+  const canSeeComp = canOrg(ctx, 'users.view_compensation');
 
   // Invoices (exclude cancelled from billed).
   const inv = await db
@@ -196,7 +195,7 @@ financeRouter.get('/owner-snapshot', async (req, res) => {
         amount: invoicePayments.amount,
       })
       .from(invoicePayments)
-      .where(inArray(invoicePayments.invoiceId, invoiceIds));
+      .where(and(eq(invoicePayments.agencyId, ctx.agencyId), inArray(invoicePayments.invoiceId, invoiceIds)));
     for (const p of pays) {
       const amt = Number(p.amount ?? 0);
       paid += amt;
@@ -225,7 +224,6 @@ financeRouter.get('/owner-snapshot', async (req, res) => {
       id: users.id,
       name: users.fullName,
       role: users.role,
-      customRoleId: users.customRoleId,
       designation: users.designation,
       salary: users.monthlySalaryPaise,
     })
@@ -233,7 +231,7 @@ financeRouter.get('/owner-snapshot', async (req, res) => {
     .where(
       and(
         eq(users.agencyId, ctx.agencyId),
-        ne(users.role, 'client'),
+        eq(users.kind, 'staff'),
         eq(users.status, 'active'),
       ),
     );
@@ -358,9 +356,9 @@ financeRouter.get('/owner-snapshot', async (req, res) => {
     recurringRevenue,
     oneTimeMonthly,
     monthlyExpenses,
-    monthlyPayroll,
+    monthlyPayroll: canSeeComp ? monthlyPayroll : null,
     // Coherent monthly net: this-month revenue − this-month expenses − payroll.
-    monthlyNet: monthlyRevenue - monthlyExpenses - monthlyPayroll,
+    monthlyNet: canSeeComp ? monthlyRevenue - monthlyExpenses - monthlyPayroll : null,
     // Cash view (invoices): collected to date + what's still owed.
     collected: paid,
     revenue: paid, // legacy alias (collected)
@@ -371,7 +369,7 @@ financeRouter.get('/owner-snapshot', async (req, res) => {
     invoiceCount: inv.length,
     overdueCount,
     headcount: staff.length,
-    salaries: staff
+    salaries: !canSeeComp ? null : staff
       .filter((s) => Number(s.salary ?? 0) > 0)
       .sort((a, b) => Number(b.salary ?? 0) - Number(a.salary ?? 0))
       .map((s) => ({
