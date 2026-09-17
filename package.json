@@ -16,7 +16,9 @@
     "test:watch": "vitest",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
-    "db:seed": "tsc -p tsconfig.json && node dist/seed.js"
+    "db:seed": "tsc -p tsconfig.json && node dist/seed.js",
+    "authz:generate": "tsx scripts/authz-generate.ts",
+    "authz:check": "tsx scripts/authz-generate.ts --check"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.65.0",

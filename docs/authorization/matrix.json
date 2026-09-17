@@ -1,0 +1,2111 @@
+{
+  "version": "13l768h",
+  "note": "Default grants for new agencies (system roles) and role templates. Existing agencies may have edited roles.",
+  "roles": [
+    {
+      "key": "owner",
+      "name": "Owner",
+      "kind": "system",
+      "actorType": "staff",
+      "grants": {
+        "organization.view": [
+          "organization"
+        ],
+        "organization.update": [
+          "organization"
+        ],
+        "organization.view_usage": [
+          "organization"
+        ],
+        "organization.view_audit_log": [
+          "organization"
+        ],
+        "storage.view": [
+          "organization"
+        ],
+        "storage.archive": [
+          "organization"
+        ],
+        "users.view": [
+          "organization"
+        ],
+        "users.invite": [
+          "organization"
+        ],
+        "users.update": [
+          "organization"
+        ],
+        "users.view_compensation": [
+          "organization"
+        ],
+        "users.update_compensation": [
+          "organization"
+        ],
+        "users.disable": [
+          "organization"
+        ],
+        "users.delete": [
+          "organization"
+        ],
+        "users.reset_password": [
+          "organization"
+        ],
+        "users.revoke_sessions": [
+          "organization"
+        ],
+        "users.view_activity": [
+          "organization"
+        ],
+        "users.assign_roles": [
+          "organization"
+        ],
+        "users.manage_permissions": [
+          "organization"
+        ],
+        "roles.view": [
+          "organization"
+        ],
+        "roles.create": [
+          "organization"
+        ],
+        "roles.update": [
+          "organization"
+        ],
+        "roles.archive": [
+          "organization"
+        ],
+        "client_users.view": [
+          "organization"
+        ],
+        "client_users.invite": [
+          "organization"
+        ],
+        "client_users.update": [
+          "organization"
+        ],
+        "client_users.disable": [
+          "organization"
+        ],
+        "client_users.reset_password": [
+          "organization"
+        ],
+        "clients.view": [
+          "organization"
+        ],
+        "clients.create": [
+          "organization"
+        ],
+        "clients.update": [
+          "organization"
+        ],
+        "clients.archive": [
+          "organization"
+        ],
+        "clients.view_financials": [
+          "organization"
+        ],
+        "clients.view_activity": [
+          "organization"
+        ],
+        "clients.manage_assignments": [
+          "organization"
+        ],
+        "clients.manage_portal": [
+          "organization"
+        ],
+        "contacts.manage": [
+          "organization"
+        ],
+        "client_notes.create": [
+          "organization"
+        ],
+        "client_notes.update": [
+          "organization"
+        ],
+        "client_notes.delete": [
+          "organization"
+        ],
+        "tags.manage": [
+          "organization"
+        ],
+        "deals.view": [
+          "organization"
+        ],
+        "deals.create": [
+          "organization"
+        ],
+        "deals.update": [
+          "organization"
+        ],
+        "deals.delete": [
+          "organization"
+        ],
+        "deals.view_value": [
+          "organization"
+        ],
+        "deals.update_value": [
+          "organization"
+        ],
+        "posts.view": [
+          "organization"
+        ],
+        "posts.create": [
+          "organization"
+        ],
+        "posts.update": [
+          "organization"
+        ],
+        "posts.delete": [
+          "organization"
+        ],
+        "posts.submit_for_approval": [
+          "organization"
+        ],
+        "posts.schedule": [
+          "organization"
+        ],
+        "posts.publish": [
+          "organization"
+        ],
+        "posts.archive": [
+          "organization"
+        ],
+        "posts.restore": [
+          "organization"
+        ],
+        "post_comments.view": [
+          "organization"
+        ],
+        "post_comments.create": [
+          "organization"
+        ],
+        "media.upload": [
+          "organization"
+        ],
+        "media.delete": [
+          "organization"
+        ],
+        "social_accounts.view": [
+          "organization"
+        ],
+        "social_accounts.manage": [
+          "organization"
+        ],
+        "ai.generate_content": [
+          "organization"
+        ],
+        "ai.use_assistant": [
+          "organization"
+        ],
+        "ai.task_breakdown": [
+          "organization"
+        ],
+        "projects.view": [
+          "organization"
+        ],
+        "projects.create": [
+          "organization"
+        ],
+        "projects.update": [
+          "organization"
+        ],
+        "projects.delete": [
+          "organization"
+        ],
+        "projects.view_financials": [
+          "organization"
+        ],
+        "projects.update_financials": [
+          "organization"
+        ],
+        "projects.manage_members": [
+          "organization"
+        ],
+        "project_milestones.manage": [
+          "organization"
+        ],
+        "project_labels.manage": [
+          "organization"
+        ],
+        "tasks.view": [
+          "organization"
+        ],
+        "tasks.create": [
+          "organization"
+        ],
+        "tasks.update": [
+          "organization"
+        ],
+        "tasks.assign": [
+          "organization"
+        ],
+        "tasks.delete": [
+          "organization"
+        ],
+        "tasks.archive": [
+          "organization"
+        ],
+        "tasks.restore": [
+          "organization"
+        ],
+        "task_comments.create": [
+          "organization"
+        ],
+        "task_comments.update": [
+          "organization"
+        ],
+        "task_comments.delete": [
+          "organization"
+        ],
+        "timers.use": [
+          "own"
+        ],
+        "timers.view": [
+          "organization"
+        ],
+        "time_logs.view": [
+          "organization"
+        ],
+        "time_logs.create": [
+          "organization"
+        ],
+        "time_logs.update": [
+          "organization"
+        ],
+        "time_logs.delete": [
+          "organization"
+        ],
+        "reports.view_dashboard": [
+          "organization"
+        ],
+        "reports.view_team_overview": [
+          "organization"
+        ],
+        "reports.view_leaderboard": [
+          "organization"
+        ],
+        "attendance.check_in": [
+          "own"
+        ],
+        "attendance.view": [
+          "organization"
+        ],
+        "attendance.view_live": [
+          "organization"
+        ],
+        "attendance.view_reports": [
+          "organization"
+        ],
+        "attendance.email_reports": [
+          "organization"
+        ],
+        "attendance.mark": [
+          "organization"
+        ],
+        "attendance.manage_policy": [
+          "organization"
+        ],
+        "holidays.manage": [
+          "organization"
+        ],
+        "leave_types.manage": [
+          "organization"
+        ],
+        "leaves.request": [
+          "own"
+        ],
+        "leaves.view": [
+          "organization"
+        ],
+        "leaves.approve": [
+          "organization"
+        ],
+        "leaves.cancel": [
+          "organization"
+        ],
+        "regularizations.request": [
+          "own"
+        ],
+        "regularizations.view": [
+          "organization"
+        ],
+        "regularizations.approve": [
+          "organization"
+        ],
+        "regularizations.cancel": [
+          "organization"
+        ],
+        "checkout_requests.request": [
+          "own"
+        ],
+        "checkout_requests.view": [
+          "organization"
+        ],
+        "checkout_requests.approve": [
+          "organization"
+        ],
+        "checkout_requests.cancel": [
+          "organization"
+        ],
+        "messages.view": [
+          "organization"
+        ],
+        "messages.send": [
+          "assigned"
+        ],
+        "messages.update": [
+          "own"
+        ],
+        "messages.delete": [
+          "organization"
+        ],
+        "messages.pin": [
+          "organization"
+        ],
+        "threads.create": [
+          "organization"
+        ],
+        "threads.update": [
+          "organization"
+        ],
+        "threads.manage_participants": [
+          "organization"
+        ],
+        "threads.delete": [
+          "organization"
+        ],
+        "documents.view": [
+          "organization"
+        ],
+        "documents.view_hidden": [
+          "organization"
+        ],
+        "documents.upload": [
+          "organization"
+        ],
+        "documents.update": [
+          "organization"
+        ],
+        "documents.delete": [
+          "organization"
+        ],
+        "documents.share_with_client": [
+          "organization"
+        ],
+        "documents.hide_from_team": [
+          "organization"
+        ],
+        "folders.create": [
+          "organization"
+        ],
+        "folders.update": [
+          "organization"
+        ],
+        "folders.delete": [
+          "organization"
+        ],
+        "sheets.view": [
+          "organization"
+        ],
+        "sheets.create": [
+          "organization"
+        ],
+        "sheets.update": [
+          "organization"
+        ],
+        "sheets.delete": [
+          "organization"
+        ],
+        "sheets.publish": [
+          "organization"
+        ],
+        "leads.view": [
+          "organization"
+        ],
+        "leads.create": [
+          "organization"
+        ],
+        "leads.update": [
+          "organization"
+        ],
+        "leads.delete": [
+          "organization"
+        ],
+        "leads.assign": [
+          "organization"
+        ],
+        "leads.convert": [
+          "organization"
+        ],
+        "leads.view_value": [
+          "organization"
+        ],
+        "proposals.view": [
+          "organization"
+        ],
+        "proposals.create": [
+          "organization"
+        ],
+        "proposals.update": [
+          "organization"
+        ],
+        "proposals.send": [
+          "organization"
+        ],
+        "proposals.convert": [
+          "organization"
+        ],
+        "proposals.manage_templates": [
+          "organization"
+        ],
+        "proposals.view_pricing": [
+          "organization"
+        ],
+        "agreements.view": [
+          "organization"
+        ],
+        "agreements.create": [
+          "organization"
+        ],
+        "agreements.update": [
+          "organization"
+        ],
+        "agreements.delete": [
+          "organization"
+        ],
+        "agreements.send": [
+          "organization"
+        ],
+        "agreements.manage_templates": [
+          "organization"
+        ],
+        "agreements.view_pricing": [
+          "organization"
+        ],
+        "invoices.view": [
+          "organization"
+        ],
+        "invoices.create": [
+          "organization"
+        ],
+        "invoices.update": [
+          "organization"
+        ],
+        "invoices.change_status": [
+          "organization"
+        ],
+        "invoices.record_payment": [
+          "organization"
+        ],
+        "invoices.send": [
+          "organization"
+        ],
+        "invoices.sync": [
+          "organization"
+        ],
+        "expenses.view": [
+          "organization"
+        ],
+        "expenses.create": [
+          "organization"
+        ],
+        "expenses.update": [
+          "organization"
+        ],
+        "expenses.delete": [
+          "organization"
+        ],
+        "finance.view_overview": [
+          "organization"
+        ],
+        "finance.view_reports": [
+          "organization"
+        ]
+      }
+    },
+    {
+      "key": "admin",
+      "name": "Administrator",
+      "kind": "system",
+      "actorType": "staff",
+      "grants": {
+        "organization.view": [
+          "organization"
+        ],
+        "organization.update": [
+          "organization"
+        ],
+        "organization.view_usage": [
+          "organization"
+        ],
+        "organization.view_audit_log": [
+          "organization"
+        ],
+        "storage.view": [
+          "organization"
+        ],
+        "storage.archive": [
+          "organization"
+        ],
+        "users.view": [
+          "organization"
+        ],
+        "users.invite": [
+          "organization"
+        ],
+        "users.update": [
+          "organization"
+        ],
+        "users.disable": [
+          "organization"
+        ],
+        "users.delete": [
+          "organization"
+        ],
+        "users.reset_password": [
+          "organization"
+        ],
+        "users.revoke_sessions": [
+          "organization"
+        ],
+        "users.view_activity": [
+          "own",
+          "organization"
+        ],
+        "users.assign_roles": [
+          "organization"
+        ],
+        "users.manage_permissions": [
+          "organization"
+        ],
+        "roles.view": [
+          "organization"
+        ],
+        "roles.create": [
+          "organization"
+        ],
+        "roles.update": [
+          "organization"
+        ],
+        "roles.archive": [
+          "organization"
+        ],
+        "client_users.view": [
+          "organization"
+        ],
+        "client_users.invite": [
+          "organization"
+        ],
+        "client_users.update": [
+          "organization"
+        ],
+        "client_users.disable": [
+          "organization"
+        ],
+        "client_users.reset_password": [
+          "organization"
+        ],
+        "clients.view": [
+          "organization"
+        ],
+        "clients.create": [
+          "organization"
+        ],
+        "clients.update": [
+          "organization"
+        ],
+        "clients.archive": [
+          "organization"
+        ],
+        "clients.view_activity": [
+          "organization"
+        ],
+        "clients.manage_assignments": [
+          "organization"
+        ],
+        "clients.manage_portal": [
+          "organization"
+        ],
+        "contacts.manage": [
+          "organization"
+        ],
+        "client_notes.create": [
+          "organization"
+        ],
+        "client_notes.update": [
+          "own",
+          "organization"
+        ],
+        "client_notes.delete": [
+          "own",
+          "organization"
+        ],
+        "tags.manage": [
+          "organization"
+        ],
+        "deals.view": [
+          "organization"
+        ],
+        "deals.create": [
+          "organization"
+        ],
+        "deals.update": [
+          "organization"
+        ],
+        "deals.delete": [
+          "organization"
+        ],
+        "posts.view": [
+          "organization"
+        ],
+        "posts.create": [
+          "organization"
+        ],
+        "posts.update": [
+          "organization"
+        ],
+        "posts.delete": [
+          "organization"
+        ],
+        "posts.submit_for_approval": [
+          "organization"
+        ],
+        "posts.schedule": [
+          "organization"
+        ],
+        "posts.publish": [
+          "organization"
+        ],
+        "posts.archive": [
+          "organization"
+        ],
+        "posts.restore": [
+          "organization"
+        ],
+        "post_comments.view": [
+          "organization"
+        ],
+        "post_comments.create": [
+          "organization"
+        ],
+        "media.upload": [
+          "organization"
+        ],
+        "media.delete": [
+          "organization"
+        ],
+        "social_accounts.view": [
+          "organization"
+        ],
+        "social_accounts.manage": [
+          "organization"
+        ],
+        "ai.generate_content": [
+          "organization"
+        ],
+        "ai.use_assistant": [
+          "organization"
+        ],
+        "ai.task_breakdown": [
+          "project",
+          "organization"
+        ],
+        "projects.view": [
+          "organization"
+        ],
+        "projects.create": [
+          "organization"
+        ],
+        "projects.update": [
+          "assigned",
+          "organization"
+        ],
+        "projects.delete": [
+          "organization"
+        ],
+        "projects.manage_members": [
+          "assigned",
+          "organization"
+        ],
+        "project_milestones.manage": [
+          "assigned",
+          "organization"
+        ],
+        "project_labels.manage": [
+          "assigned",
+          "organization"
+        ],
+        "tasks.view": [
+          "own",
+          "assigned",
+          "project",
+          "organization"
+        ],
+        "tasks.create": [
+          "project",
+          "organization"
+        ],
+        "tasks.update": [
+          "own",
+          "assigned",
+          "project",
+          "organization"
+        ],
+        "tasks.assign": [
+          "project",
+          "organization"
+        ],
+        "tasks.delete": [
+          "own",
+          "organization"
+        ],
+        "tasks.archive": [
+          "organization"
+        ],
+        "tasks.restore": [
+          "organization"
+        ],
+        "task_comments.create": [
+          "own",
+          "assigned",
+          "project",
+          "organization"
+        ],
+        "task_comments.update": [
+          "own"
+        ],
+        "task_comments.delete": [
+          "own"
+        ],
+        "timers.use": [
+          "own"
+        ],
+        "timers.view": [
+          "project",
+          "organization"
+        ],
+        "time_logs.view": [
+          "own",
+          "project",
+          "organization"
+        ],
+        "time_logs.create": [
+          "own",
+          "organization"
+        ],
+        "time_logs.update": [
+          "own",
+          "organization"
+        ],
+        "time_logs.delete": [
+          "own",
+          "organization"
+        ],
+        "reports.view_dashboard": [
+          "organization"
+        ],
+        "reports.view_team_overview": [
+          "organization"
+        ],
+        "reports.view_leaderboard": [
+          "organization"
+        ],
+        "attendance.check_in": [
+          "own"
+        ],
+        "attendance.view": [
+          "own",
+          "organization"
+        ],
+        "attendance.view_live": [
+          "organization"
+        ],
+        "attendance.view_reports": [
+          "organization"
+        ],
+        "attendance.email_reports": [
+          "organization"
+        ],
+        "attendance.mark": [
+          "organization"
+        ],
+        "attendance.manage_policy": [
+          "organization"
+        ],
+        "holidays.manage": [
+          "organization"
+        ],
+        "leave_types.manage": [
+          "organization"
+        ],
+        "leaves.request": [
+          "own"
+        ],
+        "leaves.view": [
+          "own",
+          "organization"
+        ],
+        "leaves.approve": [
+          "organization"
+        ],
+        "leaves.cancel": [
+          "own",
+          "organization"
+        ],
+        "regularizations.request": [
+          "own"
+        ],
+        "regularizations.view": [
+          "own",
+          "organization"
+        ],
+        "regularizations.approve": [
+          "organization"
+        ],
+        "regularizations.cancel": [
+          "own",
+          "organization"
+        ],
+        "checkout_requests.request": [
+          "own"
+        ],
+        "checkout_requests.view": [
+          "own",
+          "organization"
+        ],
+        "checkout_requests.approve": [
+          "organization"
+        ],
+        "checkout_requests.cancel": [
+          "own",
+          "organization"
+        ],
+        "messages.view": [
+          "assigned"
+        ],
+        "messages.send": [
+          "assigned"
+        ],
+        "messages.update": [
+          "own"
+        ],
+        "messages.delete": [
+          "own",
+          "assigned"
+        ],
+        "messages.pin": [
+          "assigned"
+        ],
+        "threads.create": [
+          "organization"
+        ],
+        "threads.update": [
+          "own",
+          "organization"
+        ],
+        "threads.manage_participants": [
+          "own",
+          "organization"
+        ],
+        "threads.delete": [
+          "own",
+          "organization"
+        ],
+        "documents.view": [
+          "organization"
+        ],
+        "documents.upload": [
+          "organization"
+        ],
+        "documents.update": [
+          "own",
+          "organization"
+        ],
+        "documents.delete": [
+          "organization"
+        ],
+        "documents.share_with_client": [
+          "organization"
+        ],
+        "folders.create": [
+          "organization"
+        ],
+        "folders.update": [
+          "organization"
+        ],
+        "folders.delete": [
+          "organization"
+        ],
+        "sheets.view": [
+          "organization"
+        ],
+        "sheets.create": [
+          "organization"
+        ],
+        "sheets.update": [
+          "organization"
+        ],
+        "sheets.delete": [
+          "organization"
+        ],
+        "sheets.publish": [
+          "organization"
+        ]
+      }
+    },
+    {
+      "key": "employee",
+      "name": "Employee",
+      "kind": "system",
+      "actorType": "staff",
+      "grants": {
+        "organization.view": [
+          "organization"
+        ],
+        "users.view": [
+          "organization"
+        ],
+        "users.view_activity": [
+          "own"
+        ],
+        "clients.view": [
+          "organization"
+        ],
+        "deals.view": [
+          "organization"
+        ],
+        "posts.view": [
+          "organization"
+        ],
+        "post_comments.view": [
+          "organization"
+        ],
+        "social_accounts.view": [
+          "organization"
+        ],
+        "ai.use_assistant": [
+          "organization"
+        ],
+        "ai.task_breakdown": [
+          "project"
+        ],
+        "projects.view": [
+          "organization"
+        ],
+        "projects.update": [
+          "assigned"
+        ],
+        "projects.manage_members": [
+          "assigned"
+        ],
+        "project_milestones.manage": [
+          "assigned"
+        ],
+        "project_labels.manage": [
+          "assigned"
+        ],
+        "tasks.view": [
+          "own",
+          "assigned",
+          "project"
+        ],
+        "tasks.create": [
+          "project"
+        ],
+        "tasks.update": [
+          "own",
+          "assigned",
+          "project"
+        ],
+        "tasks.assign": [
+          "project"
+        ],
+        "tasks.delete": [
+          "own"
+        ],
+        "task_comments.create": [
+          "own",
+          "assigned",
+          "project"
+        ],
+        "task_comments.update": [
+          "own"
+        ],
+        "task_comments.delete": [
+          "own"
+        ],
+        "timers.use": [
+          "own"
+        ],
+        "timers.view": [
+          "project"
+        ],
+        "time_logs.view": [
+          "own",
+          "project"
+        ],
+        "time_logs.update": [
+          "own"
+        ],
+        "time_logs.delete": [
+          "own"
+        ],
+        "reports.view_dashboard": [
+          "organization"
+        ],
+        "reports.view_team_overview": [
+          "organization"
+        ],
+        "attendance.check_in": [
+          "own"
+        ],
+        "attendance.view": [
+          "own"
+        ],
+        "leaves.request": [
+          "own"
+        ],
+        "leaves.view": [
+          "own"
+        ],
+        "leaves.cancel": [
+          "own"
+        ],
+        "regularizations.request": [
+          "own"
+        ],
+        "regularizations.view": [
+          "own"
+        ],
+        "regularizations.cancel": [
+          "own"
+        ],
+        "checkout_requests.request": [
+          "own"
+        ],
+        "checkout_requests.view": [
+          "own"
+        ],
+        "checkout_requests.cancel": [
+          "own"
+        ],
+        "messages.view": [
+          "assigned"
+        ],
+        "messages.send": [
+          "assigned"
+        ],
+        "messages.update": [
+          "own"
+        ],
+        "messages.pin": [
+          "assigned"
+        ],
+        "threads.create": [
+          "organization"
+        ],
+        "threads.update": [
+          "own"
+        ],
+        "threads.manage_participants": [
+          "own"
+        ],
+        "documents.view": [
+          "organization"
+        ],
+        "documents.upload": [
+          "organization"
+        ],
+        "documents.update": [
+          "own"
+        ],
+        "documents.share_with_client": [
+          "organization"
+        ],
+        "folders.create": [
+          "organization"
+        ],
+        "folders.update": [
+          "organization"
+        ],
+        "sheets.view": [
+          "organization"
+        ],
+        "sheets.create": [
+          "organization"
+        ],
+        "sheets.update": [
+          "organization"
+        ],
+        "sheets.publish": [
+          "organization"
+        ]
+      }
+    },
+    {
+      "key": "client_approver",
+      "name": "Client (approver)",
+      "kind": "system",
+      "actorType": "client",
+      "grants": {
+        "posts.view": [
+          "client"
+        ],
+        "post_comments.view": [
+          "client"
+        ],
+        "post_comments.create": [
+          "client"
+        ],
+        "projects.view": [
+          "client"
+        ],
+        "projects.view_team": [
+          "client"
+        ],
+        "documents.view": [
+          "client"
+        ],
+        "documents.upload": [
+          "client"
+        ],
+        "folders.create": [
+          "client"
+        ],
+        "proposals.view": [
+          "client"
+        ],
+        "proposals.view_pricing": [
+          "client"
+        ],
+        "proposals.respond": [
+          "client"
+        ],
+        "agreements.view": [
+          "client"
+        ],
+        "agreements.view_pricing": [
+          "client"
+        ],
+        "agreements.sign": [
+          "client"
+        ],
+        "invoices.view": [
+          "client"
+        ],
+        "posts.approve": [
+          "client"
+        ]
+      }
+    },
+    {
+      "key": "client_reviewer",
+      "name": "Client (reviewer)",
+      "kind": "system",
+      "actorType": "client",
+      "grants": {
+        "posts.view": [
+          "client"
+        ],
+        "post_comments.view": [
+          "client"
+        ],
+        "post_comments.create": [
+          "client"
+        ],
+        "projects.view": [
+          "client"
+        ],
+        "projects.view_team": [
+          "client"
+        ],
+        "documents.view": [
+          "client"
+        ],
+        "documents.upload": [
+          "client"
+        ],
+        "folders.create": [
+          "client"
+        ],
+        "proposals.view": [
+          "client"
+        ],
+        "proposals.view_pricing": [
+          "client"
+        ],
+        "proposals.respond": [
+          "client"
+        ],
+        "agreements.view": [
+          "client"
+        ],
+        "agreements.view_pricing": [
+          "client"
+        ],
+        "agreements.sign": [
+          "client"
+        ],
+        "invoices.view": [
+          "client"
+        ]
+      }
+    },
+    {
+      "key": "share_link",
+      "name": "Share link (approve)",
+      "kind": "system",
+      "actorType": "client",
+      "grants": {
+        "posts.view": [
+          "client"
+        ],
+        "post_comments.view": [
+          "client"
+        ],
+        "post_comments.create": [
+          "client"
+        ],
+        "posts.approve": [
+          "client"
+        ]
+      }
+    },
+    {
+      "key": "share_link_reviewer",
+      "name": "Share link (review)",
+      "kind": "system",
+      "actorType": "client",
+      "grants": {
+        "posts.view": [
+          "client"
+        ],
+        "post_comments.view": [
+          "client"
+        ],
+        "post_comments.create": [
+          "client"
+        ]
+      }
+    },
+    {
+      "key": "manager",
+      "name": "Manager",
+      "kind": "template",
+      "actorType": "staff",
+      "grants": {
+        "organization.view": [
+          "organization"
+        ],
+        "users.view": [
+          "organization"
+        ],
+        "users.view_activity": [
+          "own"
+        ],
+        "clients.view": [
+          "organization"
+        ],
+        "clients.create": [
+          "organization"
+        ],
+        "clients.update": [
+          "organization"
+        ],
+        "clients.archive": [
+          "organization"
+        ],
+        "clients.view_activity": [
+          "organization"
+        ],
+        "contacts.manage": [
+          "organization"
+        ],
+        "client_notes.create": [
+          "organization"
+        ],
+        "client_notes.update": [
+          "own",
+          "organization"
+        ],
+        "client_notes.delete": [
+          "own",
+          "organization"
+        ],
+        "deals.view": [
+          "organization"
+        ],
+        "deals.create": [
+          "organization"
+        ],
+        "deals.update": [
+          "organization"
+        ],
+        "deals.delete": [
+          "organization"
+        ],
+        "posts.view": [
+          "organization"
+        ],
+        "posts.create": [
+          "organization"
+        ],
+        "posts.update": [
+          "organization"
+        ],
+        "posts.delete": [
+          "organization"
+        ],
+        "posts.submit_for_approval": [
+          "organization"
+        ],
+        "posts.schedule": [
+          "organization"
+        ],
+        "posts.publish": [
+          "organization"
+        ],
+        "posts.archive": [
+          "organization"
+        ],
+        "posts.restore": [
+          "organization"
+        ],
+        "post_comments.view": [
+          "organization"
+        ],
+        "post_comments.create": [
+          "organization"
+        ],
+        "media.upload": [
+          "organization"
+        ],
+        "media.delete": [
+          "organization"
+        ],
+        "social_accounts.view": [
+          "organization"
+        ],
+        "social_accounts.manage": [
+          "organization"
+        ],
+        "ai.generate_content": [
+          "organization"
+        ],
+        "ai.use_assistant": [
+          "organization"
+        ],
+        "ai.task_breakdown": [
+          "project",
+          "organization"
+        ],
+        "projects.view": [
+          "organization"
+        ],
+        "projects.create": [
+          "organization"
+        ],
+        "projects.update": [
+          "assigned",
+          "organization"
+        ],
+        "projects.delete": [
+          "organization"
+        ],
+        "projects.manage_members": [
+          "assigned",
+          "organization"
+        ],
+        "project_milestones.manage": [
+          "assigned",
+          "organization"
+        ],
+        "project_labels.manage": [
+          "assigned",
+          "organization"
+        ],
+        "tasks.view": [
+          "own",
+          "assigned",
+          "project",
+          "organization"
+        ],
+        "tasks.create": [
+          "project",
+          "organization"
+        ],
+        "tasks.update": [
+          "own",
+          "assigned",
+          "project",
+          "organization"
+        ],
+        "tasks.assign": [
+          "project",
+          "organization"
+        ],
+        "tasks.delete": [
+          "own",
+          "organization"
+        ],
+        "tasks.archive": [
+          "organization"
+        ],
+        "tasks.restore": [
+          "organization"
+        ],
+        "task_comments.create": [
+          "own",
+          "assigned",
+          "project",
+          "organization"
+        ],
+        "task_comments.update": [
+          "own"
+        ],
+        "task_comments.delete": [
+          "own"
+        ],
+        "timers.use": [
+          "own"
+        ],
+        "timers.view": [
+          "project",
+          "organization"
+        ],
+        "time_logs.view": [
+          "own",
+          "project",
+          "organization"
+        ],
+        "time_logs.update": [
+          "own",
+          "organization"
+        ],
+        "time_logs.delete": [
+          "own",
+          "organization"
+        ],
+        "reports.view_dashboard": [
+          "organization"
+        ],
+        "reports.view_team_overview": [
+          "organization"
+        ],
+        "reports.view_leaderboard": [
+          "organization"
+        ],
+        "attendance.check_in": [
+          "own"
+        ],
+        "attendance.view": [
+          "own"
+        ],
+        "attendance.view_live": [
+          "organization"
+        ],
+        "attendance.view_reports": [
+          "organization"
+        ],
+        "attendance.email_reports": [
+          "organization"
+        ],
+        "leaves.request": [
+          "own"
+        ],
+        "leaves.view": [
+          "own"
+        ],
+        "leaves.cancel": [
+          "own"
+        ],
+        "regularizations.request": [
+          "own"
+        ],
+        "regularizations.view": [
+          "own",
+          "organization"
+        ],
+        "regularizations.approve": [
+          "organization"
+        ],
+        "regularizations.cancel": [
+          "own"
+        ],
+        "checkout_requests.request": [
+          "own"
+        ],
+        "checkout_requests.view": [
+          "own",
+          "organization"
+        ],
+        "checkout_requests.approve": [
+          "organization"
+        ],
+        "checkout_requests.cancel": [
+          "own"
+        ],
+        "messages.view": [
+          "assigned"
+        ],
+        "messages.send": [
+          "assigned"
+        ],
+        "messages.update": [
+          "own"
+        ],
+        "messages.delete": [
+          "own"
+        ],
+        "messages.pin": [
+          "assigned"
+        ],
+        "threads.create": [
+          "organization"
+        ],
+        "threads.update": [
+          "own"
+        ],
+        "threads.manage_participants": [
+          "own"
+        ],
+        "threads.delete": [
+          "own"
+        ],
+        "documents.view": [
+          "organization"
+        ],
+        "documents.upload": [
+          "organization"
+        ],
+        "documents.update": [
+          "own",
+          "organization"
+        ],
+        "documents.delete": [
+          "organization"
+        ],
+        "documents.share_with_client": [
+          "organization"
+        ],
+        "folders.create": [
+          "organization"
+        ],
+        "folders.update": [
+          "organization"
+        ],
+        "folders.delete": [
+          "organization"
+        ],
+        "sheets.view": [
+          "organization"
+        ],
+        "sheets.create": [
+          "organization"
+        ],
+        "sheets.update": [
+          "organization"
+        ],
+        "sheets.delete": [
+          "organization"
+        ],
+        "sheets.publish": [
+          "organization"
+        ]
+      }
+    },
+    {
+      "key": "employee",
+      "name": "Employee",
+      "kind": "template",
+      "actorType": "staff",
+      "grants": {
+        "organization.view": [
+          "organization"
+        ],
+        "users.view": [
+          "organization"
+        ],
+        "users.view_activity": [
+          "own"
+        ],
+        "clients.view": [
+          "organization"
+        ],
+        "deals.view": [
+          "organization"
+        ],
+        "posts.view": [
+          "organization"
+        ],
+        "post_comments.view": [
+          "organization"
+        ],
+        "social_accounts.view": [
+          "organization"
+        ],
+        "ai.use_assistant": [
+          "organization"
+        ],
+        "ai.task_breakdown": [
+          "project"
+        ],
+        "projects.view": [
+          "organization"
+        ],
+        "projects.update": [
+          "assigned"
+        ],
+        "projects.manage_members": [
+          "assigned"
+        ],
+        "project_milestones.manage": [
+          "assigned"
+        ],
+        "project_labels.manage": [
+          "assigned"
+        ],
+        "tasks.view": [
+          "own",
+          "assigned",
+          "project"
+        ],
+        "tasks.create": [
+          "project"
+        ],
+        "tasks.update": [
+          "own",
+          "assigned",
+          "project"
+        ],
+        "tasks.assign": [
+          "project"
+        ],
+        "tasks.delete": [
+          "own"
+        ],
+        "task_comments.create": [
+          "own",
+          "assigned",
+          "project"
+        ],
+        "task_comments.update": [
+          "own"
+        ],
+        "task_comments.delete": [
+          "own"
+        ],
+        "timers.use": [
+          "own"
+        ],
+        "timers.view": [
+          "project"
+        ],
+        "time_logs.view": [
+          "own",
+          "project"
+        ],
+        "time_logs.update": [
+          "own"
+        ],
+        "time_logs.delete": [
+          "own"
+        ],
+        "reports.view_dashboard": [
+          "organization"
+        ],
+        "reports.view_team_overview": [
+          "organization"
+        ],
+        "attendance.check_in": [
+          "own"
+        ],
+        "attendance.view": [
+          "own"
+        ],
+        "leaves.request": [
+          "own"
+        ],
+        "leaves.view": [
+          "own"
+        ],
+        "leaves.cancel": [
+          "own"
+        ],
+        "regularizations.request": [
+          "own"
+        ],
+        "regularizations.view": [
+          "own"
+        ],
+        "regularizations.cancel": [
+          "own"
+        ],
+        "checkout_requests.request": [
+          "own"
+        ],
+        "checkout_requests.view": [
+          "own"
+        ],
+        "checkout_requests.cancel": [
+          "own"
+        ],
+        "messages.view": [
+          "assigned"
+        ],
+        "messages.send": [
+          "assigned"
+        ],
+        "messages.update": [
+          "own"
+        ],
+        "messages.pin": [
+          "assigned"
+        ],
+        "threads.create": [
+          "organization"
+        ],
+        "threads.update": [
+          "own"
+        ],
+        "threads.manage_participants": [
+          "own"
+        ],
+        "documents.view": [
+          "organization"
+        ],
+        "documents.upload": [
+          "organization"
+        ],
+        "documents.update": [
+          "own"
+        ],
+        "documents.share_with_client": [
+          "organization"
+        ],
+        "folders.create": [
+          "organization"
+        ],
+        "folders.update": [
+          "organization"
+        ],
+        "sheets.view": [
+          "organization"
+        ],
+        "sheets.create": [
+          "organization"
+        ],
+        "sheets.update": [
+          "organization"
+        ],
+        "sheets.publish": [
+          "organization"
+        ]
+      }
+    },
+    {
+      "key": "accountant",
+      "name": "Accountant",
+      "kind": "template",
+      "actorType": "staff",
+      "grants": {
+        "organization.view": [
+          "organization"
+        ],
+        "clients.view": [
+          "organization"
+        ],
+        "clients.view_financials": [
+          "organization"
+        ],
+        "projects.view": [
+          "organization"
+        ],
+        "projects.view_financials": [
+          "organization"
+        ],
+        "attendance.check_in": [
+          "own"
+        ],
+        "leaves.request": [
+          "own"
+        ],
+        "leaves.view": [
+          "own"
+        ],
+        "messages.view": [
+          "organization"
+        ],
+        "messages.send": [
+          "assigned"
+        ],
+        "threads.create": [
+          "organization"
+        ],
+        "invoices.view": [
+          "organization"
+        ],
+        "invoices.create": [
+          "organization"
+        ],
+        "invoices.update": [
+          "organization"
+        ],
+        "invoices.change_status": [
+          "organization"
+        ],
+        "invoices.record_payment": [
+          "organization"
+        ],
+        "invoices.send": [
+          "organization"
+        ],
+        "expenses.view": [
+          "organization"
+        ],
+        "expenses.create": [
+          "organization"
+        ],
+        "expenses.update": [
+          "organization"
+        ],
+        "expenses.delete": [
+          "organization"
+        ],
+        "finance.view_overview": [
+          "organization"
+        ],
+        "finance.view_reports": [
+          "organization"
+        ]
+      }
+    },
+    {
+      "key": "content_manager",
+      "name": "Content Manager",
+      "kind": "template",
+      "actorType": "staff",
+      "grants": {
+        "organization.view": [
+          "organization"
+        ],
+        "clients.view": [
+          "organization"
+        ],
+        "posts.view": [
+          "organization"
+        ],
+        "posts.create": [
+          "organization"
+        ],
+        "posts.update": [
+          "organization"
+        ],
+        "posts.delete": [
+          "organization"
+        ],
+        "posts.submit_for_approval": [
+          "organization"
+        ],
+        "posts.schedule": [
+          "organization"
+        ],
+        "posts.publish": [
+          "organization"
+        ],
+        "posts.restore": [
+          "organization"
+        ],
+        "post_comments.view": [
+          "organization"
+        ],
+        "post_comments.create": [
+          "organization"
+        ],
+        "media.upload": [
+          "organization"
+        ],
+        "media.delete": [
+          "organization"
+        ],
+        "social_accounts.view": [
+          "organization"
+        ],
+        "social_accounts.manage": [
+          "organization"
+        ],
+        "ai.generate_content": [
+          "organization"
+        ],
+        "attendance.check_in": [
+          "own"
+        ],
+        "leaves.request": [
+          "own"
+        ],
+        "messages.view": [
+          "organization"
+        ],
+        "messages.send": [
+          "assigned"
+        ],
+        "threads.create": [
+          "organization"
+        ],
+        "documents.view": [
+          "organization"
+        ],
+        "documents.upload": [
+          "organization"
+        ]
+      }
+    },
+    {
+      "key": "hr_manager",
+      "name": "HR Manager",
+      "kind": "template",
+      "actorType": "staff",
+      "grants": {
+        "organization.view": [
+          "organization"
+        ],
+        "users.view": [
+          "organization"
+        ],
+        "users.update": [
+          "organization"
+        ],
+        "users.view_activity": [
+          "organization"
+        ],
+        "attendance.check_in": [
+          "own"
+        ],
+        "attendance.view": [
+          "organization"
+        ],
+        "attendance.view_live": [
+          "organization"
+        ],
+        "attendance.view_reports": [
+          "organization"
+        ],
+        "attendance.email_reports": [
+          "organization"
+        ],
+        "attendance.mark": [
+          "organization"
+        ],
+        "attendance.manage_policy": [
+          "organization"
+        ],
+        "holidays.manage": [
+          "organization"
+        ],
+        "leave_types.manage": [
+          "organization"
+        ],
+        "leaves.request": [
+          "own"
+        ],
+        "leaves.view": [
+          "organization"
+        ],
+        "leaves.approve": [
+          "organization"
+        ],
+        "leaves.cancel": [
+          "organization"
+        ],
+        "regularizations.request": [
+          "own"
+        ],
+        "regularizations.view": [
+          "organization"
+        ],
+        "regularizations.approve": [
+          "organization"
+        ],
+        "regularizations.cancel": [
+          "organization"
+        ],
+        "checkout_requests.request": [
+          "own"
+        ],
+        "checkout_requests.view": [
+          "organization"
+        ],
+        "checkout_requests.approve": [
+          "organization"
+        ],
+        "checkout_requests.cancel": [
+          "organization"
+        ],
+        "messages.view": [
+          "organization"
+        ],
+        "messages.send": [
+          "assigned"
+        ],
+        "threads.create": [
+          "organization"
+        ]
+      }
+    },
+    {
+      "key": "viewer",
+      "name": "Viewer",
+      "kind": "template",
+      "actorType": "staff",
+      "grants": {
+        "organization.view": [
+          "organization"
+        ],
+        "clients.view": [
+          "organization"
+        ],
+        "posts.view": [
+          "organization"
+        ],
+        "post_comments.view": [
+          "organization"
+        ],
+        "projects.view": [
+          "organization"
+        ],
+        "tasks.view": [
+          "organization"
+        ],
+        "messages.view": [
+          "organization"
+        ],
+        "documents.view": [
+          "organization"
+        ],
+        "sheets.view": [
+          "organization"
+        ]
+      }
+    },
+    {
+      "key": "client_viewer",
+      "name": "Client viewer",
+      "kind": "template",
+      "actorType": "client",
+      "grants": {
+        "posts.view": [
+          "client"
+        ],
+        "post_comments.view": [
+          "client"
+        ],
+        "projects.view": [
+          "client"
+        ],
+        "documents.view": [
+          "client"
+        ]
+      }
+    }
+  ]
+}

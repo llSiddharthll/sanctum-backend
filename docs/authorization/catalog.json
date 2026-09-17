@@ -1,0 +1,4429 @@
+{
+  "version": "13l768h",
+  "scopes": [
+    {
+      "key": "own",
+      "label": "Own",
+      "description": "Items the person created, authored, or that are about them."
+    },
+    {
+      "key": "assigned",
+      "label": "Assigned",
+      "description": "Items the person is attached to: project member, task assignee, assigned client, thread participant."
+    },
+    {
+      "key": "project",
+      "label": "Project",
+      "description": "Items inside projects the person is a member of."
+    },
+    {
+      "key": "client",
+      "label": "Client (brand)",
+      "description": "Client portal users: their own brand's items (and allowed projects)."
+    },
+    {
+      "key": "organization",
+      "label": "Organization",
+      "description": "Everything in the agency."
+    }
+  ],
+  "categories": [
+    {
+      "key": "organization",
+      "label": "Organization & access"
+    },
+    {
+      "key": "clients",
+      "label": "Clients & CRM"
+    },
+    {
+      "key": "content",
+      "label": "Content calendar & social"
+    },
+    {
+      "key": "ai",
+      "label": "AI"
+    },
+    {
+      "key": "projects",
+      "label": "Projects, tasks & time"
+    },
+    {
+      "key": "attendance",
+      "label": "Attendance & leave"
+    },
+    {
+      "key": "collaboration",
+      "label": "Messages, documents & sheets"
+    },
+    {
+      "key": "business",
+      "label": "Business"
+    },
+    {
+      "key": "finance",
+      "label": "Finance"
+    },
+    {
+      "key": "client_portal",
+      "label": "Client portal"
+    }
+  ],
+  "permissions": [
+    {
+      "key": "organization.view",
+      "resource": "organization",
+      "action": "view",
+      "category": "organization",
+      "label": "View agency",
+      "description": "View the agency profile and branding.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "organization.update",
+      "resource": "organization",
+      "action": "update",
+      "category": "organization",
+      "label": "Update agency",
+      "description": "Change agency profile, branding and theme.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "organization.view"
+      ]
+    },
+    {
+      "key": "organization.view_usage",
+      "resource": "organization",
+      "action": "view_usage",
+      "category": "organization",
+      "label": "View usage",
+      "description": "View plan usage and limits.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "organization.view_audit_log",
+      "resource": "organization",
+      "action": "view_audit_log",
+      "category": "organization",
+      "label": "View audit log",
+      "description": "View the security and audit log.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": []
+    },
+    {
+      "key": "storage.view",
+      "resource": "storage",
+      "action": "view",
+      "category": "organization",
+      "label": "View storage",
+      "description": "View server storage status (platform agency only).",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": []
+    },
+    {
+      "key": "storage.archive",
+      "resource": "storage",
+      "action": "archive",
+      "category": "organization",
+      "label": "Archive storage",
+      "description": "Archive and delete old media (platform agency only).",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "storage.view"
+      ]
+    },
+    {
+      "key": "users.view",
+      "resource": "users",
+      "action": "view",
+      "category": "organization",
+      "label": "View members",
+      "description": "View team members and their profiles.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "users.invite",
+      "resource": "users",
+      "action": "invite",
+      "category": "organization",
+      "label": "Invite members",
+      "description": "Invite new staff members.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "users.view"
+      ]
+    },
+    {
+      "key": "users.update",
+      "resource": "users",
+      "action": "update",
+      "category": "organization",
+      "label": "Edit members",
+      "description": "Edit another member's profile details.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "users.view"
+      ]
+    },
+    {
+      "key": "users.view_compensation",
+      "resource": "users",
+      "action": "view_compensation",
+      "category": "organization",
+      "label": "View compensation",
+      "description": "View salaries and hourly rates.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "users.view"
+      ]
+    },
+    {
+      "key": "users.update_compensation",
+      "resource": "users",
+      "action": "update_compensation",
+      "category": "organization",
+      "label": "Edit compensation",
+      "description": "Change salaries and hourly rates (never your own).",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "users.view_compensation"
+      ]
+    },
+    {
+      "key": "users.disable",
+      "resource": "users",
+      "action": "disable",
+      "category": "organization",
+      "label": "Disable members",
+      "description": "Disable and re-enable member accounts.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "users.view"
+      ]
+    },
+    {
+      "key": "users.delete",
+      "resource": "users",
+      "action": "delete",
+      "category": "organization",
+      "label": "Delete members",
+      "description": "Permanently delete member accounts.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "users.view"
+      ]
+    },
+    {
+      "key": "users.reset_password",
+      "resource": "users",
+      "action": "reset_password",
+      "category": "organization",
+      "label": "Reset passwords",
+      "description": "Email a password reset link to a member.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "users.view"
+      ]
+    },
+    {
+      "key": "users.revoke_sessions",
+      "resource": "users",
+      "action": "revoke_sessions",
+      "category": "organization",
+      "label": "Sign members out",
+      "description": "End all sessions of a member.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "users.view"
+      ]
+    },
+    {
+      "key": "users.view_activity",
+      "resource": "users",
+      "action": "view_activity",
+      "category": "organization",
+      "label": "View member activity",
+      "description": "View a member's activity feed.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "users.assign_roles",
+      "resource": "users",
+      "action": "assign_roles",
+      "category": "organization",
+      "label": "Assign roles",
+      "description": "Assign and remove roles on members.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "users.view",
+        "roles.view"
+      ]
+    },
+    {
+      "key": "users.manage_permissions",
+      "resource": "users",
+      "action": "manage_permissions",
+      "category": "organization",
+      "label": "Manage member exceptions",
+      "description": "Add per-member permission grants and denies.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "users.view",
+        "roles.view"
+      ]
+    },
+    {
+      "key": "roles.view",
+      "resource": "roles",
+      "action": "view",
+      "category": "organization",
+      "label": "View roles",
+      "description": "View roles and their permissions.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "roles.create",
+      "resource": "roles",
+      "action": "create",
+      "category": "organization",
+      "label": "Create roles",
+      "description": "Create custom roles.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "roles.view"
+      ]
+    },
+    {
+      "key": "roles.update",
+      "resource": "roles",
+      "action": "update",
+      "category": "organization",
+      "label": "Edit roles",
+      "description": "Edit custom roles and editable system roles.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "roles.view"
+      ]
+    },
+    {
+      "key": "roles.archive",
+      "resource": "roles",
+      "action": "archive",
+      "category": "organization",
+      "label": "Archive roles",
+      "description": "Archive custom roles.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "roles.view"
+      ]
+    },
+    {
+      "key": "client_users.view",
+      "resource": "client_users",
+      "action": "view",
+      "category": "organization",
+      "label": "View client users",
+      "description": "View client portal accounts.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "client_users.invite",
+      "resource": "client_users",
+      "action": "invite",
+      "category": "organization",
+      "label": "Invite client users",
+      "description": "Invite people to the client portal.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "client_users.view"
+      ]
+    },
+    {
+      "key": "client_users.update",
+      "resource": "client_users",
+      "action": "update",
+      "category": "organization",
+      "label": "Edit client users",
+      "description": "Change client user details, role and project access.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "client_users.view"
+      ]
+    },
+    {
+      "key": "client_users.disable",
+      "resource": "client_users",
+      "action": "disable",
+      "category": "organization",
+      "label": "Disable client users",
+      "description": "Disable or delete client portal accounts.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "client_users.view"
+      ]
+    },
+    {
+      "key": "client_users.reset_password",
+      "resource": "client_users",
+      "action": "reset_password",
+      "category": "organization",
+      "label": "Reset client passwords",
+      "description": "Email a reset link to a client user.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "client_users.view"
+      ]
+    },
+    {
+      "key": "clients.view",
+      "resource": "clients",
+      "action": "view",
+      "category": "clients",
+      "label": "View clients",
+      "description": "View clients, profiles and follow-ups.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "clients.create",
+      "resource": "clients",
+      "action": "create",
+      "category": "clients",
+      "label": "Create clients",
+      "description": "Create new clients.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "clients.view"
+      ]
+    },
+    {
+      "key": "clients.update",
+      "resource": "clients",
+      "action": "update",
+      "category": "clients",
+      "label": "Edit clients",
+      "description": "Edit client details.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "clients.view"
+      ]
+    },
+    {
+      "key": "clients.archive",
+      "resource": "clients",
+      "action": "archive",
+      "category": "clients",
+      "label": "Archive clients",
+      "description": "Archive and restore clients.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "clients.view"
+      ]
+    },
+    {
+      "key": "clients.view_financials",
+      "resource": "clients",
+      "action": "view_financials",
+      "category": "clients",
+      "label": "View client financials",
+      "description": "View billing details, outstanding amounts and invoice counts.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "clients.view"
+      ]
+    },
+    {
+      "key": "clients.view_activity",
+      "resource": "clients",
+      "action": "view_activity",
+      "category": "clients",
+      "label": "View client activity",
+      "description": "View the cross-module activity feed of a client.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "clients.view"
+      ]
+    },
+    {
+      "key": "clients.manage_assignments",
+      "resource": "clients",
+      "action": "manage_assignments",
+      "category": "clients",
+      "label": "Manage client team",
+      "description": "Set the account owner and assigned team.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "clients.view",
+        "users.view"
+      ]
+    },
+    {
+      "key": "clients.manage_portal",
+      "resource": "clients",
+      "action": "manage_portal",
+      "category": "clients",
+      "label": "Manage client portal",
+      "description": "Create share links and change portal settings.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "clients.view"
+      ]
+    },
+    {
+      "key": "contacts.manage",
+      "resource": "contacts",
+      "action": "manage",
+      "category": "clients",
+      "label": "Manage contacts",
+      "description": "Create, edit and delete client contacts.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "clients.view"
+      ]
+    },
+    {
+      "key": "client_notes.create",
+      "resource": "client_notes",
+      "action": "create",
+      "category": "clients",
+      "label": "Add notes",
+      "description": "Add CRM notes and activities.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "clients.view"
+      ]
+    },
+    {
+      "key": "client_notes.update",
+      "resource": "client_notes",
+      "action": "update",
+      "category": "clients",
+      "label": "Edit notes",
+      "description": "Edit CRM notes.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "clients.view"
+      ]
+    },
+    {
+      "key": "client_notes.delete",
+      "resource": "client_notes",
+      "action": "delete",
+      "category": "clients",
+      "label": "Delete notes",
+      "description": "Delete CRM notes.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "clients.view"
+      ]
+    },
+    {
+      "key": "tags.manage",
+      "resource": "tags",
+      "action": "manage",
+      "category": "clients",
+      "label": "Manage tags",
+      "description": "Create and delete tag definitions.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "deals.view",
+      "resource": "deals",
+      "action": "view",
+      "category": "clients",
+      "label": "View deals",
+      "description": "View deals and the pipeline.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "deals.create",
+      "resource": "deals",
+      "action": "create",
+      "category": "clients",
+      "label": "Create deals",
+      "description": "Create deals.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "deals.view"
+      ]
+    },
+    {
+      "key": "deals.update",
+      "resource": "deals",
+      "action": "update",
+      "category": "clients",
+      "label": "Edit deals",
+      "description": "Edit deals and move stages.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "deals.view"
+      ]
+    },
+    {
+      "key": "deals.delete",
+      "resource": "deals",
+      "action": "delete",
+      "category": "clients",
+      "label": "Delete deals",
+      "description": "Delete deals.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "deals.view"
+      ]
+    },
+    {
+      "key": "deals.view_value",
+      "resource": "deals",
+      "action": "view_value",
+      "category": "clients",
+      "label": "View deal values",
+      "description": "See deal amounts.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "deals.view"
+      ]
+    },
+    {
+      "key": "deals.update_value",
+      "resource": "deals",
+      "action": "update_value",
+      "category": "clients",
+      "label": "Edit deal values",
+      "description": "Set deal amounts.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "deals.view_value",
+        "deals.update"
+      ]
+    },
+    {
+      "key": "posts.view",
+      "resource": "posts",
+      "action": "view",
+      "category": "content",
+      "label": "View posts",
+      "description": "View calendar posts and reservations.",
+      "scopes": [
+        "assigned",
+        "organization",
+        "client"
+      ],
+      "actors": [
+        "staff",
+        "client"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "posts.create",
+      "resource": "posts",
+      "action": "create",
+      "category": "content",
+      "label": "Create posts",
+      "description": "Create posts and reservations.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "posts.view"
+      ]
+    },
+    {
+      "key": "posts.update",
+      "resource": "posts",
+      "action": "update",
+      "category": "content",
+      "label": "Edit posts",
+      "description": "Edit posts and reservations (edits reset client approval).",
+      "scopes": [
+        "own",
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "posts.view"
+      ]
+    },
+    {
+      "key": "posts.delete",
+      "resource": "posts",
+      "action": "delete",
+      "category": "content",
+      "label": "Delete posts",
+      "description": "Delete posts and reservations.",
+      "scopes": [
+        "own",
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "posts.view"
+      ]
+    },
+    {
+      "key": "posts.submit_for_approval",
+      "resource": "posts",
+      "action": "submit_for_approval",
+      "category": "content",
+      "label": "Send for approval",
+      "description": "Send posts to the client for approval.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "posts.view"
+      ]
+    },
+    {
+      "key": "posts.schedule",
+      "resource": "posts",
+      "action": "schedule",
+      "category": "content",
+      "label": "Schedule posts",
+      "description": "Schedule approved posts.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "posts.view"
+      ]
+    },
+    {
+      "key": "posts.publish",
+      "resource": "posts",
+      "action": "publish",
+      "category": "content",
+      "label": "Publish posts",
+      "description": "Publish now, mark as posted and control auto-publishing.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "posts.view"
+      ]
+    },
+    {
+      "key": "posts.archive",
+      "resource": "posts",
+      "action": "archive",
+      "category": "content",
+      "label": "Archive month",
+      "description": "Run the month-end archive sweep for posts.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "posts.restore",
+      "resource": "posts",
+      "action": "restore",
+      "category": "content",
+      "label": "Restore posts",
+      "description": "Restore archived posts.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "posts.view"
+      ]
+    },
+    {
+      "key": "post_comments.view",
+      "resource": "post_comments",
+      "action": "view",
+      "category": "content",
+      "label": "View comments",
+      "description": "View post comments.",
+      "scopes": [
+        "assigned",
+        "organization",
+        "client"
+      ],
+      "actors": [
+        "staff",
+        "client"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "post_comments.create",
+      "resource": "post_comments",
+      "action": "create",
+      "category": "content",
+      "label": "Comment on posts",
+      "description": "Comment on posts.",
+      "scopes": [
+        "assigned",
+        "organization",
+        "client"
+      ],
+      "actors": [
+        "staff",
+        "client"
+      ],
+      "sensitive": false,
+      "requires": [
+        "post_comments.view"
+      ]
+    },
+    {
+      "key": "media.upload",
+      "resource": "media",
+      "action": "upload",
+      "category": "content",
+      "label": "Upload media",
+      "description": "Attach media to posts.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "posts.view"
+      ]
+    },
+    {
+      "key": "media.delete",
+      "resource": "media",
+      "action": "delete",
+      "category": "content",
+      "label": "Remove media",
+      "description": "Remove media from posts.",
+      "scopes": [
+        "own",
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "posts.view"
+      ]
+    },
+    {
+      "key": "social_accounts.view",
+      "resource": "social_accounts",
+      "action": "view",
+      "category": "content",
+      "label": "View social accounts",
+      "description": "View connected social accounts.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "social_accounts.manage",
+      "resource": "social_accounts",
+      "action": "manage",
+      "category": "content",
+      "label": "Manage social accounts",
+      "description": "Connect or disconnect accounts and change auto-publish.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "social_accounts.view"
+      ]
+    },
+    {
+      "key": "ai.generate_content",
+      "resource": "ai",
+      "action": "generate_content",
+      "category": "ai",
+      "label": "Generate content",
+      "description": "Generate captions, ideas, month plans and repurposed content.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "clients.view"
+      ]
+    },
+    {
+      "key": "ai.use_assistant",
+      "resource": "ai",
+      "action": "use_assistant",
+      "category": "ai",
+      "label": "Use AI assistant",
+      "description": "Chat assistant and document generation (limited to data you can view).",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "ai.task_breakdown",
+      "resource": "ai",
+      "action": "task_breakdown",
+      "category": "ai",
+      "label": "AI task breakdown",
+      "description": "Generate tasks and milestones with AI (also needs task permissions).",
+      "scopes": [
+        "project",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "tasks.create"
+      ]
+    },
+    {
+      "key": "projects.view",
+      "resource": "projects",
+      "action": "view",
+      "category": "projects",
+      "label": "View projects",
+      "description": "View projects, overview and activity.",
+      "scopes": [
+        "assigned",
+        "organization",
+        "client"
+      ],
+      "actors": [
+        "staff",
+        "client"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "projects.create",
+      "resource": "projects",
+      "action": "create",
+      "category": "projects",
+      "label": "Create projects",
+      "description": "Create projects.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "projects.view"
+      ]
+    },
+    {
+      "key": "projects.update",
+      "resource": "projects",
+      "action": "update",
+      "category": "projects",
+      "label": "Edit projects",
+      "description": "Edit project details and status.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "projects.view"
+      ]
+    },
+    {
+      "key": "projects.delete",
+      "resource": "projects",
+      "action": "delete",
+      "category": "projects",
+      "label": "Delete projects",
+      "description": "Delete projects and everything in them.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "projects.view"
+      ]
+    },
+    {
+      "key": "projects.view_financials",
+      "resource": "projects",
+      "action": "view_financials",
+      "category": "projects",
+      "label": "View project financials",
+      "description": "See contract value and billing.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "projects.view"
+      ]
+    },
+    {
+      "key": "projects.update_financials",
+      "resource": "projects",
+      "action": "update_financials",
+      "category": "projects",
+      "label": "Edit project financials",
+      "description": "Set contract value and billing.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "projects.view_financials",
+        "projects.update"
+      ]
+    },
+    {
+      "key": "projects.manage_members",
+      "resource": "projects",
+      "action": "manage_members",
+      "category": "projects",
+      "label": "Manage project members",
+      "description": "Add and remove project members.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "projects.view"
+      ]
+    },
+    {
+      "key": "projects.view_team",
+      "resource": "projects",
+      "action": "view_team",
+      "category": "projects",
+      "label": "View project team",
+      "description": "See the project team in the client portal.",
+      "scopes": [
+        "client"
+      ],
+      "actors": [
+        "client"
+      ],
+      "sensitive": false,
+      "requires": [
+        "projects.view"
+      ]
+    },
+    {
+      "key": "project_milestones.manage",
+      "resource": "project_milestones",
+      "action": "manage",
+      "category": "projects",
+      "label": "Manage milestones",
+      "description": "Create, edit and delete milestones.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "projects.view"
+      ]
+    },
+    {
+      "key": "project_labels.manage",
+      "resource": "project_labels",
+      "action": "manage",
+      "category": "projects",
+      "label": "Manage labels",
+      "description": "Create, edit and delete project task labels.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "projects.view"
+      ]
+    },
+    {
+      "key": "tasks.view",
+      "resource": "tasks",
+      "action": "view",
+      "category": "projects",
+      "label": "View tasks",
+      "description": "View tasks, subtasks, dependencies and history.",
+      "scopes": [
+        "own",
+        "assigned",
+        "project",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "tasks.create",
+      "resource": "tasks",
+      "action": "create",
+      "category": "projects",
+      "label": "Create tasks",
+      "description": "Create tasks and subtasks.",
+      "scopes": [
+        "project",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "tasks.view"
+      ]
+    },
+    {
+      "key": "tasks.update",
+      "resource": "tasks",
+      "action": "update",
+      "category": "projects",
+      "label": "Edit tasks",
+      "description": "Edit task fields, status, labels and dependencies.",
+      "scopes": [
+        "own",
+        "assigned",
+        "project",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "tasks.view"
+      ]
+    },
+    {
+      "key": "tasks.assign",
+      "resource": "tasks",
+      "action": "assign",
+      "category": "projects",
+      "label": "Assign tasks",
+      "description": "Assign tasks to other people.",
+      "scopes": [
+        "project",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "tasks.update"
+      ]
+    },
+    {
+      "key": "tasks.delete",
+      "resource": "tasks",
+      "action": "delete",
+      "category": "projects",
+      "label": "Delete tasks",
+      "description": "Delete tasks.",
+      "scopes": [
+        "own",
+        "project",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "tasks.view"
+      ]
+    },
+    {
+      "key": "tasks.archive",
+      "resource": "tasks",
+      "action": "archive",
+      "category": "projects",
+      "label": "Archive month",
+      "description": "Run the month-end archive sweep for tasks.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "tasks.restore",
+      "resource": "tasks",
+      "action": "restore",
+      "category": "projects",
+      "label": "Restore tasks",
+      "description": "Restore archived tasks.",
+      "scopes": [
+        "project",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "tasks.view"
+      ]
+    },
+    {
+      "key": "task_comments.create",
+      "resource": "task_comments",
+      "action": "create",
+      "category": "projects",
+      "label": "Comment on tasks",
+      "description": "Comment on tasks.",
+      "scopes": [
+        "own",
+        "assigned",
+        "project",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "tasks.view"
+      ]
+    },
+    {
+      "key": "task_comments.update",
+      "resource": "task_comments",
+      "action": "update",
+      "category": "projects",
+      "label": "Edit task comments",
+      "description": "Edit task comments.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "tasks.view"
+      ]
+    },
+    {
+      "key": "task_comments.delete",
+      "resource": "task_comments",
+      "action": "delete",
+      "category": "projects",
+      "label": "Delete task comments",
+      "description": "Delete task comments.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "tasks.view"
+      ]
+    },
+    {
+      "key": "timers.use",
+      "resource": "timers",
+      "action": "use",
+      "category": "projects",
+      "label": "Track time",
+      "description": "Start and stop your own timers.",
+      "scopes": [
+        "own"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "timers.view",
+      "resource": "timers",
+      "action": "view",
+      "category": "projects",
+      "label": "See active timers",
+      "description": "See who is tracking time.",
+      "scopes": [
+        "project",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "time_logs.view",
+      "resource": "time_logs",
+      "action": "view",
+      "category": "projects",
+      "label": "View time logs",
+      "description": "View time logs.",
+      "scopes": [
+        "own",
+        "project",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "time_logs.create",
+      "resource": "time_logs",
+      "action": "create",
+      "category": "projects",
+      "label": "Log time",
+      "description": "Log time manually.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "time_logs.view"
+      ]
+    },
+    {
+      "key": "time_logs.update",
+      "resource": "time_logs",
+      "action": "update",
+      "category": "projects",
+      "label": "Edit time logs",
+      "description": "Edit time log entries.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "time_logs.view"
+      ]
+    },
+    {
+      "key": "time_logs.delete",
+      "resource": "time_logs",
+      "action": "delete",
+      "category": "projects",
+      "label": "Delete time logs",
+      "description": "Delete time log entries.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "time_logs.view"
+      ]
+    },
+    {
+      "key": "reports.view_dashboard",
+      "resource": "reports",
+      "action": "view_dashboard",
+      "category": "projects",
+      "label": "Agency dashboard",
+      "description": "View agency dashboard analytics.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "reports.view_team_overview",
+      "resource": "reports",
+      "action": "view_team_overview",
+      "category": "projects",
+      "label": "Team overview",
+      "description": "View team workload and utilization.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "reports.view_leaderboard",
+      "resource": "reports",
+      "action": "view_leaderboard",
+      "category": "projects",
+      "label": "Leaderboard",
+      "description": "View the performance leaderboard (includes attendance).",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": []
+    },
+    {
+      "key": "attendance.check_in",
+      "resource": "attendance",
+      "action": "check_in",
+      "category": "attendance",
+      "label": "Check in/out",
+      "description": "Check in and out, see your own day.",
+      "scopes": [
+        "own"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "attendance.view",
+      "resource": "attendance",
+      "action": "view",
+      "category": "attendance",
+      "label": "View attendance",
+      "description": "View attendance calendars and summaries.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "attendance.view_live",
+      "resource": "attendance",
+      "action": "view_live",
+      "category": "attendance",
+      "label": "Who's in",
+      "description": "See who is in right now.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "attendance.view_reports",
+      "resource": "attendance",
+      "action": "view_reports",
+      "category": "attendance",
+      "label": "Attendance reports",
+      "description": "Team summaries and reports, including utilization.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": []
+    },
+    {
+      "key": "attendance.email_reports",
+      "resource": "attendance",
+      "action": "email_reports",
+      "category": "attendance",
+      "label": "Email reports",
+      "description": "Email attendance reports.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "attendance.view_reports"
+      ]
+    },
+    {
+      "key": "attendance.mark",
+      "resource": "attendance",
+      "action": "mark",
+      "category": "attendance",
+      "label": "Mark attendance",
+      "description": "Mark or override someone else's attendance.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "attendance.view"
+      ]
+    },
+    {
+      "key": "attendance.manage_policy",
+      "resource": "attendance",
+      "action": "manage_policy",
+      "category": "attendance",
+      "label": "Attendance policy",
+      "description": "Office hours, geofence and network policy.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": []
+    },
+    {
+      "key": "holidays.manage",
+      "resource": "holidays",
+      "action": "manage",
+      "category": "attendance",
+      "label": "Manage holidays",
+      "description": "Add and remove holidays.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "leave_types.manage",
+      "resource": "leave_types",
+      "action": "manage",
+      "category": "attendance",
+      "label": "Manage leave types",
+      "description": "Manage leave types and quotas.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "leaves.request",
+      "resource": "leaves",
+      "action": "request",
+      "category": "attendance",
+      "label": "Request leave",
+      "description": "Request leave for yourself.",
+      "scopes": [
+        "own"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "leaves.view",
+      "resource": "leaves",
+      "action": "view",
+      "category": "attendance",
+      "label": "View leave",
+      "description": "View leave requests and balances.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "leaves.approve",
+      "resource": "leaves",
+      "action": "approve",
+      "category": "attendance",
+      "label": "Approve leave",
+      "description": "Approve or reject leave (never your own).",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "leaves.view"
+      ]
+    },
+    {
+      "key": "leaves.cancel",
+      "resource": "leaves",
+      "action": "cancel",
+      "category": "attendance",
+      "label": "Cancel leave",
+      "description": "Cancel leave requests (own: pending or upcoming only).",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "regularizations.request",
+      "resource": "regularizations",
+      "action": "request",
+      "category": "attendance",
+      "label": "Request regularization",
+      "description": "Request an attendance correction.",
+      "scopes": [
+        "own"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "regularizations.view",
+      "resource": "regularizations",
+      "action": "view",
+      "category": "attendance",
+      "label": "View regularizations",
+      "description": "View attendance correction requests.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "regularizations.approve",
+      "resource": "regularizations",
+      "action": "approve",
+      "category": "attendance",
+      "label": "Approve regularizations",
+      "description": "Approve or reject corrections (never your own).",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "regularizations.view"
+      ]
+    },
+    {
+      "key": "regularizations.cancel",
+      "resource": "regularizations",
+      "action": "cancel",
+      "category": "attendance",
+      "label": "Cancel regularizations",
+      "description": "Cancel correction requests (own: pending only).",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "checkout_requests.request",
+      "resource": "checkout_requests",
+      "action": "request",
+      "category": "attendance",
+      "label": "Request checkout",
+      "description": "Request an out-of-office checkout.",
+      "scopes": [
+        "own"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "checkout_requests.view",
+      "resource": "checkout_requests",
+      "action": "view",
+      "category": "attendance",
+      "label": "View checkout requests",
+      "description": "View out-of-office checkout requests.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "checkout_requests.approve",
+      "resource": "checkout_requests",
+      "action": "approve",
+      "category": "attendance",
+      "label": "Approve checkouts",
+      "description": "Approve or reject checkouts (never your own).",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "checkout_requests.view"
+      ]
+    },
+    {
+      "key": "checkout_requests.cancel",
+      "resource": "checkout_requests",
+      "action": "cancel",
+      "category": "attendance",
+      "label": "Cancel checkout requests",
+      "description": "Cancel checkout requests (own: pending only).",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "messages.view",
+      "resource": "messages",
+      "action": "view",
+      "category": "collaboration",
+      "label": "Read messages",
+      "description": "Read threads you take part in (organization: moderation).",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "messages.send",
+      "resource": "messages",
+      "action": "send",
+      "category": "collaboration",
+      "label": "Send messages",
+      "description": "Send messages in your threads.",
+      "scopes": [
+        "assigned"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "messages.view"
+      ]
+    },
+    {
+      "key": "messages.update",
+      "resource": "messages",
+      "action": "update",
+      "category": "collaboration",
+      "label": "Edit messages",
+      "description": "Edit your messages.",
+      "scopes": [
+        "own"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "messages.view"
+      ]
+    },
+    {
+      "key": "messages.delete",
+      "resource": "messages",
+      "action": "delete",
+      "category": "collaboration",
+      "label": "Delete messages",
+      "description": "Delete messages (assigned: anyone's message in your threads).",
+      "scopes": [
+        "own",
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "messages.view"
+      ]
+    },
+    {
+      "key": "messages.pin",
+      "resource": "messages",
+      "action": "pin",
+      "category": "collaboration",
+      "label": "Pin messages",
+      "description": "Pin and unpin messages.",
+      "scopes": [
+        "assigned",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "messages.view"
+      ]
+    },
+    {
+      "key": "threads.create",
+      "resource": "threads",
+      "action": "create",
+      "category": "collaboration",
+      "label": "Start threads",
+      "description": "Start new threads.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "messages.view"
+      ]
+    },
+    {
+      "key": "threads.update",
+      "resource": "threads",
+      "action": "update",
+      "category": "collaboration",
+      "label": "Edit threads",
+      "description": "Rename threads and change their client link.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "messages.view"
+      ]
+    },
+    {
+      "key": "threads.manage_participants",
+      "resource": "threads",
+      "action": "manage_participants",
+      "category": "collaboration",
+      "label": "Manage participants",
+      "description": "Add and remove thread participants.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "messages.view",
+        "users.view"
+      ]
+    },
+    {
+      "key": "threads.delete",
+      "resource": "threads",
+      "action": "delete",
+      "category": "collaboration",
+      "label": "Delete threads",
+      "description": "Delete whole threads.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "messages.view"
+      ]
+    },
+    {
+      "key": "documents.view",
+      "resource": "documents",
+      "action": "view",
+      "category": "collaboration",
+      "label": "View documents",
+      "description": "View documents and folders.",
+      "scopes": [
+        "organization",
+        "client"
+      ],
+      "actors": [
+        "staff",
+        "client"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "documents.view_hidden",
+      "resource": "documents",
+      "action": "view_hidden",
+      "category": "collaboration",
+      "label": "View hidden documents",
+      "description": "View documents hidden from the team.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "documents.view"
+      ]
+    },
+    {
+      "key": "documents.upload",
+      "resource": "documents",
+      "action": "upload",
+      "category": "collaboration",
+      "label": "Upload documents",
+      "description": "Upload documents.",
+      "scopes": [
+        "organization",
+        "client"
+      ],
+      "actors": [
+        "staff",
+        "client"
+      ],
+      "sensitive": false,
+      "requires": [
+        "documents.view"
+      ]
+    },
+    {
+      "key": "documents.update",
+      "resource": "documents",
+      "action": "update",
+      "category": "collaboration",
+      "label": "Edit documents",
+      "description": "Rename, recategorize and move documents.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "documents.view"
+      ]
+    },
+    {
+      "key": "documents.delete",
+      "resource": "documents",
+      "action": "delete",
+      "category": "collaboration",
+      "label": "Delete documents",
+      "description": "Delete documents.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "documents.view"
+      ]
+    },
+    {
+      "key": "documents.share_with_client",
+      "resource": "documents",
+      "action": "share_with_client",
+      "category": "collaboration",
+      "label": "Share with client",
+      "description": "Make documents visible in the client portal.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "documents.view"
+      ]
+    },
+    {
+      "key": "documents.hide_from_team",
+      "resource": "documents",
+      "action": "hide_from_team",
+      "category": "collaboration",
+      "label": "Hide from team",
+      "description": "Hide documents from the team.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "documents.view_hidden"
+      ]
+    },
+    {
+      "key": "folders.create",
+      "resource": "folders",
+      "action": "create",
+      "category": "collaboration",
+      "label": "Create folders",
+      "description": "Create folders.",
+      "scopes": [
+        "organization",
+        "client"
+      ],
+      "actors": [
+        "staff",
+        "client"
+      ],
+      "sensitive": false,
+      "requires": [
+        "documents.view"
+      ]
+    },
+    {
+      "key": "folders.update",
+      "resource": "folders",
+      "action": "update",
+      "category": "collaboration",
+      "label": "Edit folders",
+      "description": "Rename and move folders.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "documents.view"
+      ]
+    },
+    {
+      "key": "folders.delete",
+      "resource": "folders",
+      "action": "delete",
+      "category": "collaboration",
+      "label": "Delete folders",
+      "description": "Delete folders.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "documents.view"
+      ]
+    },
+    {
+      "key": "sheets.view",
+      "resource": "sheets",
+      "action": "view",
+      "category": "collaboration",
+      "label": "View sheets",
+      "description": "View sheets.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "sheets.create",
+      "resource": "sheets",
+      "action": "create",
+      "category": "collaboration",
+      "label": "Create sheets",
+      "description": "Create and import sheets.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "sheets.view"
+      ]
+    },
+    {
+      "key": "sheets.update",
+      "resource": "sheets",
+      "action": "update",
+      "category": "collaboration",
+      "label": "Edit sheets",
+      "description": "Edit sheets.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "sheets.view"
+      ]
+    },
+    {
+      "key": "sheets.delete",
+      "resource": "sheets",
+      "action": "delete",
+      "category": "collaboration",
+      "label": "Delete sheets",
+      "description": "Delete sheets.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "sheets.view"
+      ]
+    },
+    {
+      "key": "sheets.publish",
+      "resource": "sheets",
+      "action": "publish",
+      "category": "collaboration",
+      "label": "Publish sheets",
+      "description": "Publish sheet rows into projects, posts and tasks (needs those permissions too).",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "sheets.view"
+      ]
+    },
+    {
+      "key": "leads.view",
+      "resource": "leads",
+      "action": "view",
+      "category": "business",
+      "label": "View leads",
+      "description": "View leads and their activities.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "leads.create",
+      "resource": "leads",
+      "action": "create",
+      "category": "business",
+      "label": "Create leads",
+      "description": "Create leads.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "leads.view"
+      ]
+    },
+    {
+      "key": "leads.update",
+      "resource": "leads",
+      "action": "update",
+      "category": "business",
+      "label": "Edit leads",
+      "description": "Edit leads and activities.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "leads.view"
+      ]
+    },
+    {
+      "key": "leads.delete",
+      "resource": "leads",
+      "action": "delete",
+      "category": "business",
+      "label": "Delete leads",
+      "description": "Delete leads and activities.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "leads.view"
+      ]
+    },
+    {
+      "key": "leads.assign",
+      "resource": "leads",
+      "action": "assign",
+      "category": "business",
+      "label": "Assign leads",
+      "description": "Change the owner of a lead.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "leads.update"
+      ]
+    },
+    {
+      "key": "leads.convert",
+      "resource": "leads",
+      "action": "convert",
+      "category": "business",
+      "label": "Convert leads",
+      "description": "Convert a lead into a client.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "leads.view",
+        "clients.create"
+      ]
+    },
+    {
+      "key": "leads.view_value",
+      "resource": "leads",
+      "action": "view_value",
+      "category": "business",
+      "label": "View lead values",
+      "description": "See budgets and estimated values.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "leads.view"
+      ]
+    },
+    {
+      "key": "proposals.view",
+      "resource": "proposals",
+      "action": "view",
+      "category": "business",
+      "label": "View proposals",
+      "description": "View proposals.",
+      "scopes": [
+        "own",
+        "organization",
+        "client"
+      ],
+      "actors": [
+        "staff",
+        "client"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "proposals.create",
+      "resource": "proposals",
+      "action": "create",
+      "category": "business",
+      "label": "Create proposals",
+      "description": "Create proposals.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "proposals.view"
+      ]
+    },
+    {
+      "key": "proposals.update",
+      "resource": "proposals",
+      "action": "update",
+      "category": "business",
+      "label": "Edit proposals",
+      "description": "Edit draft and sent proposals.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "proposals.view"
+      ]
+    },
+    {
+      "key": "proposals.send",
+      "resource": "proposals",
+      "action": "send",
+      "category": "business",
+      "label": "Send proposals",
+      "description": "Send proposals to clients.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "proposals.view"
+      ]
+    },
+    {
+      "key": "proposals.convert",
+      "resource": "proposals",
+      "action": "convert",
+      "category": "business",
+      "label": "Convert proposals",
+      "description": "Convert an accepted proposal into an agreement.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "proposals.view",
+        "agreements.create"
+      ]
+    },
+    {
+      "key": "proposals.manage_templates",
+      "resource": "proposals",
+      "action": "manage_templates",
+      "category": "business",
+      "label": "Proposal templates",
+      "description": "Manage proposal templates.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "proposals.view_pricing",
+      "resource": "proposals",
+      "action": "view_pricing",
+      "category": "business",
+      "label": "View proposal pricing",
+      "description": "See pricing and totals.",
+      "scopes": [
+        "own",
+        "organization",
+        "client"
+      ],
+      "actors": [
+        "staff",
+        "client"
+      ],
+      "sensitive": true,
+      "requires": [
+        "proposals.view"
+      ]
+    },
+    {
+      "key": "proposals.respond",
+      "resource": "proposals",
+      "action": "respond",
+      "category": "business",
+      "label": "Respond to proposals",
+      "description": "Accept or reject proposals as the client.",
+      "scopes": [
+        "client"
+      ],
+      "actors": [
+        "client"
+      ],
+      "sensitive": false,
+      "requires": [
+        "proposals.view"
+      ]
+    },
+    {
+      "key": "agreements.view",
+      "resource": "agreements",
+      "action": "view",
+      "category": "business",
+      "label": "View agreements",
+      "description": "View agreements.",
+      "scopes": [
+        "own",
+        "organization",
+        "client"
+      ],
+      "actors": [
+        "staff",
+        "client"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "agreements.create",
+      "resource": "agreements",
+      "action": "create",
+      "category": "business",
+      "label": "Create agreements",
+      "description": "Create agreements.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "agreements.view"
+      ]
+    },
+    {
+      "key": "agreements.update",
+      "resource": "agreements",
+      "action": "update",
+      "category": "business",
+      "label": "Edit agreements",
+      "description": "Edit unsigned agreements.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "agreements.view"
+      ]
+    },
+    {
+      "key": "agreements.delete",
+      "resource": "agreements",
+      "action": "delete",
+      "category": "business",
+      "label": "Delete agreements",
+      "description": "Delete unsigned agreements.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "agreements.view"
+      ]
+    },
+    {
+      "key": "agreements.send",
+      "resource": "agreements",
+      "action": "send",
+      "category": "business",
+      "label": "Send agreements",
+      "description": "Send agreements for signature.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "agreements.view"
+      ]
+    },
+    {
+      "key": "agreements.manage_templates",
+      "resource": "agreements",
+      "action": "manage_templates",
+      "category": "business",
+      "label": "Agreement templates",
+      "description": "Manage agreement templates.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "agreements.view_pricing",
+      "resource": "agreements",
+      "action": "view_pricing",
+      "category": "business",
+      "label": "View agreement value",
+      "description": "See agreement value and retainer.",
+      "scopes": [
+        "own",
+        "organization",
+        "client"
+      ],
+      "actors": [
+        "staff",
+        "client"
+      ],
+      "sensitive": true,
+      "requires": [
+        "agreements.view"
+      ]
+    },
+    {
+      "key": "agreements.sign",
+      "resource": "agreements",
+      "action": "sign",
+      "category": "business",
+      "label": "Sign agreements",
+      "description": "Sign agreements as the client.",
+      "scopes": [
+        "client"
+      ],
+      "actors": [
+        "client"
+      ],
+      "sensitive": false,
+      "requires": [
+        "agreements.view"
+      ]
+    },
+    {
+      "key": "invoices.view",
+      "resource": "invoices",
+      "action": "view",
+      "category": "finance",
+      "label": "View invoices",
+      "description": "View invoices and payments.",
+      "scopes": [
+        "organization",
+        "client"
+      ],
+      "actors": [
+        "staff",
+        "client"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "invoices.create",
+      "resource": "invoices",
+      "action": "create",
+      "category": "finance",
+      "label": "Create invoices",
+      "description": "Create invoices.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "invoices.view"
+      ]
+    },
+    {
+      "key": "invoices.update",
+      "resource": "invoices",
+      "action": "update",
+      "category": "finance",
+      "label": "Edit invoices",
+      "description": "Edit unpaid invoices, including bank details.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "invoices.view"
+      ]
+    },
+    {
+      "key": "invoices.change_status",
+      "resource": "invoices",
+      "action": "change_status",
+      "category": "finance",
+      "label": "Change invoice status",
+      "description": "Mark invoices sent, paid or cancelled.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "invoices.view"
+      ]
+    },
+    {
+      "key": "invoices.record_payment",
+      "resource": "invoices",
+      "action": "record_payment",
+      "category": "finance",
+      "label": "Record payments",
+      "description": "Record invoice payments.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "invoices.view"
+      ]
+    },
+    {
+      "key": "invoices.send",
+      "resource": "invoices",
+      "action": "send",
+      "category": "finance",
+      "label": "Send invoices",
+      "description": "Email invoices to clients.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "invoices.view"
+      ]
+    },
+    {
+      "key": "invoices.sync",
+      "resource": "invoices",
+      "action": "sync",
+      "category": "finance",
+      "label": "Sync invoices",
+      "description": "Sync invoices with Refrens.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": [
+        "invoices.view"
+      ]
+    },
+    {
+      "key": "expenses.view",
+      "resource": "expenses",
+      "action": "view",
+      "category": "finance",
+      "label": "View expenses",
+      "description": "View expenses.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": []
+    },
+    {
+      "key": "expenses.create",
+      "resource": "expenses",
+      "action": "create",
+      "category": "finance",
+      "label": "Log expenses",
+      "description": "Log expenses.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "expenses.view"
+      ]
+    },
+    {
+      "key": "expenses.update",
+      "resource": "expenses",
+      "action": "update",
+      "category": "finance",
+      "label": "Edit expenses",
+      "description": "Edit expenses.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "expenses.view"
+      ]
+    },
+    {
+      "key": "expenses.delete",
+      "resource": "expenses",
+      "action": "delete",
+      "category": "finance",
+      "label": "Delete expenses",
+      "description": "Delete expenses.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": false,
+      "requires": [
+        "expenses.view"
+      ]
+    },
+    {
+      "key": "finance.view_overview",
+      "resource": "finance",
+      "action": "view_overview",
+      "category": "finance",
+      "label": "Finance overview",
+      "description": "Profit & loss overview and receivables.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": []
+    },
+    {
+      "key": "finance.view_reports",
+      "resource": "finance",
+      "action": "view_reports",
+      "category": "finance",
+      "label": "Finance reports",
+      "description": "Finance reports.",
+      "scopes": [
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
+      "requires": []
+    },
+    {
+      "key": "posts.approve",
+      "resource": "posts",
+      "action": "approve",
+      "category": "client_portal",
+      "label": "Approve posts",
+      "description": "Approve posts or request changes as the client.",
+      "scopes": [
+        "client"
+      ],
+      "actors": [
+        "client"
+      ],
+      "sensitive": false,
+      "requires": [
+        "posts.view"
+      ]
+    }
+  ],
+  "templates": [
+    {
+      "key": "manager",
+      "name": "Manager",
+      "description": "Runs delivery: clients, projects, content, attendance approvals and messages. No finance, business or agency settings.",
+      "actorType": "staff",
+      "colorToken": "ocean",
+      "grants": [
+        {
+          "permission": "organization.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "users.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "users.view_activity",
+          "scope": "own"
+        },
+        {
+          "permission": "clients.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "clients.create",
+          "scope": "organization"
+        },
+        {
+          "permission": "clients.update",
+          "scope": "organization"
+        },
+        {
+          "permission": "clients.archive",
+          "scope": "organization"
+        },
+        {
+          "permission": "clients.view_activity",
+          "scope": "organization"
+        },
+        {
+          "permission": "contacts.manage",
+          "scope": "organization"
+        },
+        {
+          "permission": "client_notes.create",
+          "scope": "organization"
+        },
+        {
+          "permission": "client_notes.update",
+          "scope": "own"
+        },
+        {
+          "permission": "client_notes.update",
+          "scope": "organization"
+        },
+        {
+          "permission": "client_notes.delete",
+          "scope": "own"
+        },
+        {
+          "permission": "client_notes.delete",
+          "scope": "organization"
+        },
+        {
+          "permission": "deals.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "deals.create",
+          "scope": "organization"
+        },
+        {
+          "permission": "deals.update",
+          "scope": "organization"
+        },
+        {
+          "permission": "deals.delete",
+          "scope": "organization"
+        },
+        {
+          "permission": "posts.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "posts.create",
+          "scope": "organization"
+        },
+        {
+          "permission": "posts.update",
+          "scope": "organization"
+        },
+        {
+          "permission": "posts.delete",
+          "scope": "organization"
+        },
+        {
+          "permission": "posts.submit_for_approval",
+          "scope": "organization"
+        },
+        {
+          "permission": "posts.schedule",
+          "scope": "organization"
+        },
+        {
+          "permission": "posts.publish",
+          "scope": "organization"
+        },
+        {
+          "permission": "posts.archive",
+          "scope": "organization"
+        },
+        {
+          "permission": "posts.restore",
+          "scope": "organization"
+        },
+        {
+          "permission": "post_comments.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "post_comments.create",
+          "scope": "organization"
+        },
+        {
+          "permission": "media.upload",
+          "scope": "organization"
+        },
+        {
+          "permission": "media.delete",
+          "scope": "organization"
+        },
+        {
+          "permission": "social_accounts.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "social_accounts.manage",
+          "scope": "organization"
+        },
+        {
+          "permission": "ai.generate_content",
+          "scope": "organization"
+        },
+        {
+          "permission": "ai.use_assistant",
+          "scope": "organization"
+        },
+        {
+          "permission": "ai.task_breakdown",
+          "scope": "project"
+        },
+        {
+          "permission": "ai.task_breakdown",
+          "scope": "organization"
+        },
+        {
+          "permission": "projects.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "projects.create",
+          "scope": "organization"
+        },
+        {
+          "permission": "projects.update",
+          "scope": "assigned"
+        },
+        {
+          "permission": "projects.update",
+          "scope": "organization"
+        },
+        {
+          "permission": "projects.delete",
+          "scope": "organization"
+        },
+        {
+          "permission": "projects.manage_members",
+          "scope": "assigned"
+        },
+        {
+          "permission": "projects.manage_members",
+          "scope": "organization"
+        },
+        {
+          "permission": "project_milestones.manage",
+          "scope": "assigned"
+        },
+        {
+          "permission": "project_milestones.manage",
+          "scope": "organization"
+        },
+        {
+          "permission": "project_labels.manage",
+          "scope": "assigned"
+        },
+        {
+          "permission": "project_labels.manage",
+          "scope": "organization"
+        },
+        {
+          "permission": "tasks.view",
+          "scope": "own"
+        },
+        {
+          "permission": "tasks.view",
+          "scope": "assigned"
+        },
+        {
+          "permission": "tasks.view",
+          "scope": "project"
+        },
+        {
+          "permission": "tasks.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "tasks.create",
+          "scope": "project"
+        },
+        {
+          "permission": "tasks.create",
+          "scope": "organization"
+        },
+        {
+          "permission": "tasks.update",
+          "scope": "own"
+        },
+        {
+          "permission": "tasks.update",
+          "scope": "assigned"
+        },
+        {
+          "permission": "tasks.update",
+          "scope": "project"
+        },
+        {
+          "permission": "tasks.update",
+          "scope": "organization"
+        },
+        {
+          "permission": "tasks.assign",
+          "scope": "project"
+        },
+        {
+          "permission": "tasks.assign",
+          "scope": "organization"
+        },
+        {
+          "permission": "tasks.delete",
+          "scope": "own"
+        },
+        {
+          "permission": "tasks.delete",
+          "scope": "organization"
+        },
+        {
+          "permission": "tasks.archive",
+          "scope": "organization"
+        },
+        {
+          "permission": "tasks.restore",
+          "scope": "organization"
+        },
+        {
+          "permission": "task_comments.create",
+          "scope": "own"
+        },
+        {
+          "permission": "task_comments.create",
+          "scope": "assigned"
+        },
+        {
+          "permission": "task_comments.create",
+          "scope": "project"
+        },
+        {
+          "permission": "task_comments.create",
+          "scope": "organization"
+        },
+        {
+          "permission": "task_comments.update",
+          "scope": "own"
+        },
+        {
+          "permission": "task_comments.delete",
+          "scope": "own"
+        },
+        {
+          "permission": "timers.use",
+          "scope": "own"
+        },
+        {
+          "permission": "timers.view",
+          "scope": "project"
+        },
+        {
+          "permission": "timers.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "time_logs.view",
+          "scope": "own"
+        },
+        {
+          "permission": "time_logs.view",
+          "scope": "project"
+        },
+        {
+          "permission": "time_logs.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "time_logs.update",
+          "scope": "own"
+        },
+        {
+          "permission": "time_logs.update",
+          "scope": "organization"
+        },
+        {
+          "permission": "time_logs.delete",
+          "scope": "own"
+        },
+        {
+          "permission": "time_logs.delete",
+          "scope": "organization"
+        },
+        {
+          "permission": "reports.view_dashboard",
+          "scope": "organization"
+        },
+        {
+          "permission": "reports.view_team_overview",
+          "scope": "organization"
+        },
+        {
+          "permission": "reports.view_leaderboard",
+          "scope": "organization"
+        },
+        {
+          "permission": "attendance.check_in",
+          "scope": "own"
+        },
+        {
+          "permission": "attendance.view",
+          "scope": "own"
+        },
+        {
+          "permission": "attendance.view_live",
+          "scope": "organization"
+        },
+        {
+          "permission": "attendance.view_reports",
+          "scope": "organization"
+        },
+        {
+          "permission": "attendance.email_reports",
+          "scope": "organization"
+        },
+        {
+          "permission": "leaves.request",
+          "scope": "own"
+        },
+        {
+          "permission": "leaves.view",
+          "scope": "own"
+        },
+        {
+          "permission": "leaves.cancel",
+          "scope": "own"
+        },
+        {
+          "permission": "regularizations.request",
+          "scope": "own"
+        },
+        {
+          "permission": "regularizations.view",
+          "scope": "own"
+        },
+        {
+          "permission": "regularizations.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "regularizations.approve",
+          "scope": "organization"
+        },
+        {
+          "permission": "regularizations.cancel",
+          "scope": "own"
+        },
+        {
+          "permission": "checkout_requests.request",
+          "scope": "own"
+        },
+        {
+          "permission": "checkout_requests.view",
+          "scope": "own"
+        },
+        {
+          "permission": "checkout_requests.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "checkout_requests.approve",
+          "scope": "organization"
+        },
+        {
+          "permission": "checkout_requests.cancel",
+          "scope": "own"
+        },
+        {
+          "permission": "messages.view",
+          "scope": "assigned"
+        },
+        {
+          "permission": "messages.send",
+          "scope": "assigned"
+        },
+        {
+          "permission": "messages.update",
+          "scope": "own"
+        },
+        {
+          "permission": "messages.delete",
+          "scope": "own"
+        },
+        {
+          "permission": "messages.pin",
+          "scope": "assigned"
+        },
+        {
+          "permission": "threads.create",
+          "scope": "organization"
+        },
+        {
+          "permission": "threads.update",
+          "scope": "own"
+        },
+        {
+          "permission": "threads.manage_participants",
+          "scope": "own"
+        },
+        {
+          "permission": "threads.delete",
+          "scope": "own"
+        },
+        {
+          "permission": "documents.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "documents.upload",
+          "scope": "organization"
+        },
+        {
+          "permission": "documents.update",
+          "scope": "own"
+        },
+        {
+          "permission": "documents.update",
+          "scope": "organization"
+        },
+        {
+          "permission": "documents.delete",
+          "scope": "organization"
+        },
+        {
+          "permission": "documents.share_with_client",
+          "scope": "organization"
+        },
+        {
+          "permission": "folders.create",
+          "scope": "organization"
+        },
+        {
+          "permission": "folders.update",
+          "scope": "organization"
+        },
+        {
+          "permission": "folders.delete",
+          "scope": "organization"
+        },
+        {
+          "permission": "sheets.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "sheets.create",
+          "scope": "organization"
+        },
+        {
+          "permission": "sheets.update",
+          "scope": "organization"
+        },
+        {
+          "permission": "sheets.delete",
+          "scope": "organization"
+        },
+        {
+          "permission": "sheets.publish",
+          "scope": "organization"
+        }
+      ]
+    },
+    {
+      "key": "employee",
+      "name": "Employee",
+      "description": "Does the work: own and assigned tasks, time tracking, content, documents, attendance.",
+      "actorType": "staff",
+      "colorToken": "pine",
+      "grants": [
+        {
+          "permission": "organization.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "users.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "users.view_activity",
+          "scope": "own"
+        },
+        {
+          "permission": "clients.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "deals.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "posts.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "post_comments.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "social_accounts.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "ai.use_assistant",
+          "scope": "organization"
+        },
+        {
+          "permission": "ai.task_breakdown",
+          "scope": "project"
+        },
+        {
+          "permission": "projects.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "projects.update",
+          "scope": "assigned"
+        },
+        {
+          "permission": "projects.manage_members",
+          "scope": "assigned"
+        },
+        {
+          "permission": "project_milestones.manage",
+          "scope": "assigned"
+        },
+        {
+          "permission": "project_labels.manage",
+          "scope": "assigned"
+        },
+        {
+          "permission": "tasks.view",
+          "scope": "own"
+        },
+        {
+          "permission": "tasks.view",
+          "scope": "assigned"
+        },
+        {
+          "permission": "tasks.view",
+          "scope": "project"
+        },
+        {
+          "permission": "tasks.create",
+          "scope": "project"
+        },
+        {
+          "permission": "tasks.update",
+          "scope": "own"
+        },
+        {
+          "permission": "tasks.update",
+          "scope": "assigned"
+        },
+        {
+          "permission": "tasks.update",
+          "scope": "project"
+        },
+        {
+          "permission": "tasks.assign",
+          "scope": "project"
+        },
+        {
+          "permission": "tasks.delete",
+          "scope": "own"
+        },
+        {
+          "permission": "task_comments.create",
+          "scope": "own"
+        },
+        {
+          "permission": "task_comments.create",
+          "scope": "assigned"
+        },
+        {
+          "permission": "task_comments.create",
+          "scope": "project"
+        },
+        {
+          "permission": "task_comments.update",
+          "scope": "own"
+        },
+        {
+          "permission": "task_comments.delete",
+          "scope": "own"
+        },
+        {
+          "permission": "timers.use",
+          "scope": "own"
+        },
+        {
+          "permission": "timers.view",
+          "scope": "project"
+        },
+        {
+          "permission": "time_logs.view",
+          "scope": "own"
+        },
+        {
+          "permission": "time_logs.view",
+          "scope": "project"
+        },
+        {
+          "permission": "time_logs.update",
+          "scope": "own"
+        },
+        {
+          "permission": "time_logs.delete",
+          "scope": "own"
+        },
+        {
+          "permission": "reports.view_dashboard",
+          "scope": "organization"
+        },
+        {
+          "permission": "reports.view_team_overview",
+          "scope": "organization"
+        },
+        {
+          "permission": "attendance.check_in",
+          "scope": "own"
+        },
+        {
+          "permission": "attendance.view",
+          "scope": "own"
+        },
+        {
+          "permission": "leaves.request",
+          "scope": "own"
+        },
+        {
+          "permission": "leaves.view",
+          "scope": "own"
+        },
+        {
+          "permission": "leaves.cancel",
+          "scope": "own"
+        },
+        {
+          "permission": "regularizations.request",
+          "scope": "own"
+        },
+        {
+          "permission": "regularizations.view",
+          "scope": "own"
+        },
+        {
+          "permission": "regularizations.cancel",
+          "scope": "own"
+        },
+        {
+          "permission": "checkout_requests.request",
+          "scope": "own"
+        },
+        {
+          "permission": "checkout_requests.view",
+          "scope": "own"
+        },
+        {
+          "permission": "checkout_requests.cancel",
+          "scope": "own"
+        },
+        {
+          "permission": "messages.view",
+          "scope": "assigned"
+        },
+        {
+          "permission": "messages.send",
+          "scope": "assigned"
+        },
+        {
+          "permission": "messages.update",
+          "scope": "own"
+        },
+        {
+          "permission": "messages.pin",
+          "scope": "assigned"
+        },
+        {
+          "permission": "threads.create",
+          "scope": "organization"
+        },
+        {
+          "permission": "threads.update",
+          "scope": "own"
+        },
+        {
+          "permission": "threads.manage_participants",
+          "scope": "own"
+        },
+        {
+          "permission": "documents.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "documents.upload",
+          "scope": "organization"
+        },
+        {
+          "permission": "documents.update",
+          "scope": "own"
+        },
+        {
+          "permission": "documents.share_with_client",
+          "scope": "organization"
+        },
+        {
+          "permission": "folders.create",
+          "scope": "organization"
+        },
+        {
+          "permission": "folders.update",
+          "scope": "organization"
+        },
+        {
+          "permission": "sheets.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "sheets.create",
+          "scope": "organization"
+        },
+        {
+          "permission": "sheets.update",
+          "scope": "organization"
+        },
+        {
+          "permission": "sheets.publish",
+          "scope": "organization"
+        }
+      ]
+    },
+    {
+      "key": "accountant",
+      "name": "Accountant",
+      "description": "Invoices, expenses and finance reports.",
+      "actorType": "staff",
+      "colorToken": "brass",
+      "grants": [
+        {
+          "permission": "organization.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "clients.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "clients.view_financials",
+          "scope": "organization"
+        },
+        {
+          "permission": "projects.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "projects.view_financials",
+          "scope": "organization"
+        },
+        {
+          "permission": "invoices.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "invoices.create",
+          "scope": "organization"
+        },
+        {
+          "permission": "invoices.update",
+          "scope": "organization"
+        },
+        {
+          "permission": "invoices.change_status",
+          "scope": "organization"
+        },
+        {
+          "permission": "invoices.record_payment",
+          "scope": "organization"
+        },
+        {
+          "permission": "invoices.send",
+          "scope": "organization"
+        },
+        {
+          "permission": "expenses.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "expenses.create",
+          "scope": "organization"
+        },
+        {
+          "permission": "expenses.update",
+          "scope": "organization"
+        },
+        {
+          "permission": "expenses.delete",
+          "scope": "organization"
+        },
+        {
+          "permission": "finance.view_overview",
+          "scope": "organization"
+        },
+        {
+          "permission": "finance.view_reports",
+          "scope": "organization"
+        },
+        {
+          "permission": "attendance.check_in",
+          "scope": "own"
+        },
+        {
+          "permission": "leaves.request",
+          "scope": "own"
+        },
+        {
+          "permission": "leaves.view",
+          "scope": "own"
+        },
+        {
+          "permission": "messages.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "messages.send",
+          "scope": "assigned"
+        },
+        {
+          "permission": "threads.create",
+          "scope": "organization"
+        }
+      ]
+    },
+    {
+      "key": "content_manager",
+      "name": "Content Manager",
+      "description": "Content calendars, approvals, publishing and social accounts for all clients.",
+      "actorType": "staff",
+      "colorToken": "rose",
+      "grants": [
+        {
+          "permission": "organization.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "clients.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "posts.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "posts.create",
+          "scope": "organization"
+        },
+        {
+          "permission": "posts.update",
+          "scope": "organization"
+        },
+        {
+          "permission": "posts.delete",
+          "scope": "organization"
+        },
+        {
+          "permission": "posts.submit_for_approval",
+          "scope": "organization"
+        },
+        {
+          "permission": "posts.schedule",
+          "scope": "organization"
+        },
+        {
+          "permission": "posts.publish",
+          "scope": "organization"
+        },
+        {
+          "permission": "posts.restore",
+          "scope": "organization"
+        },
+        {
+          "permission": "post_comments.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "post_comments.create",
+          "scope": "organization"
+        },
+        {
+          "permission": "media.upload",
+          "scope": "organization"
+        },
+        {
+          "permission": "media.delete",
+          "scope": "organization"
+        },
+        {
+          "permission": "social_accounts.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "social_accounts.manage",
+          "scope": "organization"
+        },
+        {
+          "permission": "ai.generate_content",
+          "scope": "organization"
+        },
+        {
+          "permission": "documents.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "documents.upload",
+          "scope": "organization"
+        },
+        {
+          "permission": "messages.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "messages.send",
+          "scope": "assigned"
+        },
+        {
+          "permission": "threads.create",
+          "scope": "organization"
+        },
+        {
+          "permission": "attendance.check_in",
+          "scope": "own"
+        },
+        {
+          "permission": "leaves.request",
+          "scope": "own"
+        }
+      ]
+    },
+    {
+      "key": "hr_manager",
+      "name": "HR Manager",
+      "description": "Team profiles, attendance, leave and approvals.",
+      "actorType": "staff",
+      "colorToken": "violet",
+      "grants": [
+        {
+          "permission": "organization.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "users.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "users.update",
+          "scope": "organization"
+        },
+        {
+          "permission": "users.view_activity",
+          "scope": "organization"
+        },
+        {
+          "permission": "attendance.check_in",
+          "scope": "own"
+        },
+        {
+          "permission": "attendance.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "attendance.view_live",
+          "scope": "organization"
+        },
+        {
+          "permission": "attendance.view_reports",
+          "scope": "organization"
+        },
+        {
+          "permission": "attendance.email_reports",
+          "scope": "organization"
+        },
+        {
+          "permission": "attendance.mark",
+          "scope": "organization"
+        },
+        {
+          "permission": "attendance.manage_policy",
+          "scope": "organization"
+        },
+        {
+          "permission": "holidays.manage",
+          "scope": "organization"
+        },
+        {
+          "permission": "leave_types.manage",
+          "scope": "organization"
+        },
+        {
+          "permission": "leaves.request",
+          "scope": "own"
+        },
+        {
+          "permission": "leaves.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "leaves.approve",
+          "scope": "organization"
+        },
+        {
+          "permission": "leaves.cancel",
+          "scope": "organization"
+        },
+        {
+          "permission": "regularizations.request",
+          "scope": "own"
+        },
+        {
+          "permission": "regularizations.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "regularizations.approve",
+          "scope": "organization"
+        },
+        {
+          "permission": "regularizations.cancel",
+          "scope": "organization"
+        },
+        {
+          "permission": "checkout_requests.request",
+          "scope": "own"
+        },
+        {
+          "permission": "checkout_requests.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "checkout_requests.approve",
+          "scope": "organization"
+        },
+        {
+          "permission": "checkout_requests.cancel",
+          "scope": "organization"
+        },
+        {
+          "permission": "messages.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "messages.send",
+          "scope": "assigned"
+        },
+        {
+          "permission": "threads.create",
+          "scope": "organization"
+        }
+      ]
+    },
+    {
+      "key": "viewer",
+      "name": "Viewer",
+      "description": "Read-only access to clients, projects, content and documents.",
+      "actorType": "staff",
+      "colorToken": "slate",
+      "grants": [
+        {
+          "permission": "organization.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "clients.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "projects.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "tasks.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "posts.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "post_comments.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "documents.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "sheets.view",
+          "scope": "organization"
+        },
+        {
+          "permission": "messages.view",
+          "scope": "organization"
+        }
+      ]
+    },
+    {
+      "key": "client_viewer",
+      "name": "Client viewer",
+      "description": "Client portal read-only.",
+      "actorType": "client",
+      "colorToken": "slate",
+      "grants": [
+        {
+          "permission": "projects.view",
+          "scope": "client"
+        },
+        {
+          "permission": "documents.view",
+          "scope": "client"
+        },
+        {
+          "permission": "posts.view",
+          "scope": "client"
+        },
+        {
+          "permission": "post_comments.view",
+          "scope": "client"
+        }
+      ]
+    }
+  ]
+}
