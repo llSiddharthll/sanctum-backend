@@ -278,7 +278,15 @@ export function bannerHtml(opts: {
 </body></html>`;
 }
 
+/**
+ * Test-only outbox: under NODE_ENV=test every message is also recorded here so
+ * integration tests can read links that are deliberately NOT returned by the
+ * API (password resets, credential emails). Never populated in other envs.
+ */
+export const testOutbox: EmailMessage[] = [];
+
 export async function sendEmail(msg: EmailMessage): Promise<{ ok: boolean }> {
+  if (process.env.NODE_ENV === 'test') testOutbox.push(msg);
   const tx = getTransporter();
   if (!tx) {
     // eslint-disable-next-line no-console

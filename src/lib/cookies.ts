@@ -1,6 +1,7 @@
 import type { Response } from 'express';
 import { isProd } from '../env.js';
 import { tokenTtl } from './jwt.js';
+import { ACCESS_TTL_SECONDS } from '../authz/sessions.js';
 import { ACCESS_COOKIE, REFRESH_COOKIE } from '../middleware/auth.js';
 
 /**
@@ -19,14 +20,17 @@ function baseOptions() {
 export function setAuthCookies(
   res: Response,
   tokens: { access: string; refresh: string },
+  refreshExpiresAt?: Date,
 ): void {
   res.cookie(ACCESS_COOKIE, tokens.access, {
     ...baseOptions(),
-    maxAge: tokenTtl.accessSeconds * 1000,
+    maxAge: ACCESS_TTL_SECONDS * 1000,
   });
   res.cookie(REFRESH_COOKIE, tokens.refresh, {
     ...baseOptions(),
-    maxAge: tokenTtl.refreshSeconds * 1000,
+    maxAge: refreshExpiresAt
+      ? Math.max(0, refreshExpiresAt.getTime() - Date.now())
+      : tokenTtl.refreshSeconds * 1000,
   });
 }
 

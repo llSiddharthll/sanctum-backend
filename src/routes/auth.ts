@@ -1,28 +1,26 @@
-import { Router } from 'express';
+import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { and, eq, gt, isNull, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   agencies,
-  customRoles,
   invites,
   passwordResets,
   plans,
+  roles,
+  sessions,
   subscriptions,
+  userRoles,
   users,
 } from '../db/schema.js';
 import { hashPassword, verifyPassword } from '../lib/password.js';
 import { createPasswordReset } from '../services/password-reset.js';
-import {
-  signAccessToken,
-  signRefreshToken,
-  verifyRefreshToken,
-  type Role,
-} from '../lib/jwt.js';
+import { verifyRefreshToken } from '../lib/jwt.js';
 import { setAuthCookies, clearAuthCookies } from '../lib/cookies.js';
 import { ok, created } from '../lib/http.js';
 import { newId, hashToken } from '../lib/ids.js';
 import {
+  AppError,
   invalidCredentials,
   unauthenticated,
   notFound,
@@ -32,11 +30,29 @@ import {
   forbidden,
 } from '../lib/errors.js';
 import { env } from '../env.js';
-import { requireAuth, REFRESH_COOKIE } from '../middleware/auth.js';
+import { REFRESH_COOKIE } from '../middleware/auth.js';
 import { authLimiter } from '../middleware/rate-limit.js';
-import { getAuth } from '../middleware/tenant.js';
 import { audit } from '../services/audit.js';
-import { resolvePermissions } from '../lib/permissions.js';
+import {
+  authenticate,
+  getActor,
+  getUserActor,
+  readAccessToken,
+} from '../authz/http.js';
+import {
+  createSession,
+  getSession,
+  listUserSessions,
+  revokeSessions,
+  revokeUserSessions,
+  rotateRefresh,
+  verifyAnyAccessToken,
+  type SessionActorType,
+} from '../authz/sessions.js';
+import { initAgencyAuthorization } from '../authz/roles-store.js';
+import { legacyPermissionMap, legacyPersona } from '../authz/compat.js';
+import { CATALOG_VERSION } from '../authz/catalog.js';
+import { actorAuditId } from '../authz/actor.js';
 
 export const authRouter = Router();
 
@@ -50,31 +66,29 @@ function slugify(name: string): string {
   );
 }
 
-async function issueSession(
-  res: import('express').Response,
-  user: {
-    id: string;
-    agencyId: string;
-    role: Role;
-    clientId?: string | null;
-  },
+/**
+ * Start a server-side session for a user and hand out tokens. Cookies stay for
+ * desktop browsers; tokens are also returned in the body for Bearer clients
+ * (iOS WebKit blocks the cross-site cookie).
+ */
+async function startUserSession(
+  req: Request,
+  res: Response,
+  user: { id: string; agencyId: string; kind: 'staff' | 'client' },
 ): Promise<{ access: string; refresh: string }> {
-  const access = await signAccessToken({
-    userId: user.id,
+  const s = await createSession({
+    actorType: user.kind as SessionActorType,
     agencyId: user.agencyId,
-    role: user.role,
-    clientId: user.clientId ?? null,
-  });
-  const refresh = await signRefreshToken({
     userId: user.id,
-    agencyId: user.agencyId,
+    req,
   });
-  // Cookies stay for desktop browsers; the tokens are ALSO returned in the body
-  // so the SPA can store + send them as `Authorization: Bearer` — the cross-site
-  // cookie (Vercel ↔ Render) is blocked by iOS/iPadOS WebKit, which was bouncing
-  // iPad/iPhone users back to login. Bearer auth works on every device.
-  setAuthCookies(res, { access, refresh });
-  return { access, refresh };
+  const tokens = { access: s.access, refresh: s.refresh };
+  setAuthCookies(res, tokens, s.expiresAt);
+  return tokens;
+}
+
+function isSyntheticPortalUser(email: string): boolean {
+  return email.toLowerCase().endsWith('@portal.sanctum');
 }
 
 // POST /auth/signup — create agency + first owner.
@@ -86,8 +100,6 @@ const signupSchema = z.object({
 });
 
 authRouter.post('/signup', authLimiter, async (req, res) => {
-  // Internal-use deployments disable public self-signup (ALLOW_SIGNUP=false).
-  // New teammates are added via invite instead.
   if (!env.ALLOW_SIGNUP) {
     throw forbidden(
       'Public sign-up is disabled. Ask an admin to invite you to the workspace.',
@@ -96,9 +108,6 @@ authRouter.post('/signup', authLimiter, async (req, res) => {
   const body = signupSchema.parse(req.body);
   const email = body.email.toLowerCase();
 
-  // Email is the global login identifier (login resolves lower(email) with no
-  // agency scope), so it must be globally unique. Reject a duplicate signup
-  // before creating the agency to avoid an ambiguous login + orphaned agency.
   const existingUser = await db
     .select({ id: users.id })
     .from(users)
@@ -110,8 +119,6 @@ authRouter.post('/signup', authLimiter, async (req, res) => {
 
   const agencyId = newId('agc');
   let slug = slugify(body.agencyName);
-
-  // Ensure slug uniqueness (slug is globally unique).
   const existingSlug = await db
     .select({ id: agencies.id })
     .from(agencies)
@@ -119,13 +126,8 @@ authRouter.post('/signup', authLimiter, async (req, res) => {
     .limit(1);
   if (existingSlug.length) slug = `${slug}-${agencyId.slice(-6)}`;
 
-  await db.insert(agencies).values({
-    id: agencyId,
-    name: body.agencyName,
-    slug,
-  });
+  await db.insert(agencies).values({ id: agencyId, name: body.agencyName, slug });
 
-  // Attach a default subscription if a 'studio' plan exists (best-effort).
   const [defaultPlan] = await db
     .select({ id: plans.id })
     .from(plans)
@@ -148,17 +150,15 @@ authRouter.post('/signup', authLimiter, async (req, res) => {
     passwordHash: await hashPassword(body.password),
     fullName: body.fullName,
     role: 'owner',
+    kind: 'staff',
     status: 'active',
   });
+  await initAgencyAuthorization(agencyId, userId);
 
-  const tokens = await issueSession(res, {
-    id: userId,
-    agencyId,
-    role: 'owner',
-  });
+  const tokens = await startUserSession(req, res, { id: userId, agencyId, kind: 'staff' });
   await audit({
     agencyId,
-    actorType: 'owner',
+    actorType: 'staff',
     actorId: userId,
     action: 'agency.signup',
     entityType: 'agency',
@@ -167,7 +167,7 @@ authRouter.post('/signup', authLimiter, async (req, res) => {
   });
 
   created(res, {
-    user: { id: userId, email, fullName: body.fullName, role: 'owner' },
+    user: { id: userId, email, fullName: body.fullName, kind: 'staff', role: 'owner' },
     agency: { id: agencyId, name: body.agencyName, slug },
     tokens,
   });
@@ -183,33 +183,32 @@ authRouter.post('/login', authLimiter, async (req, res) => {
   const body = loginSchema.parse(req.body);
   const email = body.email.toLowerCase();
 
-  const [user] = await db
+  // Email is unique per agency; the same address may exist in two agencies.
+  // Resolve by password so an invite from another agency can't hijack or lock
+  // out a login. Ambiguity (same password in both) is refused, never guessed.
+  const candidates = await db
     .select()
     .from(users)
-    .where(sql`lower(${users.email}) = ${email}`)
-    .limit(1);
-
-  // Generic failure -> no user enumeration.
-  if (!user || user.status !== 'active') {
-    throw invalidCredentials();
+    .where(and(sql`lower(${users.email}) = ${email}`, eq(users.status, 'active')))
+    .limit(5);
+  const matches = [];
+  for (const u of candidates) {
+    if (isSyntheticPortalUser(u.email)) continue;
+    if (await verifyPassword(u.passwordHash, body.password)) matches.push(u);
   }
-  const valid = await verifyPassword(user.passwordHash, body.password);
-  if (!valid) throw invalidCredentials();
+  if (matches.length === 0) throw invalidCredentials();
+  if (matches.length > 1) {
+    throw conflict(
+      'This email belongs to more than one workspace. Ask your admin to change one of the accounts.',
+    );
+  }
+  const user = matches[0]!;
 
-  await db
-    .update(users)
-    .set({ lastLoginAt: new Date() })
-    .where(eq(users.id, user.id));
-
-  const tokens = await issueSession(res, {
-    id: user.id,
-    agencyId: user.agencyId,
-    role: user.role,
-    clientId: user.clientId,
-  });
+  await db.update(users).set({ lastLoginAt: new Date() }).where(eq(users.id, user.id));
+  const tokens = await startUserSession(req, res, user);
   await audit({
     agencyId: user.agencyId,
-    actorType: user.role,
+    actorType: user.kind,
     actorId: user.id,
     action: 'auth.login',
     ip: req.ip,
@@ -220,6 +219,7 @@ authRouter.post('/login', authLimiter, async (req, res) => {
       id: user.id,
       email: user.email,
       fullName: user.fullName,
+      kind: user.kind,
       role: user.role,
     },
     agencyId: user.agencyId,
@@ -227,11 +227,6 @@ authRouter.post('/login', authLimiter, async (req, res) => {
   });
 });
 
-/**
- * Resolve a pending, unexpired invite by its raw token, or throw. Lazily marks
- * an over-due invite 'expired'. Shared by GET /invite (preview) and
- * POST /accept-invite (consume).
- */
 async function findPendingInvite(rawToken: string) {
   const [invite] = await db
     .select()
@@ -245,17 +240,13 @@ async function findPendingInvite(rawToken: string) {
   if (invite.status === 'revoked') throw gone('This invite was revoked.');
   if (invite.expiresAt.getTime() <= Date.now()) {
     if (invite.status !== 'expired') {
-      await db
-        .update(invites)
-        .set({ status: 'expired' })
-        .where(eq(invites.id, invite.id));
+      await db.update(invites).set({ status: 'expired' }).where(eq(invites.id, invite.id));
     }
     throw gone('This invite has expired. Ask your admin to re-invite you.');
   }
   return invite;
 }
 
-/** The teammate account created at invite time (active, random password). */
 async function inviteMember(invite: typeof invites.$inferSelect) {
   const [member] = await db
     .select()
@@ -270,8 +261,7 @@ async function inviteMember(invite: typeof invites.$inferSelect) {
   return member;
 }
 
-// GET /auth/invite?token=... — preview an invite (does NOT consume it) so the
-// accept page can greet the user with their email + agency.
+// GET /auth/invite?token=... — preview an invite (does NOT consume it).
 authRouter.get('/invite', async (req, res) => {
   const token = typeof req.query.token === 'string' ? req.query.token : '';
   if (!token) throw badRequest('Missing invite token.');
@@ -282,16 +272,26 @@ authRouter.get('/invite', async (req, res) => {
     .where(eq(agencies.id, invite.agencyId))
     .limit(1);
   const member = await inviteMember(invite);
+  const roleNames = member
+    ? (
+        await db
+          .select({ name: roles.name })
+          .from(userRoles)
+          .innerJoin(roles, eq(roles.id, userRoles.roleId))
+          .where(eq(userRoles.userId, member.id))
+      ).map((r) => r.name)
+    : [];
   ok(res, {
     email: invite.email,
+    kind: invite.role === 'client' ? 'client' : 'staff',
+    roles: roleNames,
     role: invite.role,
     agencyName: agency?.name ?? 'your team',
     fullName: member?.fullName ?? null,
   });
 });
 
-// POST /auth/accept-invite — set a password on the invited account, mark the
-// invite accepted, and log the member straight in (sets session cookies).
+// POST /auth/accept-invite — set a password on the invited account and sign in.
 const acceptInviteSchema = z.object({
   token: z.string().min(1),
   password: z.string().min(8).max(200),
@@ -313,21 +313,18 @@ authRouter.post('/accept-invite', authLimiter, async (req, res) => {
       ...(body.fullName ? { fullName: body.fullName } : {}),
     })
     .where(eq(users.id, member.id));
+  // Any session created before the invite was accepted is void.
+  await revokeUserSessions(member.id, 'invite_accepted');
 
   await db
     .update(invites)
     .set({ status: 'accepted', acceptedAt: new Date() })
     .where(eq(invites.id, invite.id));
 
-  const tokens = await issueSession(res, {
-    id: member.id,
-    agencyId: member.agencyId,
-    role: member.role,
-    clientId: member.clientId,
-  });
+  const tokens = await startUserSession(req, res, member);
   await audit({
     agencyId: member.agencyId,
-    actorType: member.role,
+    actorType: member.kind,
     actorId: member.id,
     action: 'team.invite.accept',
     entityType: 'user',
@@ -340,6 +337,7 @@ authRouter.post('/accept-invite', authLimiter, async (req, res) => {
       id: member.id,
       email: member.email,
       fullName: body.fullName ?? member.fullName,
+      kind: member.kind,
       role: member.role,
     },
     agencyId: member.agencyId,
@@ -347,25 +345,26 @@ authRouter.post('/accept-invite', authLimiter, async (req, res) => {
   });
 });
 
-// ---- Password reset (forgot password) ----------------------------------
+// ---- Password reset ------------------------------------------------------
 
-// POST /auth/forgot-password — email a reset link. Always 200 (never reveals
-// whether an account exists, to avoid email enumeration).
 const forgotSchema = z.object({ email: z.string().email() });
 
 authRouter.post('/forgot-password', authLimiter, async (req, res) => {
   const { email } = forgotSchema.parse(req.body);
-  const [user] = await db
+  const accounts = await db
     .select()
     .from(users)
-    .where(sql`lower(${users.email}) = ${email.toLowerCase()}`)
-    .limit(1);
+    .where(
+      and(sql`lower(${users.email}) = ${email.toLowerCase()}`, eq(users.status, 'active')),
+    )
+    .limit(5);
 
-  if (user && user.status === 'active') {
+  for (const user of accounts) {
+    if (isSyntheticPortalUser(user.email)) continue;
     await createPasswordReset(user, { req });
     await audit({
       agencyId: user.agencyId,
-      actorType: user.role,
+      actorType: user.kind,
       actorId: user.id,
       action: 'auth.password_reset.request',
       entityType: 'user',
@@ -376,7 +375,6 @@ authRouter.post('/forgot-password', authLimiter, async (req, res) => {
   ok(res, { ok: true });
 });
 
-/** Resolve a non-expired, unused reset token or throw. */
 async function findValidReset(rawToken: string) {
   const [row] = await db
     .select()
@@ -393,7 +391,6 @@ async function findValidReset(rawToken: string) {
   return row;
 }
 
-// GET /auth/reset-password?token= — validate the link + return the account email.
 authRouter.get('/reset-password', async (req, res) => {
   const token = typeof req.query.token === 'string' ? req.query.token : '';
   if (!token) throw badRequest('Missing reset token.');
@@ -407,8 +404,6 @@ authRouter.get('/reset-password', async (req, res) => {
   ok(res, { email: user.email });
 });
 
-// POST /auth/reset-password { token, password } — set a new password, consume
-// the token (and any other outstanding ones), and sign the user in.
 const resetSchema = z.object({
   token: z.string().min(1),
   password: z.string().min(8).max(200),
@@ -417,41 +412,24 @@ const resetSchema = z.object({
 authRouter.post('/reset-password', authLimiter, async (req, res) => {
   const body = resetSchema.parse(req.body);
   const reset = await findValidReset(body.token);
-  const [user] = await db
-    .select()
-    .from(users)
-    .where(eq(users.id, reset.userId))
-    .limit(1);
-  if (!user || user.status !== 'active') {
-    throw gone('This account is not active.');
-  }
+  const [user] = await db.select().from(users).where(eq(users.id, reset.userId)).limit(1);
+  if (!user || user.status !== 'active') throw gone('This account is not active.');
 
   await db
     .update(users)
     .set({ passwordHash: await hashPassword(body.password) })
     .where(eq(users.id, user.id));
-
-  // Burn every outstanding reset token for this user (single-use + cleanup).
   await db
     .update(passwordResets)
     .set({ usedAt: new Date() })
-    .where(
-      and(
-        eq(passwordResets.userId, user.id),
-        isNull(passwordResets.usedAt),
-      ),
-    );
+    .where(and(eq(passwordResets.userId, user.id), isNull(passwordResets.usedAt)));
+  // A reset means the old credential may be compromised: end every session.
+  await revokeUserSessions(user.id, 'password_reset');
 
-  const tokens = await issueSession(res, {
-    id: user.id,
-    agencyId: user.agencyId,
-    role: user.role,
-    // Preserve the client's brand across a password reset too.
-    clientId: user.clientId,
-  });
+  const tokens = await startUserSession(req, res, user);
   await audit({
     agencyId: user.agencyId,
-    actorType: user.role,
+    actorType: user.kind,
     actorId: user.id,
     action: 'auth.password_reset',
     entityType: 'user',
@@ -460,31 +438,22 @@ authRouter.post('/reset-password', authLimiter, async (req, res) => {
   });
 
   ok(res, {
-    user: {
-      id: user.id,
-      email: user.email,
-      fullName: user.fullName,
-      role: user.role,
-    },
+    user: { id: user.id, email: user.email, fullName: user.fullName, kind: user.kind, role: user.role },
     agencyId: user.agencyId,
     tokens,
   });
 });
 
-// POST /auth/change-password { currentPassword, newPassword } — authenticated.
+// POST /auth/change-password — authenticated; ends every OTHER session.
 const changePasswordSchema = z.object({
   currentPassword: z.string().min(1),
   newPassword: z.string().min(8).max(200),
 });
 
-authRouter.post('/change-password', requireAuth, async (req, res) => {
-  const ctx = getAuth(req);
+authRouter.post('/change-password', authenticate, async (req, res) => {
+  const actor = getUserActor(req);
   const body = changePasswordSchema.parse(req.body);
-  const [user] = await db
-    .select()
-    .from(users)
-    .where(eq(users.id, ctx.userId))
-    .limit(1);
+  const [user] = await db.select().from(users).where(eq(users.id, actor.userId)).limit(1);
   if (!user) throw notFound('User not found.');
 
   const valid = await verifyPassword(user.passwordHash, body.currentPassword);
@@ -494,174 +463,155 @@ authRouter.post('/change-password', requireAuth, async (req, res) => {
     .update(users)
     .set({ passwordHash: await hashPassword(body.newPassword) })
     .where(eq(users.id, user.id));
+  const ended = await revokeUserSessions(user.id, 'password_change', actor.sessionId);
   await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+    agencyId: actor.agencyId,
+    actorType: actor.type,
+    actorId: actor.userId,
     action: 'auth.password_change',
     entityType: 'user',
-    entityId: ctx.userId,
+    entityId: actor.userId,
+    metadata: { otherSessionsEnded: ended },
     ip: req.ip,
   });
   ok(res, { ok: true });
 });
 
-// POST /auth/refresh — rotate tokens from the refresh cookie.
-authRouter.post('/refresh', authLimiter, async (req, res) => {
-  // Prefer the cookie (desktop); fall back to a body field or Bearer header so
-  // the SPA can refresh on devices where the cross-site cookie is blocked (iOS).
+function readRefreshToken(req: Request): string | undefined {
   const header = req.headers.authorization;
-  const bearer =
-    header && header.startsWith('Bearer ')
-      ? header.slice('Bearer '.length)
-      : undefined;
+  const bearer = header?.startsWith('Bearer ') ? header.slice('Bearer '.length) : undefined;
   const bodyToken =
     req.body && typeof req.body.refreshToken === 'string'
       ? (req.body.refreshToken as string)
       : undefined;
-  const token =
-    (req.cookies?.[REFRESH_COOKIE] as string | undefined) ?? bodyToken ?? bearer;
+  return bodyToken ?? (req.cookies?.[REFRESH_COOKIE] as string | undefined) ?? bearer;
+}
+
+// POST /auth/refresh — rotate the refresh token; reuse revokes the session.
+authRouter.post('/refresh', authLimiter, async (req, res) => {
+  const token = readRefreshToken(req);
   if (!token) throw unauthenticated('No refresh token.');
 
-  let claims;
   try {
-    claims = await verifyRefreshToken(token);
-  } catch {
-    clearAuthCookies(res);
-    throw unauthenticated('Invalid refresh token.');
-  }
+    if (token.split('.').length === 3) {
+      // Legacy JWT refresh token issued before sessions existed: exchange ONCE
+      // for a real session. TODO(authz phase 10): remove after 30 days.
+      let claims;
+      try {
+        claims = await verifyRefreshToken(token);
+      } catch {
+        throw unauthenticated('Invalid refresh token.');
+      }
+      const [user] = await db
+        .select()
+        .from(users)
+        .where(and(eq(users.id, claims.sub), eq(users.agencyId, claims.agencyId)))
+        .limit(1);
+      if (!user || user.status !== 'active' || isSyntheticPortalUser(user.email)) {
+        throw unauthenticated('Session no longer valid.');
+      }
+      const tokens = await startUserSession(req, res, user);
+      return ok(res, { refreshed: true, tokens });
+    }
 
-  const [user] = await db
-    .select()
-    .from(users)
-    .where(
-      and(eq(users.id, claims.sub), eq(users.agencyId, claims.agencyId)),
-    )
-    .limit(1);
-  if (!user || user.status !== 'active') {
-    clearAuthCookies(res);
-    throw unauthenticated('Session no longer valid.');
+    const r = await rotateRefresh(token);
+    const tokens = { access: r.access, refresh: r.refresh };
+    setAuthCookies(res, tokens, r.session.expiresAt);
+    ok(res, { refreshed: true, tokens });
+  } catch (err) {
+    if (err instanceof AppError && err.status === 401) clearAuthCookies(res);
+    throw err;
   }
-
-  const tokens = await issueSession(res, {
-    id: user.id,
-    agencyId: user.agencyId,
-    role: user.role,
-    // Carry the brand through a refresh — without it a client's rotated access
-    // token loses `clientId` and requireClientAuth 403s the whole portal.
-    clientId: user.clientId,
-  });
-  ok(res, { refreshed: true, tokens });
 });
 
-// POST /auth/logout
+// POST /auth/logout — ends the current session (access or refresh token).
 authRouter.post('/logout', async (req, res) => {
   clearAuthCookies(res);
-  if (req.auth) {
-    await audit({
-      agencyId: req.auth.agencyId,
-      actorType: req.auth.role,
-      actorId: req.auth.userId,
-      action: 'auth.logout',
-      ip: req.ip,
-    });
+  let sessionId: string | null = null;
+  const access = readAccessToken(req);
+  if (access) {
+    try {
+      const claims = await verifyAnyAccessToken(access);
+      if (claims.v === 2 && typeof claims.sid === 'string') sessionId = claims.sid;
+    } catch {
+      // expired access token: fall back to the refresh token below
+    }
+  }
+  if (!sessionId) {
+    const refresh = readRefreshToken(req);
+    if (refresh && refresh.split('.').length !== 3) {
+      const [row] = await db
+        .select({ id: sessions.id })
+        .from(sessions)
+        .where(eq(sessions.refreshHash, hashToken(refresh)))
+        .limit(1);
+      sessionId = row?.id ?? null;
+    }
+  }
+  if (sessionId) {
+    const s = await getSession(sessionId);
+    await revokeSessions([sessionId], 'logout');
+    if (s) {
+      await audit({
+        agencyId: s.agencyId,
+        actorType: s.actorType,
+        actorId: s.userId ?? s.portalTokenId ?? undefined,
+        action: 'auth.logout',
+        metadata: { sessionId },
+        ip: req.ip,
+      });
+    }
   }
   ok(res, { loggedOut: true });
 });
 
-// GET /auth/me
-authRouter.get('/me', requireAuth, async (req, res) => {
-  const ctx = getAuth(req);
+// GET /auth/me — identity + the authorization contract (design §I.5).
+authRouter.get('/me', authenticate, async (req, res) => {
+  const actor = getUserActor(req);
   const [user] = await db
     .select()
     .from(users)
-    .where(and(eq(users.id, ctx.userId), eq(users.agencyId, ctx.agencyId)))
+    .where(and(eq(users.id, actor.userId), eq(users.agencyId, actor.agencyId)))
     .limit(1);
   if (!user) throw notFound('User not found.');
 
-  const [agency] = await db
-    .select()
-    .from(agencies)
-    .where(eq(agencies.id, ctx.agencyId))
-    .limit(1);
-
-  // Plan summary (best-effort).
+  const [agency] = await db.select().from(agencies).where(eq(agencies.id, actor.agencyId)).limit(1);
   const [sub] = await db
     .select()
     .from(subscriptions)
-    .where(eq(subscriptions.agencyId, ctx.agencyId))
+    .where(eq(subscriptions.agencyId, actor.agencyId))
     .limit(1);
   let plan = null;
   if (sub) {
-    const [p] = await db
-      .select()
-      .from(plans)
-      .where(eq(plans.id, sub.planId))
-      .limit(1);
+    const [p] = await db.select().from(plans).where(eq(plans.id, sub.planId)).limit(1);
     plan = p ?? null;
   }
 
-  // Resolve the user's custom role (if any) for its name + permission preset.
-  let customRole = null;
-  if (user.customRoleId) {
-    const [cr] = await db
-      .select()
-      .from(customRoles)
-      .where(
-        and(
-          eq(customRoles.id, user.customRoleId),
-          eq(customRoles.agencyId, ctx.agencyId),
-        ),
-      )
-      .limit(1);
-    customRole = cr ?? null;
-  }
-  const builtinLabel =
-    user.role === 'owner'
-      ? 'Owner'
-      : user.role === 'admin'
-        ? 'Admin'
-        : user.role === 'client'
-          ? 'Client'
-          : 'Member';
+  const roleRows = await db
+    .select({ id: roles.id, key: roles.key, name: roles.name, kind: roles.kind })
+    .from(userRoles)
+    .innerJoin(roles, eq(roles.id, userRoles.roleId))
+    .where(and(eq(userRoles.userId, user.id), isNull(roles.archivedAt)));
 
-  // Effective module permissions for sidebar/route gating on the client
-  // (user override > custom role > agency role default > built-in default).
-  const permissions = resolvePermissions(
-    user.role,
-    user.permissionsJson,
-    agency?.rolePermissionsJson ?? null,
-    customRole?.permissionsJson ?? null,
-  );
-
-  // Persona drives the role-specific dashboards + client redirect. Manager vs
-  // employee is a member-tier split: a manager can manage projects (the Manager
-  // preset grants projects:manage), an employee cannot.
-  let persona: 'owner' | 'admin' | 'manager' | 'employee' | 'client';
-  if (user.role === 'owner') persona = 'owner';
-  else if (user.role === 'admin') persona = 'admin';
-  else if (user.role === 'client') persona = 'client';
-  else persona = permissions.projects === 'manage' ? 'manager' : 'employee';
+  // ---- Legacy fields (old app builds). TODO(authz phase 10): remove. ----
+  const persona = legacyPersona(actor, user.role);
+  const legacyRoleName = roleRows[0]?.name ?? 'Member';
 
   ok(res, {
     user: {
       id: user.id,
       email: user.email,
       fullName: user.fullName,
-      role: user.role,
-      customRoleId: user.customRoleId,
-      roleName: customRole?.name ?? builtinLabel,
+      kind: user.kind,
       clientId: user.clientId ?? null,
+      // legacy
+      role: user.role,
+      customRoleId: null,
+      roleName: legacyRoleName,
       persona,
     },
-    persona,
     agency: agency
-      ? {
-          id: agency.id,
-          name: agency.name,
-          slug: agency.slug,
-          themePreset: agency.themePreset,
-        }
+      ? { id: agency.id, name: agency.name, slug: agency.slug, themePreset: agency.themePreset }
       : null,
     plan: plan
       ? {
@@ -671,6 +621,44 @@ authRouter.get('/me', requireAuth, async (req, res) => {
           maxAiGenerations: plan.maxAiGenerations,
         }
       : null,
-    permissions,
+    authorization: {
+      version: `${actor.authzVersion}.${CATALOG_VERSION}`,
+      actorType: actor.type,
+      roles: roleRows,
+      grants: actor.grants.toJSON(),
+      projectAccess: actor.type === 'client' ? actor.projectAccess : null,
+    },
+    // legacy
+    persona,
+    permissions: legacyPermissionMap(actor),
   });
+});
+
+// GET /auth/sessions — the caller's live sessions.
+authRouter.get('/sessions', authenticate, async (req, res) => {
+  const actor = getActor(req);
+  if (actor.type !== 'staff' && actor.type !== 'client') throw forbidden();
+  const rows = await listUserSessions(actor.userId);
+  ok(
+    res,
+    rows.map((r) => ({ ...r, current: r.id === actor.sessionId })),
+  );
+});
+
+// DELETE /auth/sessions/:id — end one of the caller's own sessions.
+authRouter.delete('/sessions/:id', authenticate, async (req, res) => {
+  const actor = getUserActor(req);
+  const s = await getSession(String(req.params.id));
+  if (!s || s.userId !== actor.userId) throw notFound();
+  await revokeSessions([s.id], 'user_signout');
+  await audit({
+    agencyId: actor.agencyId,
+    actorType: actor.type,
+    actorId: actorAuditId(actor),
+    action: 'auth.session.revoke',
+    entityType: 'session',
+    entityId: s.id,
+    ip: req.ip,
+  });
+  ok(res, { revoked: true });
 });

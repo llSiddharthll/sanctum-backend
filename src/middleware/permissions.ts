@@ -1,13 +1,9 @@
 import type { NextFunction, Request, Response } from 'express';
-import { eq } from 'drizzle-orm';
-import { db } from '../db/client.js';
-import { agencies, customRoles, users } from '../db/schema.js';
+import { legacyPermissionMap } from '../authz/compat.js';
 import { forbidden } from '../lib/errors.js';
 import { getAuth } from './tenant.js';
 import {
-  resolvePermissions,
   meetsLevel,
-  fullAccess,
   noAccess,
   MODULE_LABELS,
   type AccessLevel,
@@ -39,45 +35,17 @@ const LEVEL_VERB: Record<AccessLevel, string> = {
 };
 
 /**
- * Load (and memoize on the request) the caller's effective permission map.
- * Owner short-circuits to full access without a DB hit. Everyone else has their
- * stored overrides resolved against role defaults.
+ * Legacy module-level view of the caller's authorization, DERIVED from the new
+ * grant set (src/authz). Kept only for routers not yet migrated to
+ * `requires(...)` + policies. TODO(authz phase 10): delete this file.
  */
 export async function loadPermissions(req: Request): Promise<PermissionMap> {
-  const cached = (req as Request & { _permissions?: PermissionMap })
-    ._permissions;
-  if (cached) return cached;
-
-  const ctx = getAuth(req);
-  let perms: PermissionMap;
-  if (ctx.role === 'owner') {
-    perms = fullAccess();
-  } else if (ctx.role === 'client') {
-    // Clients are not agency staff — zero access to every agency module.
-    perms = noAccess();
-  } else {
-    // One indexed lookup: the user's overrides + agency role defaults + the
-    // user's custom role permissions (if any).
-    const [row] = await db
-      .select({
-        permissionsJson: users.permissionsJson,
-        rolePermissionsJson: agencies.rolePermissionsJson,
-        customRolePermissionsJson: customRoles.permissionsJson,
-      })
-      .from(users)
-      .innerJoin(agencies, eq(agencies.id, users.agencyId))
-      .leftJoin(customRoles, eq(customRoles.id, users.customRoleId))
-      .where(eq(users.id, ctx.userId))
-      .limit(1);
-    perms = resolvePermissions(
-      ctx.role,
-      row?.permissionsJson ?? null,
-      row?.rolePermissionsJson ?? null,
-      row?.customRolePermissionsJson ?? null,
-    );
+  const actor = req.actor;
+  if (!actor) {
+    getAuth(req); // throws unauthenticated
+    return noAccess();
   }
-  (req as Request & { _permissions?: PermissionMap })._permissions = perms;
-  return perms;
+  return legacyPermissionMap(actor) as PermissionMap;
 }
 
 /**

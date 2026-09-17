@@ -4,10 +4,20 @@ import { env } from './env.js';
 import { ensurePragmas } from './db/client.js';
 import { initSocket } from './realtime/socket.js';
 import { startScheduler } from './services/scheduler.js';
+import { migrateAllAgencies } from './authz/migrate-legacy.js';
+import { purgeInvalidGrants, syncOwnerRoles } from './authz/roles-store.js';
 
 async function main() {
   // Enable SQLite FK enforcement before serving traffic (best-effort).
   await ensurePragmas();
+
+  // Authorization bootstrap (idempotent): migrate legacy RBAC for agencies that
+  // haven't been migrated, keep Owner roles in sync with the catalog, and drop
+  // grants for permissions that no longer exist (fail closed).
+  const migrated = await migrateAllAgencies();
+  await syncOwnerRoles();
+  const purged = await purgeInvalidGrants();
+  console.log(`[authz] migrated ${migrated} agencies, purged ${purged} invalid grants`);
 
   const app = createApp();
   const port = env.PORT;

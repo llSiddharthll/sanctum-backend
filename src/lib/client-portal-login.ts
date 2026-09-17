@@ -2,7 +2,10 @@ import type { Request } from 'express';
 import { randomBytes } from 'node:crypto';
 import { and, asc, eq, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { users } from '../db/schema.js';
+import { assignRoles, systemRoleId } from '../authz/roles-store.js';
+import { revokeUserSessions } from '../authz/sessions.js';
+import { bumpUsers } from '../authz/resolver.js';
+import { clients, users } from '../db/schema.js';
 import { hashPassword } from './password.js';
 import { newId } from './ids.js';
 import { badRequest, conflict } from './errors.js';
@@ -99,20 +102,35 @@ export async function mintClientPortalLogin(params: {
       .update(users)
       .set({ email, passwordHash, status: 'active' })
       .where(eq(users.id, existing.id));
+    await revokeUserSessions(existing.id, 'credentials_reset');
+    await bumpUsers([existing.id]);
     return { email, password, created: false };
   }
 
-  await db.insert(users).values({
-    id: newId('usr'),
-    agencyId: params.agencyId,
-    clientId: params.clientId,
-    email,
-    passwordHash,
-    fullName: `${params.clientName} (portal)`,
-    role: 'client',
-    status: 'active',
-    // Clients have no module permissions; scope = all brand projects.
-    permissionsJson: null,
+  const userId = newId('usr');
+  const [brand] = await db
+    .select({ portalRole: clients.portalRole })
+    .from(clients)
+    .where(and(eq(clients.id, params.clientId), eq(clients.agencyId, params.agencyId)))
+    .limit(1);
+  const roleId = await systemRoleId(
+    params.agencyId,
+    brand?.portalRole === 'reviewer' ? 'client_reviewer' : 'client_approver',
+  );
+  await db.transaction(async (tx) => {
+    await tx.insert(users).values({
+      id: userId,
+      agencyId: params.agencyId,
+      clientId: params.clientId,
+      email,
+      passwordHash,
+      fullName: `${params.clientName} (portal)`,
+      role: 'client',
+      kind: 'client',
+      clientProjectAccess: 'all',
+      status: 'active',
+    });
+    if (roleId) await assignRoles(tx, { agencyId: params.agencyId, userId, roleIds: [roleId] });
   });
   return { email, password, created: true };
 }

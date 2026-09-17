@@ -113,6 +113,12 @@ const envSchema = z.object({
   // Credentials come from Refrens → Business Settings → Integrations. The
   // private key is a PKCS8 EC P-256 PEM; in .env keep the newlines escaped as
   // \n (the client un-escapes them). Sync is inert unless all three are set.
+  // Tenant that owns the (single, server-wide) Refrens credentials. Sync/push is
+  // refused for every other agency (prevents cross-tenant invoice imports).
+  REFRENS_AGENCY_ID: z.string().optional(),
+  // Tenant whose staff may view/operate host-level storage (local disk archive).
+  // Unset = nobody (storage endpoints are platform operations, not per agency).
+  PLATFORM_AGENCY_ID: z.string().optional(),
   REFRENS_URL_KEY: z.string().optional(),
   REFRENS_APP_ID: z.string().optional(),
   REFRENS_PRIVATE_KEY: z.string().optional(),

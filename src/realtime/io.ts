@@ -22,6 +22,10 @@ export const threadRoom = (id: string): string => `thread:${id}`;
 export const userRoom = (id: string): string => `user:${id}`;
 /** Public client portal room — keyed by clientId (token-authed sockets join). */
 export const portalRoom = (clientId: string): string => `portal:${clientId}`;
+/** Every socket opened with a given session (disconnected on revoke). */
+export const sessionRoom = (sessionId: string): string => `session:${sessionId}`;
+/** Every socket opened with a given share link (disconnected on revoke). */
+export const portalTokenRoom = (tokenId: string): string => `portal-token:${tokenId}`;
 
 // ============================================================
 //  Broadcast helpers (no-ops when the socket layer is absent)

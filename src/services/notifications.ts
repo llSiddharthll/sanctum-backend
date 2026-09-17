@@ -3,9 +3,9 @@
  * Socket.IO to the recipient's user room. Delivery is best-effort; the bell
  * also polls REST so a sleeping socket never loses a notification.
  */
-import { and, eq, inArray, ne } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { notifications, users } from '../db/schema.js';
+import { usersWithPermission } from '../authz/resolver.js';
+import { notifications } from '../db/schema.js';
 import { newId } from '../lib/ids.js';
 import { broadcastNotification } from '../realtime/io.js';
 import { sendPushToUser } from './push-send.js';
@@ -85,42 +85,36 @@ export async function notifyMany(
   await Promise.all(userIds.map((userId) => notify({ ...base, userId })));
 }
 
-/** Active owners/admins of an agency (recipients of approval requests). */
-export async function agencyApprovers(
+/**
+ * Recipients by CAPABILITY: active staff holding `permission` (e.g. the people
+ * who can approve leave get leave requests). Replaces role-based recipient lists.
+ */
+export async function notifyPermissionHolders(
   agencyId: string,
-  excludeUserId?: string,
-): Promise<string[]> {
-  const rows = await db
-    .select({ id: users.id })
-    .from(users)
-    .where(
-      and(
-        eq(users.agencyId, agencyId),
-        inArray(users.role, ['owner', 'admin']),
-        eq(users.status, 'active'),
-        excludeUserId ? ne(users.id, excludeUserId) : undefined,
-      ),
-    );
-  return rows.map((r) => r.id);
+  permission: string,
+  base: Omit<NotifyInput, 'userId'>,
+  opts: { excludeUserId?: string } = {},
+): Promise<void> {
+  const ids = await usersWithPermission(agencyId, permission, opts);
+  await notifyMany(ids, base);
 }
 
+export { usersWithPermission };
+
 /**
- * Active OWNERS of an agency. Recipients for Business-module notices (leads,
- * proposals, agreements, invoices, expenses) — those are owner-only, so admins
- * must not receive them.
+ * @deprecated TODO(authz): call sites must use notifyPermissionHolders with the
+ * specific permission. Temporary capability-based stand-in for the old
+ * owner/admin role query.
  */
+export async function agencyApprovers(agencyId: string, excludeUserId?: string): Promise<string[]> {
+  const perms = ['leaves.approve', 'regularizations.approve', 'checkout_requests.approve', 'posts.publish'];
+  const sets = await Promise.all(perms.map((p) => usersWithPermission(agencyId, p, { excludeUserId })));
+  return [...new Set(sets.flat())];
+}
+
+/** @deprecated TODO(authz): use notifyPermissionHolders(agencyId, '<business permission>', …). */
 export async function agencyOwners(agencyId: string): Promise<string[]> {
-  const rows = await db
-    .select({ id: users.id })
-    .from(users)
-    .where(
-      and(
-        eq(users.agencyId, agencyId),
-        eq(users.role, 'owner'),
-        eq(users.status, 'active'),
-      ),
-    );
-  return rows.map((r) => r.id);
+  return usersWithPermission(agencyId, 'proposals.view');
 }
 
 export { serialize as serializeNotification };

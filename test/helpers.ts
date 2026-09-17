@@ -1,6 +1,15 @@
 import supertest from 'supertest';
 import { createApp } from '../src/app.js';
 import { db, schema } from '../src/db/client.js';
+import { testOutbox } from '../src/services/email.js';
+import {
+  closeOverRequires,
+  grantsFromLegacy,
+  LEGACY_MODULES,
+  type Grant,
+  type LegacyLevel,
+  type LegacyModule,
+} from '../src/authz/catalog.js';
 
 /** The in-process Express app under test (no Socket.IO; broadcasts are no-ops). */
 export const app = createApp();
@@ -64,47 +73,107 @@ export interface MemberResult {
   inviteBody: unknown;
 }
 
+let roleSeq = 0;
+
+/**
+ * Create a custom role through the real /roles API and return its id.
+ * `grants` are explicit (permission, scope) pairs.
+ */
+export async function createRole(
+  ownerAgent: Agent,
+  grants: Grant[],
+  opts: { name?: string; actorType?: 'staff' | 'client' } = {},
+): Promise<string> {
+  roleSeq += 1;
+  const res = await ownerAgent.post(`${BASE}/roles`).send({
+    name: opts.name ?? `Test role ${Date.now()}-${roleSeq}`,
+    actorType: opts.actorType ?? 'staff',
+    grants,
+  });
+  if (res.status !== 201) {
+    throw new Error(`role create failed ${res.status}: ${JSON.stringify(res.body)}`);
+  }
+  return res.body.data.id;
+}
+
+/**
+ * Explicit grants equivalent to a LEGACY module-level permission map (unset
+ * modules = manage, finance/business none), via the catalog's own legacy rules.
+ * Lets older suites express intent ("projects: view") in the new model.
+ */
+export function legacyGrants(
+  permissions: Record<string, string> = {},
+  role: 'admin' | 'member' = 'member',
+): Grant[] {
+  const levels = Object.fromEntries(
+    LEGACY_MODULES.map((m) => [m, (permissions[m] as LegacyLevel) ?? 'manage']),
+  ) as Record<LegacyModule, LegacyLevel>;
+  levels.finance = 'none';
+  levels.business = 'none';
+  return closeOverRequires(grantsFromLegacy({ role, levels }), 'staff');
+}
+
 /**
  * Invite a teammate through the real /team/invite endpoint, then complete the
- * real accept-invite flow (extract the token from the returned inviteUrl, set a
- * password via POST /auth/accept-invite). Returns a logged-in agent for that
- * member — exercising the exact path a real invited user takes.
+ * real accept-invite flow. Access is set by:
+ *   - `roleIds` (explicit roles), or
+ *   - `grants` (a fresh custom role with exactly these grants), or
+ *   - legacy `role` + `permissions` (translated to an equivalent custom role).
  */
 export async function createMemberSession(
   ownerAgent: Agent,
   opts: {
     role?: 'admin' | 'member';
     permissions?: Record<string, string>;
+    grants?: Grant[];
+    roleIds?: string[];
     fullName?: string;
     email?: string;
   } = {},
 ): Promise<MemberResult> {
   const email = opts.email ?? uniqueEmail('member');
   const password = 'Password123!';
+  let roleIds = opts.roleIds;
+  if (!roleIds) {
+    if (opts.grants) {
+      roleIds = [await createRole(ownerAgent, opts.grants)];
+    } else if (opts.role === 'admin' && !opts.permissions) {
+      roleIds = undefined; // system Administrator role via legacy `role`
+    } else {
+      roleIds = [await createRole(ownerAgent, legacyGrants(opts.permissions, opts.role ?? 'member'))];
+    }
+  }
   const invite = await ownerAgent.post(`${BASE}/team/invite`).send({
     fullName: opts.fullName ?? 'Member User',
     email,
-    role: opts.role ?? 'member',
-    ...(opts.permissions ? { permissions: opts.permissions } : {}),
+    ...(roleIds ? { roleIds } : { role: opts.role ?? 'member' }),
   });
   if (invite.status !== 201) {
-    throw new Error(
-      `invite failed ${invite.status}: ${JSON.stringify(invite.body)}`,
-    );
+    throw new Error(`invite failed ${invite.status}: ${JSON.stringify(invite.body)}`);
   }
   const token = inviteToken(invite.body.data.inviteUrl);
 
   const agent = supertest.agent(app);
-  const accept = await agent
-    .post(`${BASE}/auth/accept-invite`)
-    .send({ token, password });
+  const accept = await agent.post(`${BASE}/auth/accept-invite`).send({ token, password });
   if (accept.status !== 200) {
-    throw new Error(
-      `accept-invite failed ${accept.status}: ${JSON.stringify(accept.body)}`,
-    );
+    throw new Error(`accept-invite failed ${accept.status}: ${JSON.stringify(accept.body)}`);
   }
   const me = await agent.get(`${BASE}/auth/me`);
   return { agent, email, password, user: me.body.data.user, inviteBody: invite.body.data };
+}
+
+/** Most recent email sent to `to` (test outbox). */
+export function lastEmailTo(to: string) {
+  const all = testOutbox.filter((m) => m.to.toLowerCase() === to.toLowerCase());
+  return all[all.length - 1];
+}
+
+/** Extract a `token=` value from the text of an email. */
+export function tokenFromEmail(to: string): string {
+  const msg = lastEmailTo(to);
+  const m = msg && /token=([A-Za-z0-9_-]+)/.exec(msg.text);
+  if (!m) throw new Error(`no token email for ${to}`);
+  return m[1]!;
 }
 
 /** Pull the raw invite token out of an inviteUrl (…/accept-invite?token=…). */

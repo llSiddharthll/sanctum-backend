@@ -5,6 +5,7 @@ import {
   BASE,
   signupAgency,
   createMemberSession,
+  tokenFromEmail,
   data,
   uniqueEmail,
 } from './helpers';
@@ -102,7 +103,9 @@ describe('password reset + change password', () => {
       `${BASE}/team/${member.user.id}/reset-password`,
     );
     expect(reset.status).toBe(200);
-    const token = tokenFromUrl(data(reset).resetUrl);
+    // The link is emailed to the member only — never returned to the admin.
+    expect(data(reset).resetUrl).toBeUndefined();
+    const token = tokenFromEmail(member.email);
     expect(token).toMatch(/^pzt_/);
 
     // Preview returns the account email.

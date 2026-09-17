@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { Router } from 'express';
 import { z } from 'zod';
 import { and, desc, eq, inArray, ne, sql } from 'drizzle-orm';
@@ -9,12 +10,13 @@ import {
   clientAssignments,
   clients,
   clientUserProjects,
-  customRoles,
   invites,
   projectMembers,
   projectTasks,
   projects,
+  roles,
   timeLogs,
+  userRoles,
   users,
 } from '../db/schema.js';
 import { dayKeyInTz } from '../lib/attendance.js';
@@ -23,54 +25,48 @@ import { ok, created, toIso, param } from '../lib/http.js';
 import { newId, newOpaqueToken } from '../lib/ids.js';
 import { badRequest, conflict, forbidden, notFound } from '../lib/errors.js';
 import { hashPassword } from '../lib/password.js';
-import { requireAuth, requireRole, canManageRole } from '../middleware/auth.js';
-import { getAuth, isPrivileged, requireClientAccess } from '../middleware/tenant.js';
-import { requireModuleRW, loadPermissions } from '../middleware/permissions.js';
-import { audit } from '../services/audit.js';
+import { audit, auditAuthz } from '../services/audit.js';
 import { sendTeamInvite } from '../services/email.js';
 import { createPasswordReset } from '../services/password-reset.js';
-import {
-  resolvePermissions,
-  serializeOverrides,
-  sanitizeOverrides,
-  parseOverrides,
-  meetsLevel,
-  type ModuleKey,
-  type AccessLevel,
-} from '../lib/permissions.js';
-
-/**
- * A non-owner caller may not grant a module level above their OWN effective
- * access for that module (prevents privilege escalation via the permission map).
- * Throws 403 on the first violation.
- */
-async function assertPermissionCeiling(
-  req: import('express').Request,
-  callerRole: string,
-  permissions: Record<string, string> | undefined,
-): Promise<void> {
-  if (!permissions || callerRole === 'owner') return;
-  const callerPerms = await loadPermissions(req);
-  for (const [mod, lvl] of Object.entries(sanitizeOverrides(permissions))) {
-    if (!meetsLevel(callerPerms[mod as ModuleKey], lvl as AccessLevel)) {
-      throw forbidden(
-        `You cannot grant more access to ${mod} than you have yourself.`,
-      );
-    }
-  }
-}
-import crypto from 'node:crypto';
-
 import { getFrontendOrigin } from '../lib/frontend-url.js';
+import {
+  authenticate,
+  getActor,
+  getStaffActor,
+  requires,
+  requiresAny,
+} from '../authz/http.js';
+import { authorize, can, canOrg, check } from '../authz/engine.js';
+import type { StaffActor } from '../authz/actor.js';
+import {
+  assertOwnerRemains,
+  assertWithinCeiling,
+  holdsOwnerRole,
+  loadAssignableRoles,
+} from '../authz/admin.js';
+import {
+  assertCanManageUser,
+  loadTarget,
+  roleSummaries,
+  setUserOverrides,
+  setUserRoles,
+} from '../authz/user-admin.js';
+import { bumpUsers, explainUser } from '../authz/resolver.js';
+import { revokeUserSessions } from '../authz/sessions.js';
+import {
+  assignRoles,
+  readRoleGrants,
+  syncLegacyRoleColumn,
+  systemRoleId,
+} from '../authz/roles-store.js';
+import { SCOPES, type SystemRoleKey } from '../authz/catalog.js';
+import { clientFacts, clientScopeFilter } from '../authz/policies/clients.js';
 
 export const usersRouter = Router();
-usersRouter.use(requireAuth);
-// Module gate: GET needs `view`, writes need `manage` on the Team module.
-usersRouter.use(requireModuleRW('team'));
+usersRouter.use(authenticate);
 
 // ---- Helpers -------------------------------------------------
 
-/** Split a stored comma-separated skills string into a trimmed array. */
 function parseSkills(csv: string | null | undefined): string[] {
   if (!csv) return [];
   return csv
@@ -79,7 +75,6 @@ function parseSkills(csv: string | null | undefined): string[] {
     .filter((s) => s.length > 0);
 }
 
-/** Normalize a csv-string OR string[] of skills down to a stored csv string. */
 function skillsToCsv(input: string | string[] | undefined): string | undefined {
   if (input === undefined) return undefined;
   const arr = Array.isArray(input) ? input : input.split(',');
@@ -89,138 +84,86 @@ function skillsToCsv(input: string | string[] | undefined): string | undefined {
     .join(',');
 }
 
-/** UTC start-of-week (Monday 00:00:00) for "this week" worklog windows. */
 function startOfWeek(d = new Date()): Date {
-  const day = d.getUTCDay(); // 0 = Sun ... 6 = Sat
-  const diff = (day + 6) % 7; // days since Monday
-  const start = new Date(
-    Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()),
-  );
+  const day = d.getUTCDay();
+  const diff = (day + 6) % 7;
+  const start = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
   start.setUTCDate(start.getUTCDate() - diff);
   return start;
 }
 
-/** Round a utilization percentage, guarding against zero capacity. */
 function utilizationPct(loggedMinutes: number, weeklyCapacityHrs: number): number {
   const capacityMin = (weeklyCapacityHrs ?? 0) * 60;
   if (!capacityMin) return 0;
   return Math.round((loggedMinutes / capacityMin) * 100);
 }
 
-const memberBaseSelection = {
-  id: users.id,
-  email: users.email,
-  fullName: users.fullName,
-  role: users.role,
-  status: users.status,
-  lastLoginAt: users.lastLoginAt,
-  designation: users.designation,
-  department: users.department,
-  phone: users.phone,
-  hourlyRate: users.hourlyRate,
-  monthlySalaryPaise: users.monthlySalaryPaise,
-  weeklyCapacityHrs: users.weeklyCapacityHrs,
-  skills: users.skills,
-  permissionsJson: users.permissionsJson,
-  customRoleId: users.customRoleId,
-  createdAt: users.createdAt,
-};
+type UserRow = typeof users.$inferSelect;
+type RoleSummary = Awaited<ReturnType<typeof roleSummaries>>[number];
 
-type MemberBaseRow = {
-  id: string;
-  email: string;
-  fullName: string | null;
-  role: 'owner' | 'admin' | 'member' | 'client';
-  status: 'active' | 'disabled';
-  lastLoginAt: Date | null;
-  designation: string | null;
-  department: string | null;
-  phone: string | null;
-  hourlyRate: number | null;
-  monthlySalaryPaise: number | null;
-  weeklyCapacityHrs: number;
-  skills: string | null;
-  permissionsJson: string | null;
-  customRoleId: string | null;
-  createdAt: Date | null;
-};
-
-function builtinRoleLabel(role: MemberBaseRow['role']): string {
-  if (role === 'owner') return 'Owner';
-  if (role === 'admin') return 'Admin';
-  if (role === 'client') return 'Client';
-  return 'Member';
+async function rolesByUser(userIds: string[]): Promise<Map<string, RoleSummary[]>> {
+  const out = new Map<string, RoleSummary[]>();
+  if (!userIds.length) return out;
+  const rows = await db
+    .select({
+      userId: userRoles.userId,
+      id: roles.id,
+      key: roles.key,
+      name: roles.name,
+      kind: roles.kind,
+      colorToken: roles.colorToken,
+    })
+    .from(userRoles)
+    .innerJoin(roles, eq(roles.id, userRoles.roleId))
+    .where(inArray(userRoles.userId, userIds));
+  for (const r of rows) {
+    const { userId, ...role } = r;
+    out.set(userId, [...(out.get(userId) ?? []), role]);
+  }
+  return out;
 }
 
-/** Common profile fields shared by list rows and the detail view. */
-function profileFields(
-  u: MemberBaseRow,
-  roleDefaults?: string | null,
-  customRolePermsJson?: string | null,
-  customRoleName?: string | null,
-  showFinance = true,
-) {
+/** Profile shape shared by list and detail. Compensation is permission-gated. */
+function profileFields(u: UserRow, userRolesList: RoleSummary[], canSeeComp: boolean) {
+  const isOwner = userRolesList.some((r) => r.key === 'owner');
   return {
     id: u.id,
     email: u.email,
     fullName: u.fullName,
+    kind: u.kind,
+    roles: userRolesList,
+    // legacy display fields (TODO authz phase 10)
     role: u.role,
-    customRoleId: u.customRoleId,
-    roleName: customRoleName ?? builtinRoleLabel(u.role),
+    roleName: userRolesList.map((r) => r.name).join(', ') || null,
+    isOwner,
     status: u.status,
     lastLoginAt: toIso(u.lastLoginAt),
     designation: u.designation,
     department: u.department,
     phone: u.phone,
-    // Pay rate is money — hidden from non-finance roles (managers/employees).
-    hourlyRate: showFinance ? u.hourlyRate : null,
-    monthlySalaryPaise: showFinance ? u.monthlySalaryPaise : null,
+    hourlyRate: canSeeComp ? u.hourlyRate : null,
+    monthlySalaryPaise: canSeeComp ? u.monthlySalaryPaise : null,
     weeklyCapacityHrs: u.weeklyCapacityHrs ?? 0,
     skills: parseSkills(u.skills),
-    // Effective: user override > custom role > agency role default > built-in.
-    permissions: resolvePermissions(
-      u.role,
-      u.permissionsJson,
-      roleDefaults ?? null,
-      customRolePermsJson ?? null,
-    ),
     joinedAt: toIso(u.createdAt),
   };
 }
 
-/** Fetch the agency's stored role-permission defaults JSON (or null). */
-async function getAgencyRoleDefaults(agencyId: string): Promise<string | null> {
-  const [row] = await db
-    .select({ rolePermissionsJson: agencies.rolePermissionsJson })
-    .from(agencies)
-    .where(eq(agencies.id, agencyId))
-    .limit(1);
-  return row?.rolePermissionsJson ?? null;
-}
-
 // ============================================================
-//  GET /team — list members (ARRAY shape — consumers depend on it)
+//  GET /team — staff members
 // ============================================================
 const listQuery = z.object({
-  role: z.enum(['owner', 'admin', 'member']).optional(),
   search: z.string().optional(),
-  activeOnly: z
-    .union([z.literal('true'), z.literal('false'), z.boolean()])
-    .optional(),
+  activeOnly: z.union([z.literal('true'), z.literal('false'), z.boolean()]).optional(),
 });
 
-usersRouter.get('/', async (req, res) => {
-  const ctx = getAuth(req);
+usersRouter.get('/', requires('users.view'), async (req, res) => {
+  const actor = getStaffActor(req);
   const q = listQuery.parse(req.query);
   const weekStart = startOfWeek();
 
-  // Staff only — client-login users are NOT agency team members; they're listed
-  // separately (GET /team/client-users) and live under the Clients module.
-  const filters = [eq(users.agencyId, ctx.agencyId), ne(users.role, 'client')];
-  if (q.role) filters.push(eq(users.role, q.role));
-  if (q.activeOnly === true || q.activeOnly === 'true') {
-    filters.push(eq(users.status, 'active'));
-  }
+  const filters = [eq(users.agencyId, actor.agencyId), eq(users.kind, 'staff')];
+  if (q.activeOnly === true || q.activeOnly === 'true') filters.push(eq(users.status, 'active'));
   if (q.search && q.search.trim()) {
     const term = `%${q.search.trim().toLowerCase()}%`;
     filters.push(
@@ -232,212 +175,111 @@ usersRouter.get('/', async (req, res) => {
     );
   }
 
-  const baseRows = await db
-    .select({
-      ...memberBaseSelection,
-      customRolePermsJson: customRoles.permissionsJson,
-      customRoleName: customRoles.name,
-    })
-    .from(users)
-    .leftJoin(customRoles, eq(customRoles.id, users.customRoleId))
-    .where(and(...filters))
-    .orderBy(desc(users.createdAt));
-
-  const roleDefaults = await getAgencyRoleDefaults(ctx.agencyId);
-
-  // Per-user aggregates via plain grouped queries. (The earlier correlated
-  // subqueries didn't bind the outer user row, so every count came back 0.)
+  const baseRows = await db.select().from(users).where(and(...filters)).orderBy(desc(users.createdAt));
   const ids = baseRows.map((u) => u.id);
+  const roleMap = await rolesByUser(ids);
+
   const taskCount = new Map<string, number>();
   const projectIds = new Map<string, Set<string>>();
   const weekMinutes = new Map<string, number>();
-  // Presence: today's attendance keyed by user (agency timezone day).
-  const presence = new Map<
-    string,
-    { checkedIn: boolean; checkInAt: string | null; checkOutAt: string | null }
-  >();
+  const presence = new Map<string, { checkedIn: boolean; checkInAt: string | null; checkOutAt: string | null }>();
   const ensure = (m: Map<string, Set<string>>, k: string) => {
     let s = m.get(k);
     if (!s) m.set(k, (s = new Set<string>()));
     return s;
   };
 
+  // Workload aggregates are only computed for data the actor may see.
+  const seeWorkload = canOrg(actor, 'tasks.view');
+  const seeTime = canOrg(actor, 'time_logs.view');
+  const seeAttendance = canOrg(actor, 'attendance.view') || can(actor, 'attendance.view_live');
+
   if (ids.length) {
-    const weekStartSec = Math.floor(weekStart.getTime() / 1000);
-
-    const taskRows = await db
-      .select({
-        uid: projectTasks.assigneeId,
-        pid: projectTasks.projectId,
-        status: projectTasks.status,
-      })
-      .from(projectTasks)
-      .where(
-        and(
-          eq(projectTasks.agencyId, ctx.agencyId),
-          inArray(projectTasks.assigneeId, ids),
-        ),
-      );
-    for (const r of taskRows) {
-      if (!r.uid) continue;
-      if (r.status !== 'done') {
-        taskCount.set(r.uid, (taskCount.get(r.uid) ?? 0) + 1);
+    if (seeWorkload) {
+      const taskRows = await db
+        .select({ uid: projectTasks.assigneeId, pid: projectTasks.projectId, status: projectTasks.status })
+        .from(projectTasks)
+        .where(and(eq(projectTasks.agencyId, actor.agencyId), inArray(projectTasks.assigneeId, ids)));
+      for (const r of taskRows) {
+        if (!r.uid) continue;
+        if (r.status !== 'done') taskCount.set(r.uid, (taskCount.get(r.uid) ?? 0) + 1);
+        ensure(projectIds, r.uid).add(r.pid);
       }
-      ensure(projectIds, r.uid).add(r.pid);
+      const memberRows = await db
+        .select({ uid: projectMembers.userId, pid: projectMembers.projectId })
+        .from(projectMembers)
+        .where(and(eq(projectMembers.agencyId, actor.agencyId), inArray(projectMembers.userId, ids)));
+      for (const r of memberRows) ensure(projectIds, r.uid).add(r.pid);
     }
-
-    const memberRows = await db
-      .select({ uid: projectMembers.userId, pid: projectMembers.projectId })
-      .from(projectMembers)
-      .where(
-        and(
-          eq(projectMembers.agencyId, ctx.agencyId),
-          inArray(projectMembers.userId, ids),
-        ),
-      );
-    for (const r of memberRows) ensure(projectIds, r.uid).add(r.pid);
-
-    const logRows = await db
-      .select({ uid: timeLogs.userId, minutes: timeLogs.minutes })
-      .from(timeLogs)
-      .where(
-        and(
-          eq(timeLogs.agencyId, ctx.agencyId),
-          inArray(timeLogs.userId, ids),
-          sql`${timeLogs.workDate} >= ${weekStartSec}`,
-        ),
-      );
-    for (const r of logRows) {
-      weekMinutes.set(r.uid, (weekMinutes.get(r.uid) ?? 0) + Number(r.minutes ?? 0));
+    if (seeTime) {
+      const weekStartSec = Math.floor(weekStart.getTime() / 1000);
+      const logRows = await db
+        .select({ uid: timeLogs.userId, minutes: timeLogs.minutes })
+        .from(timeLogs)
+        .where(
+          and(
+            eq(timeLogs.agencyId, actor.agencyId),
+            inArray(timeLogs.userId, ids),
+            sql`${timeLogs.workDate} >= ${weekStartSec}`,
+          ),
+        );
+      for (const r of logRows) weekMinutes.set(r.uid, (weekMinutes.get(r.uid) ?? 0) + Number(r.minutes ?? 0));
     }
-
-    // Presence — today's attendance rows (agency timezone day), per user.
-    const policy = await loadPolicy(ctx.agencyId);
-    const today = dayKeyInTz(new Date(), policy.timezone);
-    const attRows = await db
-      .select({
-        userId: attendanceRecords.userId,
-        checkInAt: attendanceRecords.checkInAt,
-        checkOutAt: attendanceRecords.checkOutAt,
-      })
-      .from(attendanceRecords)
-      .where(
-        and(
-          eq(attendanceRecords.agencyId, ctx.agencyId),
-          eq(attendanceRecords.day, today),
-          inArray(attendanceRecords.userId, ids),
-        ),
-      );
-    for (const r of attRows) {
-      presence.set(r.userId, {
-        // "In" today means a check-in exists (regardless of later check-out).
-        checkedIn: !!r.checkInAt,
-        checkInAt: toIso(r.checkInAt),
-        checkOutAt: toIso(r.checkOutAt),
-      });
+    if (seeAttendance) {
+      const policy = await loadPolicy(actor.agencyId);
+      const today = dayKeyInTz(new Date(), policy.timezone);
+      const attRows = await db
+        .select({
+          userId: attendanceRecords.userId,
+          checkInAt: attendanceRecords.checkInAt,
+          checkOutAt: attendanceRecords.checkOutAt,
+        })
+        .from(attendanceRecords)
+        .where(
+          and(
+            eq(attendanceRecords.agencyId, actor.agencyId),
+            eq(attendanceRecords.day, today),
+            inArray(attendanceRecords.userId, ids),
+          ),
+        );
+      for (const r of attRows) {
+        presence.set(r.userId, {
+          checkedIn: !!r.checkInAt,
+          checkInAt: toIso(r.checkInAt),
+          checkOutAt: toIso(r.checkOutAt),
+        });
+      }
     }
   }
 
-  const showFinance = meetsLevel((await loadPermissions(req)).finance, 'view');
+  const canSeeComp = can(actor, 'users.view_compensation');
   ok(
     res,
     baseRows.map((u) => {
       const loggedMinutesThisWeek = weekMinutes.get(u.id) ?? 0;
       const p = presence.get(u.id);
       return {
-        ...profileFields(
-          u as MemberBaseRow,
-          roleDefaults,
-          u.customRolePermsJson,
-          u.customRoleName,
-          showFinance,
-        ),
+        ...profileFields(u, roleMap.get(u.id) ?? [], canSeeComp),
         activeTaskCount: taskCount.get(u.id) ?? 0,
         projectCount: projectIds.get(u.id)?.size ?? 0,
         loggedMinutesThisWeek,
-        utilizationPct: utilizationPct(
-          loggedMinutesThisWeek,
-          u.weeklyCapacityHrs ?? 0,
-        ),
-        // Presence today: 'in' once checked in, 'out' once checked out, else null.
+        utilizationPct: utilizationPct(loggedMinutesThisWeek, u.weeklyCapacityHrs ?? 0),
         checkedInToday: p?.checkedIn ?? false,
         checkInAt: p?.checkInAt ?? null,
         checkOutAt: p?.checkOutAt ?? null,
-        presence: p
-          ? p.checkOutAt
-            ? ('out' as const)
-            : ('in' as const)
-          : (null as null),
+        presence: p ? (p.checkOutAt ? ('out' as const) : ('in' as const)) : (null as null),
       };
     }),
   );
 });
 
 // ============================================================
-//  GET /team/client-users — client-login accounts (role='client'), listed
-//  SEPARATELY from staff. These are portal logins for a brand, not team members.
+//  CLIENT USERS (portal accounts)
 // ============================================================
-usersRouter.get(
-  '/client-users',
-  requireRole('owner', 'admin'),
-  async (req, res) => {
-    const ctx = getAuth(req);
-    const rows = await db
-      .select({
-        id: users.id,
-        fullName: users.fullName,
-        email: users.email,
-        status: users.status,
-        lastLoginAt: users.lastLoginAt,
-        clientId: users.clientId,
-        clientName: clients.name,
-        createdAt: users.createdAt,
-      })
-      .from(users)
-      .leftJoin(clients, eq(clients.id, users.clientId))
-      .where(and(eq(users.agencyId, ctx.agencyId), eq(users.role, 'client')))
-      .orderBy(desc(users.createdAt));
 
-    const ids = rows.map((r) => r.id);
-    const scopeCount = new Map<string, number>();
-    if (ids.length) {
-      const sc = await db
-        .select({
-          userId: clientUserProjects.userId,
-          n: sql<number>`count(*)`,
-        })
-        .from(clientUserProjects)
-        .where(
-          and(
-            eq(clientUserProjects.agencyId, ctx.agencyId),
-            inArray(clientUserProjects.userId, ids),
-          ),
-        )
-        .groupBy(clientUserProjects.userId);
-      for (const r of sc) scopeCount.set(r.userId, Number(r.n));
-    }
-
-    ok(
-      res,
-      rows.map((r) => ({
-        id: r.id,
-        fullName: r.fullName,
-        email: r.email,
-        status: r.status,
-        lastLoginAt: toIso(r.lastLoginAt),
-        clientId: r.clientId,
-        clientName: r.clientName,
-        // 0 = scoped to ALL of the brand's projects; N = restricted to N projects.
-        projectScope: scopeCount.get(r.id) ?? 0,
-        joinedAt: toIso(r.createdAt),
-      })),
-    );
-  },
-);
-
-/** Re-fetch a single client-login account in the list's serialized shape. */
-async function serializeClientUser(agencyId: string, id: string) {
-  const [r] = await db
+async function clientUserRowsFor(actor: StaffActor, idFilter?: string) {
+  const scope = await clientScopeFilter(actor, 'client_users.view', users.clientId);
+  const rows = await db
     .select({
       id: users.id,
       fullName: users.fullName,
@@ -446,23 +288,33 @@ async function serializeClientUser(agencyId: string, id: string) {
       lastLoginAt: users.lastLoginAt,
       clientId: users.clientId,
       clientName: clients.name,
+      clientProjectAccess: users.clientProjectAccess,
       createdAt: users.createdAt,
     })
     .from(users)
     .leftJoin(clients, eq(clients.id, users.clientId))
-    .where(and(eq(users.id, id), eq(users.agencyId, agencyId)))
-    .limit(1);
-  if (!r) return null;
-  const [{ n } = { n: 0 }] = await db
-    .select({ n: sql<number>`count(*)` })
-    .from(clientUserProjects)
     .where(
       and(
-        eq(clientUserProjects.agencyId, agencyId),
-        eq(clientUserProjects.userId, id),
+        eq(users.agencyId, actor.agencyId),
+        eq(users.kind, 'client'),
+        sql`lower(${users.email}) not like '%@portal.sanctum'`,
+        scope,
+        ...(idFilter ? [eq(users.id, idFilter)] : []),
       ),
-    );
-  return {
+    )
+    .orderBy(desc(users.createdAt));
+  const ids = rows.map((r) => r.id);
+  const scopeCount = new Map<string, number>();
+  if (ids.length) {
+    const sc = await db
+      .select({ userId: clientUserProjects.userId, n: sql<number>`count(*)` })
+      .from(clientUserProjects)
+      .where(and(eq(clientUserProjects.agencyId, actor.agencyId), inArray(clientUserProjects.userId, ids)))
+      .groupBy(clientUserProjects.userId);
+    for (const r of sc) scopeCount.set(r.userId, Number(r.n));
+  }
+  const roleMap = await rolesByUser(ids);
+  return rows.map((r) => ({
     id: r.id,
     fullName: r.fullName,
     email: r.email,
@@ -470,146 +322,158 @@ async function serializeClientUser(agencyId: string, id: string) {
     lastLoginAt: toIso(r.lastLoginAt),
     clientId: r.clientId,
     clientName: r.clientName,
-    projectScope: Number(n) || 0,
+    roles: roleMap.get(r.id) ?? [],
+    projectAccess: r.clientProjectAccess ?? 'all',
+    projectScope: scopeCount.get(r.id) ?? 0,
     joinedAt: toIso(r.createdAt),
-  };
+  }));
 }
 
-// ============================================================
-//  PATCH /team/client-users/:id — edit a client-login account. Changing the
-//  email sends a fresh access link to the NEW address so they can sign in there.
-// ============================================================
+usersRouter.get('/client-users', requires('client_users.view'), async (req, res) => {
+  ok(res, await clientUserRowsFor(getStaffActor(req)));
+});
+
+/** Load a client user the actor may act on for `permission`, or 404/403. */
+async function scopedClientUser(actor: StaffActor, id: string, permission: string) {
+  const target = await loadTarget(actor.agencyId, id).catch(() => null);
+  if (!target || target.kind !== 'client' || !target.clientId) throw notFound('Client account not found.');
+  const facts = await clientFacts(actor, target.clientId);
+  authorize(actor, permission, facts, { view: 'client_users.view' });
+  return target;
+}
+
 const updateClientUserSchema = z.object({
   fullName: z.string().trim().min(1).max(120).optional(),
   email: z.string().trim().email().optional(),
   status: z.enum(['active', 'disabled']).optional(),
+  roleIds: z.array(z.string().min(1)).min(1).max(5).optional(),
+  projectAccess: z.enum(['all', 'selected']).optional(),
+  projectIds: z.array(z.string().min(1)).max(200).optional(),
 });
 
-usersRouter.patch(
-  '/client-users/:id',
-  requireRole('owner', 'admin'),
-  async (req, res) => {
-    const ctx = getAuth(req);
-    const id = param(req, 'id');
-    const body = updateClientUserSchema.parse(req.body);
+usersRouter.patch('/client-users/:id', requiresAny('client_users.update', 'client_users.disable'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const body = updateClientUserSchema.parse(req.body);
+  const touchesProfile =
+    body.fullName !== undefined || body.email !== undefined || body.roleIds !== undefined ||
+    body.projectAccess !== undefined || body.projectIds !== undefined;
+  const cu = await scopedClientUser(
+    actor,
+    param(req, 'id'),
+    touchesProfile ? 'client_users.update' : 'client_users.disable',
+  );
+  if (body.status !== undefined) {
+    authorize(actor, 'client_users.disable', await clientFacts(actor, cu.clientId!));
+  }
 
-    const [cu] = await db
-      .select()
-      .from(users)
-      .where(
-        and(
-          eq(users.id, id),
-          eq(users.agencyId, ctx.agencyId),
-          eq(users.role, 'client'),
-        ),
-      )
-      .limit(1);
-    if (!cu) throw notFound('Client account not found.');
+  const patch: Partial<typeof users.$inferInsert> = { updatedAt: new Date() };
+  if (body.fullName !== undefined) patch.fullName = body.fullName;
+  if (body.status !== undefined) patch.status = body.status;
 
-    const patch: Partial<typeof users.$inferInsert> = { updatedAt: new Date() };
-    if (body.fullName !== undefined) patch.fullName = body.fullName;
-    if (body.status !== undefined) patch.status = body.status;
-
-    const nextEmail = body.email?.trim().toLowerCase();
-    const emailChanged = !!nextEmail && nextEmail !== cu.email.toLowerCase();
-    if (emailChanged) {
-      const [dupe] = await db
-        .select({ id: users.id })
-        .from(users)
-        .where(eq(users.email, nextEmail!))
-        .limit(1);
-      if (dupe) throw conflict('That email is already in use.');
-      patch.email = nextEmail!;
-    }
-
-    await db.update(users).set(patch).where(eq(users.id, cu.id));
-
-    // On email change, email a fresh access link to the NEW address.
-    let resetUrl: string | undefined;
-    if (emailChanged) {
-      const r = await createPasswordReset(
-        {
-          id: cu.id,
-          agencyId: cu.agencyId,
-          email: nextEmail!,
-          fullName: patch.fullName ?? cu.fullName,
-        },
-        { byAdmin: true },
-      );
-      resetUrl = r.resetUrl;
-    }
-
-    await audit({
-      agencyId: ctx.agencyId,
-      actorType: ctx.role,
-      actorId: ctx.userId,
-      action: 'team.client_user.update',
-      entityType: 'user',
-      entityId: cu.id,
-      metadata: { emailChanged },
-      ip: req.ip,
-    });
-
-    const updated = await serializeClientUser(ctx.agencyId, cu.id);
-    ok(res, { ...updated, emailChanged, resetUrl });
-  },
-);
-
-// ============================================================
-//  DELETE /team/client-users/:id — remove a client-login account.
-// ============================================================
-usersRouter.delete(
-  '/client-users/:id',
-  requireRole('owner', 'admin'),
-  async (req, res) => {
-    const ctx = getAuth(req);
-    const id = param(req, 'id');
-    const [cu] = await db
+  const nextEmail = body.email?.trim().toLowerCase();
+  const emailChanged = !!nextEmail && nextEmail !== cu.email.toLowerCase();
+  if (emailChanged) {
+    const [dupe] = await db
       .select({ id: users.id })
       .from(users)
-      .where(
-        and(
-          eq(users.id, id),
-          eq(users.agencyId, ctx.agencyId),
-          eq(users.role, 'client'),
-        ),
-      )
+      .where(and(eq(users.agencyId, actor.agencyId), sql`lower(${users.email}) = ${nextEmail}`))
       .limit(1);
-    if (!cu) throw notFound('Client account not found.');
+    if (dupe) throw conflict('That email is already in use.');
+    patch.email = nextEmail!;
+  }
 
-    await db
-      .delete(clientUserProjects)
-      .where(
-        and(
-          eq(clientUserProjects.agencyId, ctx.agencyId),
-          eq(clientUserProjects.userId, id),
-        ),
+  if (body.projectAccess !== undefined || body.projectIds !== undefined) {
+    const mode = body.projectAccess ?? (body.projectIds ? 'selected' : cu.clientProjectAccess ?? 'all');
+    const ids = mode === 'selected' ? await validateBrandProjects(actor.agencyId, cu.clientId!, body.projectIds ?? []) : [];
+    patch.clientProjectAccess = mode;
+    await db.delete(clientUserProjects).where(eq(clientUserProjects.userId, cu.id));
+    if (ids.length) {
+      await db.insert(clientUserProjects).values(
+        ids.map((projectId) => ({ id: newId('cup'), agencyId: actor.agencyId, userId: cu.id, projectId })),
       );
-    await db.delete(users).where(eq(users.id, id));
+    }
+  }
 
-    await audit({
-      agencyId: ctx.agencyId,
-      actorType: ctx.role,
-      actorId: ctx.userId,
-      action: 'team.client_user.delete',
-      entityType: 'user',
-      entityId: id,
-      ip: req.ip,
+  await db.update(users).set(patch).where(eq(users.id, cu.id));
+  if (body.roleIds) {
+    const assignable = await loadAssignableRoles(actor.agencyId, body.roleIds, 'client');
+    await db.transaction(async (tx) => {
+      await assignRoles(tx, { agencyId: actor.agencyId, userId: cu.id, roleIds: assignable.map((r) => r.id), assignedBy: actor.userId });
     });
-    ok(res, { deleted: true });
-  },
-);
+  }
+  const accessChanged =
+    body.status !== undefined || body.roleIds !== undefined ||
+    body.projectAccess !== undefined || body.projectIds !== undefined || emailChanged;
+  if (accessChanged) await bumpUsers([cu.id]);
+  if (body.status === 'disabled' || emailChanged) {
+    await revokeUserSessions(cu.id, body.status === 'disabled' ? 'disabled' : 'email_changed');
+  }
+  if (emailChanged) {
+    // The link goes ONLY to the new address; it is never returned to the caller.
+    await createPasswordReset(
+      { id: cu.id, agencyId: cu.agencyId, email: nextEmail!, fullName: patch.fullName ?? cu.fullName },
+      { byAdmin: true, req },
+    );
+  }
+
+  await auditAuthz({
+    actor,
+    action: 'client_user.update',
+    entityType: 'client_user',
+    entityId: cu.id,
+    before: { status: cu.status, email: cu.email, projectAccess: cu.clientProjectAccess },
+    after: { status: patch.status ?? cu.status, email: patch.email ?? cu.email, roleIds: body.roleIds, projectAccess: patch.clientProjectAccess },
+    ip: req.ip,
+  });
+  const [updated] = await clientUserRowsFor(actor, cu.id);
+  ok(res, { ...updated, emailChanged });
+});
+
+usersRouter.delete('/client-users/:id', requires('client_users.disable'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const cu = await scopedClientUser(actor, param(req, 'id'), 'client_users.disable');
+  await revokeUserSessions(cu.id, 'deleted');
+  await db.delete(users).where(and(eq(users.id, cu.id), eq(users.agencyId, actor.agencyId)));
+  await auditAuthz({ actor, action: 'client_user.delete', entityType: 'client_user', entityId: cu.id, before: { email: cu.email }, ip: req.ip });
+  ok(res, { deleted: true });
+});
+
+usersRouter.post('/client-users/:id/reset-password', requires('client_users.reset_password'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const cu = await scopedClientUser(actor, param(req, 'id'), 'client_users.reset_password');
+  if (cu.status !== 'active') throw conflict('This account is not active.');
+  await createPasswordReset(cu, { byAdmin: true, req });
+  await auditAuthz({ actor, action: 'client_user.password_reset', entityType: 'client_user', entityId: cu.id, ip: req.ip });
+  ok(res, { ok: true, emailed: true });
+});
+
+async function validateBrandProjects(agencyId: string, clientId: string, projectIds: string[]): Promise<string[]> {
+  const ids = [...new Set(projectIds)];
+  if (!ids.length) return [];
+  const rows = await db
+    .select({ id: projects.id })
+    .from(projects)
+    .where(and(eq(projects.agencyId, agencyId), eq(projects.clientId, clientId), inArray(projects.id, ids)));
+  if (rows.length !== ids.length) throw badRequest('One or more projects do not belong to this client.');
+  return rows.map((r) => r.id);
+}
 
 // ============================================================
-//  POST /team/invite — create a real (active) member + an invite token
+//  POST /team/invite — staff member or client user
 // ============================================================
+const LEGACY_ROLE_TO_SYSTEM: Record<string, SystemRoleKey> = {
+  admin: 'admin',
+  member: 'employee',
+};
+
 const inviteSchema = z
   .object({
     fullName: z.string().trim().min(1).max(120),
     email: z.string().email(),
-    role: z.enum(['admin', 'member', 'client']).default('member'),
-    // Client invites: the brand + optional project scope (empty = all the
-    // client's projects). Ignored for staff invites.
+    kind: z.enum(['staff', 'client']).optional(),
+    roleIds: z.array(z.string().min(1)).min(1).max(5).optional(),
+    /** Legacy: 'admin' | 'member' | 'client' (maps to system roles). */
+    role: z.enum(['admin', 'member', 'client']).optional(),
     clientId: z.string().min(1).optional(),
     projectIds: z.array(z.string().min(1)).max(200).optional(),
     phone: z.string().trim().max(40).optional(),
@@ -619,417 +483,344 @@ const inviteSchema = z
     monthlySalaryPaise: z.number().int().min(0).optional(),
     weeklyCapacityHrs: z.number().int().min(0).max(168).optional(),
     skills: z.union([z.string(), z.array(z.string())]).optional(),
-    // Optional module permission overrides ({ moduleKey: 'none'|'view'|'manage' }).
-    permissions: z.record(z.string(), z.string()).optional(),
   })
-  .refine((d) => d.role !== 'client' || !!d.clientId, {
+  .transform((d) => ({ ...d, kind: d.kind ?? (d.role === 'client' ? 'client' : 'staff') }))
+  .refine((d) => d.kind !== 'client' || !!d.clientId, {
     message: 'A client invite requires a clientId.',
     path: ['clientId'],
   });
 
-usersRouter.post('/invite', requireRole('owner', 'admin'), async (req, res) => {
-  const ctx = getAuth(req);
+usersRouter.post('/invite', requiresAny('users.invite', 'client_users.invite'), async (req, res) => {
+  const actor = getStaffActor(req);
   const body = inviteSchema.parse(req.body);
   const email = body.email.toLowerCase();
+  const isClient = body.kind === 'client';
 
-  // A non-owner may only invite roles strictly below their own tier (an admin
-  // can invite managers/employees, but not another admin or an owner).
-  if (ctx.role !== 'owner' && !canManageRole(ctx.role, body.role)) {
-    throw forbidden('You cannot invite a member at or above your own role.');
-  }
-  await assertPermissionCeiling(req, ctx.role, body.permissions);
-
-  // Client-invite validation: the brand must belong to this agency, and any
-  // project scope must belong to that brand. Empty scope = all of its projects.
+  let roleIds: string[];
   let clientScopeProjectIds: string[] = [];
-  if (body.role === 'client') {
+  if (isClient) {
+    const facts = await clientFacts(actor, body.clientId!);
+    authorize(actor, 'client_users.invite', facts, { view: 'clients.view' });
     const [brand] = await db
-      .select({ id: clients.id })
+      .select({ portalRole: clients.portalRole })
       .from(clients)
-      .where(
-        and(eq(clients.id, body.clientId!), eq(clients.agencyId, ctx.agencyId)),
-      )
+      .where(eq(clients.id, body.clientId!))
       .limit(1);
-    if (!brand) throw notFound('Client not found.');
-    if (body.projectIds && body.projectIds.length) {
-      const rows = await db
-        .select({ id: projects.id })
-        .from(projects)
-        .where(
-          and(
-            eq(projects.agencyId, ctx.agencyId),
-            eq(projects.clientId, body.clientId!),
-            inArray(projects.id, body.projectIds),
-          ),
-        );
-      clientScopeProjectIds = rows.map((r) => r.id);
-      if (clientScopeProjectIds.length !== body.projectIds.length) {
-        throw badRequest('One or more projects do not belong to this client.');
+    clientScopeProjectIds = await validateBrandProjects(actor.agencyId, body.clientId!, body.projectIds ?? []);
+    if (body.roleIds) {
+      roleIds = (await loadAssignableRoles(actor.agencyId, body.roleIds, 'client')).map((r) => r.id);
+    } else {
+      const key: SystemRoleKey = brand?.portalRole === 'reviewer' ? 'client_reviewer' : 'client_approver';
+      const id = await systemRoleId(actor.agencyId, key);
+      if (!id) throw conflict('Client roles are not configured for this agency.');
+      roleIds = [id];
+    }
+  } else {
+    if (!can(actor, 'users.invite')) throw forbidden("You don't have permission to invite team members.");
+    const explicitRoles = body.roleIds;
+    if (explicitRoles) {
+      if (!can(actor, 'users.assign_roles')) throw forbidden("You don't have permission to assign roles.");
+      roleIds = (await loadAssignableRoles(actor.agencyId, explicitRoles, 'staff')).map((r) => r.id);
+    } else {
+      const key = LEGACY_ROLE_TO_SYSTEM[body.role ?? 'member'] ?? 'employee';
+      if (key !== 'employee' && !can(actor, 'users.assign_roles')) {
+        throw forbidden("You don't have permission to assign roles.");
       }
+      const id = await systemRoleId(actor.agencyId, key);
+      if (!id) throw conflict('System roles are not configured for this agency.');
+      roleIds = [id];
+    }
+    const roleRows = await loadAssignableRoles(actor.agencyId, roleIds, 'staff');
+    if (roleRows.some((r) => r.key === 'owner') && !(await holdsOwnerRole(actor.userId, actor.agencyId))) {
+      throw forbidden('Only owners can grant the Owner role.');
+    }
+    // Ceiling: the invitee can never receive more than the inviter holds.
+    for (const r of roleRows) assertWithinCeiling(actor.grants, await readRoleGrants(db, r.id));
+    if ((body.hourlyRate !== undefined || body.monthlySalaryPaise !== undefined) && !can(actor, 'users.update_compensation')) {
+      throw forbidden("You don't have permission to set compensation.");
     }
   }
 
-  // Enforce the unique (agencyId, lower(email)) up front for a clean 409.
   const [existing] = await db
     .select({ id: users.id })
     .from(users)
-    .where(
-      and(
-        eq(users.agencyId, ctx.agencyId),
-        sql`lower(${users.email}) = ${email}`,
-      ),
-    )
+    .where(and(eq(users.agencyId, actor.agencyId), sql`lower(${users.email}) = ${email}`))
     .limit(1);
   if (existing) throw conflict('A member with that email already exists.');
 
   const userId = newId('usr');
-  // Random password — the member sets a real one later via accept-invite.
   const randomPassword = crypto.randomBytes(24).toString('base64url');
-
-  const permissionsJson = body.permissions
-    ? serializeOverrides(body.permissions)
-    : null;
-
-  const isClient = body.role === 'client';
-  await db.insert(users).values({
-    id: userId,
-    agencyId: ctx.agencyId,
-    email,
-    passwordHash: await hashPassword(randomPassword),
-    fullName: body.fullName,
-    role: body.role,
-    status: 'active',
-    clientId: isClient ? body.clientId! : null,
-    phone: body.phone ?? null,
-    designation: body.designation ?? null,
-    department: body.department ?? null,
-    hourlyRate: body.hourlyRate ?? null,
-    monthlySalaryPaise: body.monthlySalaryPaise ?? null,
-    ...(body.weeklyCapacityHrs !== undefined
-      ? { weeklyCapacityHrs: body.weeklyCapacityHrs }
-      : {}),
-    skills: skillsToCsv(body.skills) ?? null,
-    // Clients have no module permissions (resolvePermissions returns noAccess).
-    permissionsJson: isClient ? null : permissionsJson,
+  await db.transaction(async (tx) => {
+    await tx.insert(users).values({
+      id: userId,
+      agencyId: actor.agencyId,
+      email,
+      passwordHash: await hashPassword(randomPassword),
+      fullName: body.fullName,
+      role: isClient ? 'client' : body.role === 'admin' ? 'admin' : 'member',
+      kind: isClient ? 'client' : 'staff',
+      status: 'active',
+      clientId: isClient ? body.clientId! : null,
+      clientProjectAccess: isClient ? (clientScopeProjectIds.length ? 'selected' : 'all') : null,
+      phone: body.phone ?? null,
+      designation: body.designation ?? null,
+      department: body.department ?? null,
+      hourlyRate: isClient ? null : (body.hourlyRate ?? null),
+      monthlySalaryPaise: isClient ? null : (body.monthlySalaryPaise ?? null),
+      ...(body.weeklyCapacityHrs !== undefined ? { weeklyCapacityHrs: body.weeklyCapacityHrs } : {}),
+      skills: skillsToCsv(body.skills) ?? null,
+    });
+    await assignRoles(tx, { agencyId: actor.agencyId, userId, roleIds, assignedBy: actor.userId });
+    if (!isClient) await syncLegacyRoleColumn(tx, userId);
+    if (isClient && clientScopeProjectIds.length) {
+      await tx.insert(clientUserProjects).values(
+        clientScopeProjectIds.map((projectId) => ({ id: newId('cup'), agencyId: actor.agencyId, userId, projectId })),
+      );
+    }
   });
 
-  // Per-project scope for a client login (empty = all the brand's projects).
-  if (isClient && clientScopeProjectIds.length) {
-    await db.insert(clientUserProjects).values(
-      clientScopeProjectIds.map((projectId) => ({
-        id: newId('cup'),
-        agencyId: ctx.agencyId,
-        userId,
-        projectId,
-      })),
-    );
-  }
-
-  // Pending invite row (token) — best-effort accept flow.
   const { raw, hash } = newOpaqueToken();
-  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
   await db.insert(invites).values({
     id: newId('inv'),
-    agencyId: ctx.agencyId,
+    agencyId: actor.agencyId,
     email,
-    role: body.role,
+    role: isClient ? 'client' : body.role === 'admin' ? 'admin' : 'member',
     clientId: isClient ? body.clientId! : null,
-    projectScopeJson:
-      isClient && clientScopeProjectIds.length
-        ? JSON.stringify(clientScopeProjectIds)
-        : null,
+    projectScopeJson: isClient && clientScopeProjectIds.length ? JSON.stringify(clientScopeProjectIds) : null,
     tokenHash: hash,
-    invitedBy: ctx.userId,
+    invitedBy: actor.userId,
     status: 'pending',
-    expiresAt,
+    expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
   });
 
-  await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
-    action: 'team.invite',
-    entityType: 'user',
+  const assigned = await roleSummaries(userId);
+  await auditAuthz({
+    actor,
+    action: isClient ? 'client_user.invite' : 'user.invite',
+    entityType: isClient ? 'client_user' : 'user',
     entityId: userId,
-    metadata: { email, role: body.role },
+    after: { email, roles: assigned.map((r) => r.name), clientId: body.clientId ?? null },
     ip: req.ip,
   });
 
-  const roleDefaults = await getAgencyRoleDefaults(ctx.agencyId);
-  const member = {
-    ...profileFields(
-      {
-        id: userId,
-        email,
-        fullName: body.fullName,
-        role: body.role,
-        status: 'active',
-        lastLoginAt: null,
-        designation: body.designation ?? null,
-        department: body.department ?? null,
-        phone: body.phone ?? null,
-        hourlyRate: body.hourlyRate ?? null,
-    monthlySalaryPaise: body.monthlySalaryPaise ?? null,
-        weeklyCapacityHrs: body.weeklyCapacityHrs ?? 40,
-        skills: skillsToCsv(body.skills) ?? null,
-        permissionsJson,
-        customRoleId: null,
-        createdAt: new Date(),
-      },
-      roleDefaults,
-    ),
-    activeTaskCount: 0,
-    projectCount: 0,
-    loggedMinutesThisWeek: 0,
-    utilizationPct: 0,
-  };
-
+  // The invite link is for a brand-new account whose authority is already
+  // capped by the inviter's own (ceiling above), so it may be shown to copy
+  // when email delivery isn't configured.
   const inviteUrl = `${getFrontendOrigin(req)}/accept-invite?token=${raw}`;
-
-  // Best-effort invite email (logs only when SMTP is unconfigured). The link is
-  // also returned so the inviter can copy/share it manually.
-  const [ag] = await db
-    .select({ name: agencies.name })
-    .from(agencies)
-    .where(eq(agencies.id, ctx.agencyId))
-    .limit(1);
-  void sendTeamInvite({
-    to: email,
-    agencyName: ag?.name ?? 'your team',
-    acceptUrl: inviteUrl,
-  }).catch((err) => {
+  const [ag] = await db.select({ name: agencies.name }).from(agencies).where(eq(agencies.id, actor.agencyId)).limit(1);
+  void sendTeamInvite({ to: email, agencyName: ag?.name ?? 'your team', acceptUrl: inviteUrl }).catch((err) => {
     console.error('[email:invite:error]', err);
   });
 
-  created(res, { member, inviteUrl });
+  const [row] = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+  created(res, {
+    member: {
+      ...profileFields(row!, assigned, can(actor, 'users.view_compensation')),
+      activeTaskCount: 0,
+      projectCount: 0,
+      loggedMinutesThisWeek: 0,
+      utilizationPct: 0,
+    },
+    inviteUrl,
+  });
+});
+
+// ============================================================
+//  CLIENT ASSIGNMENTS
+// ============================================================
+usersRouter.get('/clients/:clientId/assignments', requires('clients.view'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const facts = await clientFacts(actor, param(req, 'clientId'));
+  authorize(actor, 'clients.view', facts);
+  const rows = await db
+    .select({ id: clientAssignments.id, userId: clientAssignments.userId })
+    .from(clientAssignments)
+    .where(and(eq(clientAssignments.agencyId, actor.agencyId), eq(clientAssignments.clientId, param(req, 'clientId'))));
+  ok(res, rows);
+});
+
+const assignSchema = z.object({ userId: z.string().min(1) });
+
+usersRouter.post('/clients/:clientId/assignments', requires('clients.manage_assignments'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const clientId = param(req, 'clientId');
+  authorize(actor, 'clients.manage_assignments', await clientFacts(actor, clientId), { view: 'clients.view' });
+  const body = assignSchema.parse(req.body);
+  const [user] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(and(eq(users.id, body.userId), eq(users.agencyId, actor.agencyId), eq(users.kind, 'staff'), eq(users.status, 'active')))
+    .limit(1);
+  if (!user) throw notFound('User not found.');
+
+  await db
+    .insert(clientAssignments)
+    .values({ id: newId('asn'), agencyId: actor.agencyId, clientId, userId: body.userId, assignedBy: actor.userId })
+    .onConflictDoNothing();
+  await bumpUsers([body.userId]);
+  await audit({
+    agencyId: actor.agencyId,
+    actorType: 'staff',
+    actorId: actor.userId,
+    action: 'client.assign',
+    entityType: 'client',
+    entityId: clientId,
+    metadata: { userId: body.userId },
+    ip: req.ip,
+  });
+  ok(res, { assigned: true });
+});
+
+usersRouter.delete('/clients/:clientId/assignments/:userId', requires('clients.manage_assignments'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const clientId = param(req, 'clientId');
+  authorize(actor, 'clients.manage_assignments', await clientFacts(actor, clientId), { view: 'clients.view' });
+  const userId = param(req, 'userId');
+  await db
+    .delete(clientAssignments)
+    .where(
+      and(
+        eq(clientAssignments.agencyId, actor.agencyId),
+        eq(clientAssignments.clientId, clientId),
+        eq(clientAssignments.userId, userId),
+      ),
+    );
+  await bumpUsers([userId]);
+  await audit({
+    agencyId: actor.agencyId,
+    actorType: 'staff',
+    actorId: actor.userId,
+    action: 'client.unassign',
+    entityType: 'client',
+    entityId: clientId,
+    metadata: { userId },
+    ip: req.ip,
+  });
+  ok(res, { unassigned: true });
 });
 
 // ============================================================
 //  GET /team/:userId — member detail
 // ============================================================
-usersRouter.get('/:userId', async (req, res) => {
-  const ctx = getAuth(req);
+usersRouter.get('/:userId', requires('users.view'), async (req, res) => {
+  const actor = getStaffActor(req);
   const userId = param(req, 'userId');
+  const u = await loadTarget(actor.agencyId, userId);
+  if (u.kind !== 'staff') throw notFound('Member not found.');
+  const isSelf = userId === actor.userId;
 
-  const [u] = await db
-    .select({
-      ...memberBaseSelection,
-      customRolePermsJson: customRoles.permissionsJson,
-      customRoleName: customRoles.name,
-    })
-    .from(users)
-    .leftJoin(customRoles, eq(customRoles.id, users.customRoleId))
-    .where(and(eq(users.id, userId), eq(users.agencyId, ctx.agencyId)))
-    .limit(1);
-  if (!u) throw notFound('Member not found.');
+  const seeWork = isSelf || canOrg(actor, 'tasks.view');
+  const seeTime = isSelf ? can(actor, 'time_logs.view') : canOrg(actor, 'time_logs.view');
 
-  const roleDefaults = await getAgencyRoleDefaults(ctx.agencyId);
+  const memberProjects = seeWork
+    ? await db
+        .select({ id: projects.id, name: projects.name, status: projects.status, role: projectMembers.role })
+        .from(projectMembers)
+        .innerJoin(projects, eq(projects.id, projectMembers.projectId))
+        .where(and(eq(projectMembers.agencyId, actor.agencyId), eq(projectMembers.userId, userId)))
+    : [];
+  const taskProjects = seeWork
+    ? await db
+        .selectDistinct({ id: projects.id, name: projects.name, status: projects.status })
+        .from(projectTasks)
+        .innerJoin(projects, eq(projects.id, projectTasks.projectId))
+        .where(and(eq(projectTasks.agencyId, actor.agencyId), eq(projectTasks.assigneeId, userId)))
+    : [];
+  const projectMap = new Map<string, { id: string; name: string; status: string; role: string | null }>();
+  for (const p of memberProjects) projectMap.set(p.id, { ...p });
+  for (const p of taskProjects) if (!projectMap.has(p.id)) projectMap.set(p.id, { ...p, role: null });
+  const projectList = [...projectMap.values()];
 
-  // Projects: explicit memberships joined to project details, unioned with
-  // projects the user has tasks in (distinct by project id).
-  const memberProjects = await db
-    .select({
-      id: projects.id,
-      name: projects.name,
-      status: projects.status,
-      role: projectMembers.role,
-    })
-    .from(projectMembers)
-    .innerJoin(projects, eq(projects.id, projectMembers.projectId))
-    .where(
-      and(
-        eq(projectMembers.agencyId, ctx.agencyId),
-        eq(projectMembers.userId, userId),
-      ),
-    );
+  const activeTasks = seeWork
+    ? await db
+        .select({
+          id: projectTasks.id,
+          title: projectTasks.title,
+          status: projectTasks.status,
+          projectId: projectTasks.projectId,
+          projectName: projects.name,
+          dueDate: projectTasks.dueDate,
+        })
+        .from(projectTasks)
+        .leftJoin(projects, eq(projects.id, projectTasks.projectId))
+        .where(and(eq(projectTasks.agencyId, actor.agencyId), eq(projectTasks.assigneeId, userId), ne(projectTasks.status, 'done')))
+        .orderBy(desc(projectTasks.dueDate))
+    : [];
 
-  const taskProjects = await db
-    .selectDistinct({
-      id: projects.id,
-      name: projects.name,
-      status: projects.status,
-    })
-    .from(projectTasks)
-    .innerJoin(projects, eq(projects.id, projectTasks.projectId))
-    .where(
-      and(
-        eq(projectTasks.agencyId, ctx.agencyId),
-        eq(projectTasks.assigneeId, userId),
-      ),
-    );
+  const recentLogs = seeTime
+    ? await db
+        .select({
+          id: timeLogs.id,
+          minutes: timeLogs.minutes,
+          workDate: timeLogs.workDate,
+          note: timeLogs.note,
+          projectId: timeLogs.projectId,
+          projectName: projects.name,
+          taskId: timeLogs.taskId,
+        })
+        .from(timeLogs)
+        .leftJoin(projects, eq(projects.id, timeLogs.projectId))
+        .where(and(eq(timeLogs.agencyId, actor.agencyId), eq(timeLogs.userId, userId)))
+        .orderBy(desc(timeLogs.workDate))
+        .limit(20)
+    : [];
+  const totalLoggedMinutes = seeTime ? await totalMinutes(actor.agencyId, userId) : 0;
+  const weekMinutes = seeTime ? await loggedMinutesThisWeekForUser(actor.agencyId, userId) : 0;
 
-  const projectMap = new Map<
-    string,
-    { id: string; name: string; status: string; role: string | null }
-  >();
-  for (const p of memberProjects) {
-    projectMap.set(p.id, {
-      id: p.id,
-      name: p.name,
-      status: p.status,
-      role: p.role,
-    });
+  let checkInAt: string | null = null;
+  let checkOutAt: string | null = null;
+  let checkedInToday = false;
+  if (isSelf || canOrg(actor, 'attendance.view') || can(actor, 'attendance.view_live')) {
+    const policy = await loadPolicy(actor.agencyId);
+    const today = dayKeyInTz(new Date(), policy.timezone);
+    const [todayRec] = await db
+      .select({ checkInAt: attendanceRecords.checkInAt, checkOutAt: attendanceRecords.checkOutAt })
+      .from(attendanceRecords)
+      .where(and(eq(attendanceRecords.agencyId, actor.agencyId), eq(attendanceRecords.userId, userId), eq(attendanceRecords.day, today)))
+      .limit(1);
+    checkedInToday = !!todayRec?.checkInAt;
+    checkInAt = todayRec ? toIso(todayRec.checkInAt) : null;
+    checkOutAt = todayRec ? toIso(todayRec.checkOutAt) : null;
   }
-  for (const p of taskProjects) {
-    if (!projectMap.has(p.id)) {
-      projectMap.set(p.id, {
-        id: p.id,
-        name: p.name,
-        status: p.status,
-        role: null,
-      });
-    }
-  }
-  const projectList = Array.from(projectMap.values());
 
-  // Active tasks (assigned, not done) with project name.
-  const activeTasks = await db
-    .select({
-      id: projectTasks.id,
-      title: projectTasks.title,
-      status: projectTasks.status,
-      projectId: projectTasks.projectId,
-      projectName: projects.name,
-      dueDate: projectTasks.dueDate,
-    })
-    .from(projectTasks)
-    .leftJoin(projects, eq(projects.id, projectTasks.projectId))
-    .where(
-      and(
-        eq(projectTasks.agencyId, ctx.agencyId),
-        eq(projectTasks.assigneeId, userId),
-        ne(projectTasks.status, 'done'),
-      ),
-    )
-    .orderBy(desc(projectTasks.dueDate));
-
-  // Recent time logs (~20) with project name.
-  const recentLogs = await db
-    .select({
-      id: timeLogs.id,
-      minutes: timeLogs.minutes,
-      workDate: timeLogs.workDate,
-      note: timeLogs.note,
-      projectId: timeLogs.projectId,
-      projectName: projects.name,
-      taskId: timeLogs.taskId,
-    })
-    .from(timeLogs)
-    .leftJoin(projects, eq(projects.id, timeLogs.projectId))
-    .where(
-      and(eq(timeLogs.agencyId, ctx.agencyId), eq(timeLogs.userId, userId)),
-    )
-    .orderBy(desc(timeLogs.workDate))
-    .limit(20);
-
-  // Aggregates.
-  const [{ total } = { total: 0 }] = await db
-    .select({
-      total: sql<number>`coalesce(sum(${timeLogs.minutes}), 0)`,
-    })
-    .from(timeLogs)
-    .where(
-      and(eq(timeLogs.agencyId, ctx.agencyId), eq(timeLogs.userId, userId)),
-    );
-  const totalLoggedMinutes = Number(total ?? 0);
-
-  // Presence today (agency timezone day) for the detail header.
-  const policy = await loadPolicy(ctx.agencyId);
-  const today = dayKeyInTz(new Date(), policy.timezone);
-  const [todayRec] = await db
-    .select({
-      checkInAt: attendanceRecords.checkInAt,
-      checkOutAt: attendanceRecords.checkOutAt,
-    })
-    .from(attendanceRecords)
-    .where(
-      and(
-        eq(attendanceRecords.agencyId, ctx.agencyId),
-        eq(attendanceRecords.userId, userId),
-        eq(attendanceRecords.day, today),
-      ),
-    )
-    .limit(1);
-  const checkedInToday = !!todayRec?.checkInAt;
-  const checkInAt = todayRec ? toIso(todayRec.checkInAt) : null;
-  const checkOutAt = todayRec ? toIso(todayRec.checkOutAt) : null;
-
-  const showFinance = meetsLevel((await loadPermissions(req)).finance, 'view');
+  const userRolesList = await roleSummaries(userId);
   ok(res, {
-    ...profileFields(
-      u as MemberBaseRow,
-      roleDefaults,
-      u.customRolePermsJson,
-      u.customRoleName,
-      showFinance,
-    ),
+    ...profileFields(u, userRolesList, can(actor, 'users.view_compensation')),
     checkedInToday,
     checkInAt,
     checkOutAt,
-    presence: todayRec
-      ? checkOutAt
-        ? ('out' as const)
-        : ('in' as const)
-      : (null as null),
+    presence: checkInAt ? (checkOutAt ? ('out' as const) : ('in' as const)) : (null as null),
     projects: projectList,
-    activeTasks: activeTasks.map((tk) => ({
-      id: tk.id,
-      title: tk.title,
-      status: tk.status,
-      projectId: tk.projectId,
-      projectName: tk.projectName,
-      dueDate: toIso(tk.dueDate),
-    })),
-    timeLogs: recentLogs.map((l) => ({
-      id: l.id,
-      minutes: l.minutes,
-      workDate: toIso(l.workDate),
-      note: l.note,
-      projectId: l.projectId,
-      projectName: l.projectName,
-      taskId: l.taskId,
-    })),
+    activeTasks: activeTasks.map((tk) => ({ ...tk, dueDate: toIso(tk.dueDate) })),
+    timeLogs: recentLogs.map((l) => ({ ...l, workDate: toIso(l.workDate) })),
     totalLoggedMinutes,
     activeTaskCount: activeTasks.length,
     projectCount: projectList.length,
-    utilizationPct: utilizationPct(
-      // "this week" utilization for the detail header.
-      await loggedMinutesThisWeekForUser(ctx.agencyId, userId),
-      u.weeklyCapacityHrs ?? 0,
-    ),
+    utilizationPct: utilizationPct(weekMinutes, u.weeklyCapacityHrs ?? 0),
   });
 });
 
-/** Sum of minutes a user logged in the current week (detail-view helper). */
-async function loggedMinutesThisWeekForUser(
-  agencyId: string,
-  userId: string,
-): Promise<number> {
+async function totalMinutes(agencyId: string, userId: string): Promise<number> {
+  const [{ total } = { total: 0 }] = await db
+    .select({ total: sql<number>`coalesce(sum(${timeLogs.minutes}), 0)` })
+    .from(timeLogs)
+    .where(and(eq(timeLogs.agencyId, agencyId), eq(timeLogs.userId, userId)));
+  return Number(total ?? 0);
+}
+
+async function loggedMinutesThisWeekForUser(agencyId: string, userId: string): Promise<number> {
   const weekStartSec = Math.floor(startOfWeek().getTime() / 1000);
   const [{ total } = { total: 0 }] = await db
-    .select({
-      total: sql<number>`coalesce(sum(${timeLogs.minutes}), 0)`,
-    })
+    .select({ total: sql<number>`coalesce(sum(${timeLogs.minutes}), 0)` })
     .from(timeLogs)
-    .where(
-      and(
-        eq(timeLogs.agencyId, agencyId),
-        eq(timeLogs.userId, userId),
-        sql`${timeLogs.workDate} >= ${weekStartSec}`,
-      ),
-    );
+    .where(and(eq(timeLogs.agencyId, agencyId), eq(timeLogs.userId, userId), sql`${timeLogs.workDate} >= ${weekStartSec}`));
   return Number(total ?? 0);
 }
 
 // ============================================================
-//  PATCH /team/:userId — role/status + profile (owner/admin)
+//  PATCH /team/:userId — profile, compensation, status
 // ============================================================
 const patchSchema = z.object({
-  // 'owner' is accepted but runtime-guarded: only an owner may grant it.
-  role: z.enum(['owner', 'admin', 'member']).optional(),
-  // Assign a custom role (sets the user's tier to the role's baseRole); null
-  // clears it back to the built-in role.
-  customRoleId: z.string().nullable().optional(),
   status: z.enum(['active', 'disabled']).optional(),
   fullName: z.string().trim().min(1).max(120).optional(),
   designation: z.string().trim().max(120).nullable().optional(),
@@ -1039,243 +830,175 @@ const patchSchema = z.object({
   monthlySalaryPaise: z.number().int().min(0).nullable().optional(),
   weeklyCapacityHrs: z.number().int().min(0).max(168).optional(),
   skills: z.union([z.string(), z.array(z.string())]).optional(),
-  // Full or partial module permission map ({ moduleKey: 'none'|'view'|'manage' }).
-  permissions: z.record(z.string(), z.string()).optional(),
+  /** Legacy single-role change (old app builds) → PUT /team/:id/roles. */
+  role: z.enum(['owner', 'admin', 'member']).optional(),
 });
 
-usersRouter.patch(
-  '/:userId',
-  requireRole('owner', 'admin'),
-  async (req, res) => {
-    const ctx = getAuth(req);
-    const body = patchSchema.parse(req.body);
-    const [target] = await db
-      .select()
-      .from(users)
-      .where(
-        and(
-          eq(users.id, param(req, 'userId')),
-          eq(users.agencyId, ctx.agencyId),
-        ),
-      )
-      .limit(1);
-    if (!target) throw notFound('User not found.');
+usersRouter.patch('/:userId', requiresAny('users.update', 'users.disable', 'users.update_compensation', 'users.assign_roles'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const body = patchSchema.parse(req.body);
+  const target = await loadTarget(actor.agencyId, param(req, 'userId'));
+  if (target.kind !== 'staff') throw notFound('Member not found.');
+  await assertCanManageUser(actor, target);
 
-    const isSelf = target.id === ctx.userId;
-    const touchesPrivilege =
-      body.role !== undefined ||
-      body.customRoleId !== undefined ||
-      body.status !== undefined ||
-      body.permissions !== undefined;
+  const profileKeys = ['fullName', 'designation', 'department', 'phone', 'weeklyCapacityHrs', 'skills'] as const;
+  const touchesProfile = profileKeys.some((k) => body[k] !== undefined);
+  const touchesComp = body.hourlyRate !== undefined || body.monthlySalaryPaise !== undefined;
+  if (touchesProfile && !can(actor, 'users.update')) throw forbidden("You don't have permission to edit members.");
+  if (touchesComp && !can(actor, 'users.update_compensation')) throw forbidden("You don't have permission to change compensation.");
+  if (body.status !== undefined && !can(actor, 'users.disable')) throw forbidden("You don't have permission to change account status.");
 
-    // (1) No one may change their OWN role/permissions/status — the exact hole
-    // that let a manager self-promote to admin. Profile edits on self are fine.
-    if (isSelf && touchesPrivilege) {
-      throw forbidden(
-        'You cannot change your own role, permissions, or status.',
-      );
-    }
-    // (2) The owner is immutable (never demoted/edited by anyone).
-    if (target.role === 'owner' && touchesPrivilege) {
-      throw conflict('Cannot modify the owner.');
-    }
-    // (3) Rank ceiling: a non-owner may only manage users STRICTLY below their
-    // own tier (admins cannot touch other admins; nobody but owner touches owner).
-    if (touchesPrivilege && ctx.role !== 'owner' && !canManageRole(ctx.role, target.role)) {
-      throw forbidden('You cannot modify a member at or above your own role.');
-    }
-    // (4) Only the owner may grant the owner role.
-    if (body.role === 'owner' && ctx.role !== 'owner') {
-      throw forbidden('Only the owner can grant the owner role.');
-    }
-    // (5) A non-owner may not assign a built-in role at/above their own tier.
-    if (
-      ctx.role !== 'owner' &&
-      body.role !== undefined &&
-      !canManageRole(ctx.role, body.role)
-    ) {
-      throw forbidden('You cannot assign a role at or above your own.');
-    }
-    // (6) Permission-map ceiling.
-    await assertPermissionCeiling(req, ctx.role, body.permissions);
+  if (body.role !== undefined) {
+    if (!can(actor, 'users.assign_roles')) throw forbidden("You don't have permission to assign roles.");
+    const key: SystemRoleKey = body.role === 'owner' ? 'owner' : body.role === 'admin' ? 'admin' : 'employee';
+    const id = await systemRoleId(actor.agencyId, key);
+    if (!id) throw notFound('Role not found.');
+    await setUserRoles({ actor, target, roleIds: [id], ip: req.ip });
+  }
 
-    const patch: Partial<typeof users.$inferInsert> = { updatedAt: new Date() };
-    // Role assignment: a custom role sets the tier from its baseRole; a built-in
-    // role clears any custom role.
-    if (body.customRoleId !== undefined) {
-      if (body.customRoleId) {
-        const [cr] = await db
-          .select()
-          .from(customRoles)
-          .where(
-            and(
-              eq(customRoles.id, body.customRoleId),
-              eq(customRoles.agencyId, ctx.agencyId),
-            ),
-          )
-          .limit(1);
-        if (!cr) throw notFound('Custom role not found.');
-        // A non-owner cannot assign a custom role whose base tier is at/above
-        // their own (an admin can't mint an admin-tier role).
-        if (ctx.role !== 'owner' && !canManageRole(ctx.role, cr.baseRole)) {
-          throw forbidden(
-            'You cannot assign a role at or above your own tier.',
-          );
-        }
-        patch.customRoleId = cr.id;
-        patch.role = cr.baseRole;
-        // The role's preset now drives — clear any personal overrides.
-        patch.permissionsJson = null;
-      } else {
-        patch.customRoleId = null;
-        if (body.role !== undefined) patch.role = body.role;
-      }
-    } else if (body.role !== undefined) {
-      patch.role = body.role;
-      patch.customRoleId = null;
-    }
-    if (body.status !== undefined) patch.status = body.status;
-    if (body.fullName !== undefined) patch.fullName = body.fullName;
-    if (body.designation !== undefined) patch.designation = body.designation;
-    if (body.department !== undefined) patch.department = body.department;
-    if (body.phone !== undefined) patch.phone = body.phone;
-    if (body.hourlyRate !== undefined) patch.hourlyRate = body.hourlyRate;
-    if (body.monthlySalaryPaise !== undefined)
-      patch.monthlySalaryPaise = body.monthlySalaryPaise;
-    if (body.weeklyCapacityHrs !== undefined)
-      patch.weeklyCapacityHrs = body.weeklyCapacityHrs;
-    if (body.skills !== undefined) patch.skills = skillsToCsv(body.skills) ?? null;
-    // Merge incoming permission overrides onto any existing ones, then persist.
-    // serializeOverrides drops invalid keys/levels and returns null when empty.
-    if (body.permissions !== undefined) {
-      const merged = {
-        ...parseOverrides(target.permissionsJson),
-        ...sanitizeOverrides(body.permissions),
-      };
-      patch.permissionsJson = serializeOverrides(merged);
-    }
+  const patch: Partial<typeof users.$inferInsert> = { updatedAt: new Date() };
+  if (body.status !== undefined && body.status !== target.status) {
+    if (body.status === 'disabled') await assertOwnerRemains(actor.agencyId, [target.id]);
+    patch.status = body.status;
+  }
+  if (body.fullName !== undefined) patch.fullName = body.fullName;
+  if (body.designation !== undefined) patch.designation = body.designation;
+  if (body.department !== undefined) patch.department = body.department;
+  if (body.phone !== undefined) patch.phone = body.phone;
+  if (body.hourlyRate !== undefined) patch.hourlyRate = body.hourlyRate;
+  if (body.monthlySalaryPaise !== undefined) patch.monthlySalaryPaise = body.monthlySalaryPaise;
+  if (body.weeklyCapacityHrs !== undefined) patch.weeklyCapacityHrs = body.weeklyCapacityHrs;
+  if (body.skills !== undefined) patch.skills = skillsToCsv(body.skills) ?? null;
 
-    await db.update(users).set(patch).where(eq(users.id, target.id));
+  await db.update(users).set(patch).where(eq(users.id, target.id));
+  if (patch.status) {
+    await bumpUsers([target.id]);
+    if (patch.status === 'disabled') await revokeUserSessions(target.id, 'disabled');
+    await auditAuthz({
+      actor,
+      action: patch.status === 'disabled' ? 'user.disable' : 'user.enable',
+      entityType: 'user',
+      entityId: target.id,
+      before: { status: target.status },
+      after: { status: patch.status },
+      ip: req.ip,
+    });
+  }
+  if (touchesProfile || touchesComp) {
     await audit({
-      agencyId: ctx.agencyId,
-      actorType: ctx.role,
-      actorId: ctx.userId,
-      action: 'team.update',
+      agencyId: actor.agencyId,
+      actorType: 'staff',
+      actorId: actor.userId,
+      action: touchesComp ? 'team.update.compensation' : 'team.update',
       entityType: 'user',
       entityId: target.id,
       ip: req.ip,
     });
-    ok(res, { updated: true });
-  },
-);
+  }
+  ok(res, { updated: true });
+});
 
 // ============================================================
-//  DELETE /team/:userId — hard-delete a member (owner/admin)
+//  Authorization administration for a member
 // ============================================================
-usersRouter.delete(
-  '/:userId',
-  requireRole('owner', 'admin'),
-  async (req, res) => {
-    const ctx = getAuth(req);
-    const userId = param(req, 'userId');
-    const [target] = await db
-      .select({ id: users.id, role: users.role })
-      .from(users)
-      .where(and(eq(users.id, userId), eq(users.agencyId, ctx.agencyId)))
-      .limit(1);
-    if (!target) throw notFound('Member not found.');
-    if (target.id === ctx.userId) {
-      throw forbidden('You cannot delete your own account.');
-    }
-    if (target.role === 'owner') {
-      throw conflict('Cannot delete the owner.');
-    }
-    // A non-owner may only delete members strictly below their tier.
-    if (ctx.role !== 'owner' && !canManageRole(ctx.role, target.role)) {
-      throw forbidden('You cannot delete a member at or above your own role.');
-    }
+usersRouter.get('/:userId/authorization', requires('users.view', 'roles.view'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const target = await loadTarget(actor.agencyId, param(req, 'userId'));
+  const explained = await explainUser({ id: target.id, kind: target.kind });
+  const actorIsOwner = await holdsOwnerRole(actor.userId, actor.agencyId);
+  let manageable = false;
+  try {
+    await assertCanManageUser(actor, target);
+    manageable = true;
+  } catch {
+    manageable = false;
+  }
+  ok(res, {
+    userId: target.id,
+    kind: target.kind,
+    roles: await roleSummaries(target.id),
+    grants: explained.grants,
+    sources: explained.sources,
+    manageable,
+    actorIsOwner,
+  });
+});
 
-    // FK behavior handles the rest: project_members/client_assignments/
-    // time_logs cascade; assigned tasks' assigneeId is set null.
-    await db
-      .delete(users)
-      .where(and(eq(users.id, userId), eq(users.agencyId, ctx.agencyId)));
+const rolesBody = z.object({ roleIds: z.array(z.string().min(1)).min(1).max(10) });
 
-    await audit({
-      agencyId: ctx.agencyId,
-      actorType: ctx.role,
-      actorId: ctx.userId,
-      action: 'team.delete',
-      entityType: 'user',
-      entityId: userId,
-      ip: req.ip,
-    });
-    ok(res, { deleted: true });
-  },
-);
+usersRouter.put('/:userId/roles', requires('users.assign_roles'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const target = await loadTarget(actor.agencyId, param(req, 'userId'));
+  if (target.kind !== 'staff') throw badRequest('Use /team/client-users for client accounts.');
+  const { roleIds } = rolesBody.parse(req.body);
+  await setUserRoles({ actor, target, roleIds, ip: req.ip });
+  ok(res, { roles: await roleSummaries(target.id) });
+});
 
-// POST /team/:userId/reset-password — owner/admin sends a member a reset link
-// (e.g. to help someone who's locked out). Returns the link so it can also be
-// copied/shared manually when SMTP isn't configured.
-usersRouter.post(
-  '/:userId/reset-password',
-  requireRole('owner', 'admin'),
-  async (req, res) => {
-    const ctx = getAuth(req);
-    const userId = param(req, 'userId');
-    const [member] = await db
-      .select({
-        id: users.id,
-        agencyId: users.agencyId,
-        email: users.email,
-        fullName: users.fullName,
-        status: users.status,
-        role: users.role,
-      })
-      .from(users)
-      .where(and(eq(users.id, userId), eq(users.agencyId, ctx.agencyId)))
-      .limit(1);
-    if (!member) throw notFound('Member not found.');
-    // Only the owner can reset another owner; a non-owner can only reset members
-    // strictly below their tier (or themselves).
-    if (member.id !== ctx.userId && ctx.role !== 'owner' && !canManageRole(ctx.role, member.role)) {
-      throw forbidden('You cannot reset this member’s password.');
-    }
-    if (member.status !== 'active') {
-      throw conflict('This member is not active.');
-    }
+const overridesBody = z.object({
+  overrides: z
+    .array(
+      z.object({
+        permission: z.string().min(1),
+        scope: z.enum(SCOPES).nullable(),
+        effect: z.enum(['grant', 'deny']),
+        reason: z.string().trim().max(300).nullable().optional(),
+      }),
+    )
+    .max(200),
+});
 
-    const { resetUrl } = await createPasswordReset(member, { byAdmin: true });
-    await audit({
-      agencyId: ctx.agencyId,
-      actorType: ctx.role,
-      actorId: ctx.userId,
-      action: 'team.password_reset',
-      entityType: 'user',
-      entityId: userId,
-      ip: req.ip,
-    });
-    ok(res, { ok: true, resetUrl });
-  },
-);
+usersRouter.put('/:userId/overrides', requires('users.manage_permissions'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const target = await loadTarget(actor.agencyId, param(req, 'userId'));
+  const { overrides } = overridesBody.parse(req.body);
+  await setUserOverrides({ actor, target, overrides, ip: req.ip });
+  ok(res, { updated: true });
+});
+
+usersRouter.post('/:userId/sessions/revoke', requires('users.revoke_sessions'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const target = await loadTarget(actor.agencyId, param(req, 'userId'));
+  await assertCanManageUser(actor, target);
+  const ended = await revokeUserSessions(target.id, 'admin_revoke');
+  await auditAuthz({ actor, action: 'user.sessions.revoke', entityType: 'user', entityId: target.id, after: { ended }, ip: req.ip });
+  ok(res, { revoked: ended });
+});
+
+usersRouter.delete('/:userId', requires('users.delete'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const target = await loadTarget(actor.agencyId, param(req, 'userId'));
+  if (target.kind !== 'staff') throw notFound('Member not found.');
+  await assertCanManageUser(actor, target);
+  await assertOwnerRemains(actor.agencyId, [target.id]);
+  await revokeUserSessions(target.id, 'deleted');
+  await db.delete(users).where(and(eq(users.id, target.id), eq(users.agencyId, actor.agencyId)));
+  await auditAuthz({
+    actor,
+    action: 'user.delete',
+    entityType: 'user',
+    entityId: target.id,
+    before: { email: target.email, roles: (await roleSummaries(target.id)).map((r) => r.name) },
+    ip: req.ip,
+  });
+  ok(res, { deleted: true });
+});
+
+// Admin-initiated reset: the link is EMAILED to the member only, never returned.
+usersRouter.post('/:userId/reset-password', requires('users.reset_password'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const member = await loadTarget(actor.agencyId, param(req, 'userId'));
+  if (member.kind !== 'staff') throw badRequest('Use /team/client-users for client accounts.');
+  await assertCanManageUser(actor, member);
+  if (member.status !== 'active') throw conflict('This member is not active.');
+  await createPasswordReset(member, { byAdmin: true, req });
+  await auditAuthz({ actor, action: 'user.password_reset', entityType: 'user', entityId: member.id, ip: req.ip });
+  ok(res, { ok: true, emailed: true });
+});
 
 // ============================================================
 //  TIME LOGS — POST/GET /team/:userId/time-logs
 // ============================================================
-
-/** Verify a user belongs to the caller's agency; return its id or throw 404. */
-async function requireAgencyMember(
-  agencyId: string,
-  userId: string,
-): Promise<void> {
-  const [row] = await db
-    .select({ id: users.id })
-    .from(users)
-    .where(and(eq(users.id, userId), eq(users.agencyId, agencyId)))
-    .limit(1);
-  if (!row) throw notFound('Member not found.');
-}
-
 const createTimeLogSchema = z.object({
   minutes: z.number().int().positive(),
   projectId: z.string().min(1).optional(),
@@ -1284,27 +1007,23 @@ const createTimeLogSchema = z.object({
   note: z.string().trim().max(2000).optional(),
 });
 
-// POST /team/:userId/time-logs (self, or owner/admin)
-usersRouter.post('/:userId/time-logs', async (req, res) => {
-  const ctx = getAuth(req);
+function subjectFacts(agencyId: string, userId: string) {
+  return { agencyId, ownerIds: [userId] };
+}
+
+usersRouter.post('/:userId/time-logs', requires('time_logs.create'), async (req, res) => {
+  const actor = getStaffActor(req);
   const userId = param(req, 'userId');
-  if (userId !== ctx.userId && !isPrivileged(ctx.role)) {
-    throw forbidden('You can only log time for yourself.');
-  }
-  await requireAgencyMember(ctx.agencyId, userId);
+  const target = await loadTarget(actor.agencyId, userId);
+  if (target.kind !== 'staff') throw notFound('Member not found.');
+  authorize(actor, 'time_logs.create', subjectFacts(actor.agencyId, userId));
   const body = createTimeLogSchema.parse(req.body);
 
-  // Validate optional project/task belong to the agency.
   if (body.projectId) {
     const [p] = await db
       .select({ id: projects.id })
       .from(projects)
-      .where(
-        and(
-          eq(projects.id, body.projectId),
-          eq(projects.agencyId, ctx.agencyId),
-        ),
-      )
+      .where(and(eq(projects.id, body.projectId), eq(projects.agencyId, actor.agencyId)))
       .limit(1);
     if (!p) throw notFound('Project not found.');
   }
@@ -1312,37 +1031,27 @@ usersRouter.post('/:userId/time-logs', async (req, res) => {
     const [tk] = await db
       .select({ id: projectTasks.id, projectId: projectTasks.projectId })
       .from(projectTasks)
-      .where(
-        and(
-          eq(projectTasks.id, body.taskId),
-          eq(projectTasks.agencyId, ctx.agencyId),
-        ),
-      )
+      .where(and(eq(projectTasks.id, body.taskId), eq(projectTasks.agencyId, actor.agencyId)))
       .limit(1);
     if (!tk) throw notFound('Task not found.');
-    // If a project was also supplied, the task must belong to it.
-    if (body.projectId && tk.projectId !== body.projectId) {
-      throw conflict('Task does not belong to the given project.');
-    }
+    if (body.projectId && tk.projectId !== body.projectId) throw conflict('Task does not belong to the given project.');
   }
 
   const id = newId('tlg');
-  const workDate = body.workDate ?? new Date();
   await db.insert(timeLogs).values({
     id,
-    agencyId: ctx.agencyId,
+    agencyId: actor.agencyId,
     userId,
     projectId: body.projectId ?? null,
     taskId: body.taskId ?? null,
     minutes: body.minutes,
-    workDate,
+    workDate: body.workDate ?? new Date(),
     note: body.note ?? null,
   });
-
   await audit({
-    agencyId: ctx.agencyId,
-    actorType: ctx.role,
-    actorId: ctx.userId,
+    agencyId: actor.agencyId,
+    actorType: 'staff',
+    actorId: actor.userId,
     action: 'team.time_log.create',
     entityType: 'user',
     entityId: userId,
@@ -1364,27 +1073,14 @@ usersRouter.post('/:userId/time-logs', async (req, res) => {
     .leftJoin(projects, eq(projects.id, timeLogs.projectId))
     .where(eq(timeLogs.id, id))
     .limit(1);
-
-  created(res, {
-    id: row!.id,
-    minutes: row!.minutes,
-    workDate: toIso(row!.workDate),
-    note: row!.note,
-    projectId: row!.projectId,
-    projectName: row!.projectName,
-    taskId: row!.taskId,
-  });
+  created(res, { ...row!, workDate: toIso(row!.workDate) });
 });
 
-// GET /team/:userId/time-logs — recent logs (self, or owner/admin)
-usersRouter.get('/:userId/time-logs', async (req, res) => {
-  const ctx = getAuth(req);
+usersRouter.get('/:userId/time-logs', requires('time_logs.view'), async (req, res) => {
+  const actor = getStaffActor(req);
   const userId = param(req, 'userId');
-  if (userId !== ctx.userId && !isPrivileged(ctx.role)) {
-    throw forbidden('You can only view your own time logs.');
-  }
-  await requireAgencyMember(ctx.agencyId, userId);
-
+  await loadTarget(actor.agencyId, userId);
+  authorize(actor, 'time_logs.view', subjectFacts(actor.agencyId, userId), { message: 'You can only view your own time logs.' });
   const rows = await db
     .select({
       id: timeLogs.id,
@@ -1397,44 +1093,25 @@ usersRouter.get('/:userId/time-logs', async (req, res) => {
     })
     .from(timeLogs)
     .leftJoin(projects, eq(projects.id, timeLogs.projectId))
-    .where(
-      and(eq(timeLogs.agencyId, ctx.agencyId), eq(timeLogs.userId, userId)),
-    )
+    .where(and(eq(timeLogs.agencyId, actor.agencyId), eq(timeLogs.userId, userId)))
     .orderBy(desc(timeLogs.workDate))
     .limit(50);
-
-  ok(
-    res,
-    rows.map((l) => ({
-      id: l.id,
-      minutes: l.minutes,
-      workDate: toIso(l.workDate),
-      note: l.note,
-      projectId: l.projectId,
-      projectName: l.projectName,
-      taskId: l.taskId,
-    })),
-  );
+  ok(res, rows.map((l) => ({ ...l, workDate: toIso(l.workDate) })));
 });
 
 // ============================================================
-//  ACTIVITY — GET /team/:userId/activity (audit feed for this actor)
+//  ACTIVITY — GET /team/:userId/activity
 // ============================================================
-const activityQuery = z.object({
-  limit: z.coerce.number().int().min(1).max(100).optional(),
-});
+const activityQuery = z.object({ limit: z.coerce.number().int().min(1).max(100).optional() });
 
-// GET /team/:userId/activity — recent audit-log events this member performed
-// (self, or owner/admin). Tenant-scoped to the caller's agency.
-usersRouter.get('/:userId/activity', async (req, res) => {
-  const ctx = getAuth(req);
+usersRouter.get('/:userId/activity', requires('users.view_activity'), async (req, res) => {
+  const actor = getActor(req);
   const userId = param(req, 'userId');
-  if (userId !== ctx.userId && !isPrivileged(ctx.role)) {
+  await loadTarget(actor.agencyId, userId);
+  if (!check(actor, 'users.view_activity', subjectFacts(actor.agencyId, userId))) {
     throw forbidden('You can only view your own activity.');
   }
-  await requireAgencyMember(ctx.agencyId, userId);
   const { limit } = activityQuery.parse(req.query);
-
   const rows = await db
     .select({
       id: auditLog.id,
@@ -1445,12 +1122,9 @@ usersRouter.get('/:userId/activity', async (req, res) => {
       createdAt: auditLog.createdAt,
     })
     .from(auditLog)
-    .where(
-      and(eq(auditLog.agencyId, ctx.agencyId), eq(auditLog.actorId, userId)),
-    )
+    .where(and(eq(auditLog.agencyId, actor.agencyId), eq(auditLog.actorId, userId)))
     .orderBy(desc(auditLog.createdAt))
     .limit(limit ?? 40);
-
   ok(
     res,
     rows.map((r) => {
@@ -1462,107 +1136,7 @@ usersRouter.get('/:userId/activity', async (req, res) => {
           metadata = null;
         }
       }
-      return {
-        id: r.id,
-        action: r.action,
-        entityType: r.entityType,
-        entityId: r.entityId,
-        metadata,
-        createdAt: toIso(r.createdAt),
-      };
+      return { id: r.id, action: r.action, entityType: r.entityType, entityId: r.entityId, metadata, createdAt: toIso(r.createdAt) };
     }),
   );
 });
-
-// ============================================================
-//  CLIENT ASSIGNMENTS (owner/admin) — UNCHANGED behavior
-// ============================================================
-
-// GET /team/clients/:clientId/assignments
-usersRouter.get(
-  '/clients/:clientId/assignments',
-  requireRole('owner', 'admin'),
-  async (req, res) => {
-    const ctx = getAuth(req);
-    await requireClientAccess(ctx, param(req, 'clientId'));
-    const rows = await db
-      .select({
-        id: clientAssignments.id,
-        userId: clientAssignments.userId,
-      })
-      .from(clientAssignments)
-      .where(
-        and(
-          eq(clientAssignments.agencyId, ctx.agencyId),
-          eq(clientAssignments.clientId, param(req, 'clientId')),
-        ),
-      );
-    ok(res, rows);
-  },
-);
-
-// POST /team/clients/:clientId/assignments  { userId }
-const assignSchema = z.object({ userId: z.string().min(1) });
-
-usersRouter.post(
-  '/clients/:clientId/assignments',
-  requireRole('owner', 'admin'),
-  async (req, res) => {
-    const ctx = getAuth(req);
-    await requireClientAccess(ctx, param(req, 'clientId'));
-    const body = assignSchema.parse(req.body);
-
-    // The assignee must belong to this agency.
-    const [user] = await db
-      .select({ id: users.id })
-      .from(users)
-      .where(
-        and(eq(users.id, body.userId), eq(users.agencyId, ctx.agencyId)),
-      )
-      .limit(1);
-    if (!user) throw notFound('User not found.');
-
-    await db
-      .insert(clientAssignments)
-      .values({
-        id: newId('asn'),
-        agencyId: ctx.agencyId,
-        clientId: param(req, 'clientId'),
-        userId: body.userId,
-        assignedBy: ctx.userId,
-      })
-      .onConflictDoNothing();
-
-    await audit({
-      agencyId: ctx.agencyId,
-      actorType: ctx.role,
-      actorId: ctx.userId,
-      action: 'client.assign',
-      entityType: 'client',
-      entityId: param(req, 'clientId'),
-      metadata: { userId: body.userId },
-      ip: req.ip,
-    });
-    ok(res, { assigned: true });
-  },
-);
-
-// DELETE /team/clients/:clientId/assignments/:userId
-usersRouter.delete(
-  '/clients/:clientId/assignments/:userId',
-  requireRole('owner', 'admin'),
-  async (req, res) => {
-    const ctx = getAuth(req);
-    await requireClientAccess(ctx, param(req, 'clientId'));
-    await db
-      .delete(clientAssignments)
-      .where(
-        and(
-          eq(clientAssignments.agencyId, ctx.agencyId),
-          eq(clientAssignments.clientId, param(req, 'clientId')),
-          eq(clientAssignments.userId, param(req, 'userId')),
-        ),
-      );
-    ok(res, { unassigned: true });
-  },
-);

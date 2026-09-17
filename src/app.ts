@@ -15,6 +15,7 @@ import { globalLimiter } from './middleware/rate-limit.js';
 import { healthRouter } from './routes/health.js';
 import { authRouter } from './routes/auth.js';
 import { agenciesRouter } from './routes/agencies.js';
+import { rolesRouter, authzRouter } from './routes/roles.js';
 import { usersRouter } from './routes/users.js';
 import { clientsRouter } from './routes/clients.js';
 import { leadsRouter } from './routes/leads.js';
@@ -82,6 +83,8 @@ export function createApp() {
 
   api.use('/auth', authRouter);
   api.use('/agency', agenciesRouter);
+  api.use('/roles', rolesRouter);
+  api.use('/authz', authzRouter);
   api.use('/team', usersRouter);
   api.use('/clients', clientsRouter);
   api.use('/leads', leadsRouter);

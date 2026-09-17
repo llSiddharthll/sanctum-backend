@@ -267,6 +267,13 @@
       "when": 1789425445726,
       "tag": "0037_social_publishing",
       "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "6",
+      "when": 1789633377866,
+      "tag": "0038_authorization",
+      "breakpoints": true
     }
   ]
 }

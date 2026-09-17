@@ -1,83 +1,71 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, count, eq } from 'drizzle-orm';
+import { and, count, desc, eq } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   agencies,
   aiGenerations,
   auditLog,
   clients,
-  customRoles,
   plans,
   subscriptions,
   usageCounters,
   users,
 } from '../db/schema.js';
-import { ok, created, toIso, param } from '../lib/http.js';
-import { conflict, notFound } from '../lib/errors.js';
-import { currentPeriod, newId } from '../lib/ids.js';
-import { requireAuth, requireRole } from '../middleware/auth.js';
-import { requireModule } from '../middleware/permissions.js';
-import { getAuth } from '../middleware/tenant.js';
-import {
-  moduleCatalog,
-  resolveRolePermissions,
-  resolvePermissions,
-  serializeRoleDefaults,
-  serializeOverrides,
-  parseRoleDefaults,
-  sanitizeRoleDefaults,
-  rolePresetCatalog,
-} from '../lib/permissions.js';
+import { ok, toIso } from '../lib/http.js';
+import { forbidden, notFound } from '../lib/errors.js';
+import { currentPeriod } from '../lib/ids.js';
 import { audit } from '../services/audit.js';
 import { rateLimitConfig } from '../middleware/rate-limit.js';
 import { env } from '../env.js';
 import { getStorageStatus } from '../services/storage-status.js';
 import { runMediaArchive } from '../services/media-archive.js';
+import { authenticate, getActor, getStaffActor, requires } from '../authz/http.js';
+import type { Actor } from '../authz/actor.js';
 
 export const agenciesRouter = Router();
-agenciesRouter.use(requireAuth);
+agenciesRouter.use(authenticate);
 
-// GET /agency/storage — disk usage, last backup result, and alerts for the
-// Settings → Storage & Backups panel (owner/admin; self-hosted storage only).
-agenciesRouter.get(
-  '/storage',
-  requireRole('owner', 'admin'),
-  requireModule('settings', 'view'),
-  async (_req, res) => {
-    ok(res, await getStorageStatus());
-  },
-);
+/** Storage is host-level: only the configured platform agency may touch it. */
+function assertPlatformAgency(actor: Actor): void {
+  if (!env.PLATFORM_AGENCY_ID || actor.agencyId !== env.PLATFORM_AGENCY_ID) {
+    throw forbidden('Storage operations are restricted to the platform operator.');
+  }
+}
 
-// POST /agency/storage/archive — run the media archive/retention job on demand
-// (owner). `dryRun` reports what WOULD be archived without touching anything;
-// `olderThanDays` overrides the retention window (for testing).
+// GET /agency/storage — host disk usage + backups (platform operator).
+agenciesRouter.get('/storage', requires('storage.view'), async (req, res) => {
+  assertPlatformAgency(getStaffActor(req));
+  ok(res, await getStorageStatus());
+});
+
 const archiveSchema = z.object({
   dryRun: z.boolean().optional(),
   olderThanDays: z.number().int().min(0).max(3650).optional(),
 });
-agenciesRouter.post(
-  '/storage/archive',
-  requireRole('owner', 'admin'),
-  requireModule('settings', 'manage'),
-  async (req, res) => {
-    const body = archiveSchema.parse(req.body ?? {});
-    const result = await runMediaArchive({
-      dryRun: body.dryRun,
-      retentionDays: body.olderThanDays,
-    });
-    ok(res, result);
-  },
-);
 
-// GET /agency — current agency profile.
-agenciesRouter.get('/', async (req, res) => {
-  const ctx = getAuth(req);
-  const [agency] = await db
-    .select()
-    .from(agencies)
-    .where(eq(agencies.id, ctx.agencyId))
-    .limit(1);
+// POST /agency/storage/archive — run the media retention job (platform operator).
+agenciesRouter.post('/storage/archive', requires('storage.archive'), async (req, res) => {
+  const actor = getStaffActor(req);
+  assertPlatformAgency(actor);
+  const body = archiveSchema.parse(req.body ?? {});
+  const result = await runMediaArchive({ dryRun: body.dryRun, retentionDays: body.olderThanDays });
+  await audit({
+    agencyId: actor.agencyId,
+    actorType: 'staff',
+    actorId: actor.userId,
+    action: 'storage.archive',
+    metadata: { dryRun: !!body.dryRun, olderThanDays: body.olderThanDays ?? null },
+    ip: req.ip,
+  });
+  ok(res, result);
+});
+
+// GET /agency — agency profile & branding (any staff with organization.view;
+// client actors read branding via /client/me instead).
+agenciesRouter.get('/', requires('organization.view'), async (req, res) => {
+  const actor = getActor(req);
+  const [agency] = await db.select().from(agencies).where(eq(agencies.id, actor.agencyId)).limit(1);
   if (!agency) throw notFound('Agency not found.');
   ok(res, {
     id: agency.id,
@@ -90,10 +78,8 @@ agenciesRouter.get('/', async (req, res) => {
   });
 });
 
-// Allowed UI theme presets (must mirror frontend theme/registry.ts keys).
 const THEME_PRESETS = ['evergreen', 'goldcrest', 'tangerine'] as const;
 
-// PATCH /agency — owner/admin edit branding + theme.
 const patchSchema = z.object({
   name: z.string().min(1).max(120).optional(),
   logoUrl: z.string().url().nullable().optional(),
@@ -101,24 +87,31 @@ const patchSchema = z.object({
   themePreset: z.enum(THEME_PRESETS).optional(),
 });
 
-agenciesRouter.patch(
-  '/',
-  requireRole('owner', 'admin'),
-  requireModule('settings', 'manage'),
-  async (req, res) => {
-  const ctx = getAuth(req);
+agenciesRouter.patch('/', requires('organization.update'), async (req, res) => {
+  const actor = getStaffActor(req);
   const body = patchSchema.parse(req.body);
+  const [before] = await db.select().from(agencies).where(eq(agencies.id, actor.agencyId)).limit(1);
   const patch: Partial<typeof agencies.$inferInsert> = { updatedAt: new Date() };
   if (body.name !== undefined) patch.name = body.name;
   if (body.logoUrl !== undefined) patch.logoUrl = body.logoUrl;
   if (body.brandColor !== undefined) patch.brandColor = body.brandColor;
   if (body.themePreset !== undefined) patch.themePreset = body.themePreset;
 
-  await db.update(agencies).set(patch).where(eq(agencies.id, ctx.agencyId));
-  const [row] = await db
-    .select()
-    .from(agencies)
-    .where(eq(agencies.id, ctx.agencyId));
+  await db.update(agencies).set(patch).where(eq(agencies.id, actor.agencyId));
+  const [row] = await db.select().from(agencies).where(eq(agencies.id, actor.agencyId));
+  await audit({
+    agencyId: actor.agencyId,
+    actorType: 'staff',
+    actorId: actor.userId,
+    action: 'agency.update',
+    entityType: 'agency',
+    entityId: actor.agencyId,
+    metadata: {
+      before: { name: before?.name, themePreset: before?.themePreset },
+      after: { name: row!.name, themePreset: row!.themePreset },
+    },
+    ip: req.ip,
+  });
   ok(res, {
     id: row!.id,
     name: row!.name,
@@ -129,330 +122,99 @@ agenciesRouter.patch(
   });
 });
 
-// GET /agency/usage — current-period AI/storage usage + counts vs plan.
-agenciesRouter.get(
-  '/usage',
-  requireRole('owner', 'admin'),
-  async (req, res) => {
-    const ctx = getAuth(req);
-    const period = currentPeriod();
+// GET /agency/usage — plan usage and limits.
+agenciesRouter.get('/usage', requires('organization.view_usage'), async (req, res) => {
+  const actor = getActor(req);
+  const period = currentPeriod();
 
-    const [sub] = await db
-      .select()
-      .from(subscriptions)
-      .where(eq(subscriptions.agencyId, ctx.agencyId))
-      .limit(1);
-    let plan = null;
-    if (sub) {
-      const [p] = await db
-        .select()
-        .from(plans)
-        .where(eq(plans.id, sub.planId))
-        .limit(1);
-      plan = p ?? null;
-    }
+  const [sub] = await db.select().from(subscriptions).where(eq(subscriptions.agencyId, actor.agencyId)).limit(1);
+  let plan = null;
+  if (sub) {
+    const [p] = await db.select().from(plans).where(eq(plans.id, sub.planId)).limit(1);
+    plan = p ?? null;
+  }
+  const [counter] = await db
+    .select()
+    .from(usageCounters)
+    .where(and(eq(usageCounters.agencyId, actor.agencyId), eq(usageCounters.period, period)))
+    .limit(1);
+  const aiUsed = await db
+    .select({ n: count() })
+    .from(aiGenerations)
+    .where(
+      and(
+        eq(aiGenerations.agencyId, actor.agencyId),
+        eq(aiGenerations.period, period),
+        eq(aiGenerations.status, 'succeeded'),
+      ),
+    );
+  const [clientCount] = await db
+    .select({ n: count() })
+    .from(clients)
+    .where(and(eq(clients.agencyId, actor.agencyId), eq(clients.status, 'active')));
+  const [userCount] = await db
+    .select({ n: count() })
+    .from(users)
+    .where(and(eq(users.agencyId, actor.agencyId), eq(users.kind, 'staff')));
 
-    const [counter] = await db
-      .select()
-      .from(usageCounters)
-      .where(
-        and(
-          eq(usageCounters.agencyId, ctx.agencyId),
-          eq(usageCounters.period, period),
-        ),
-      )
-      .limit(1);
+  ok(res, {
+    period,
+    planName: plan?.name ?? null,
+    ai: {
+      used: aiUsed[0]?.n ?? 0,
+      limit: plan?.maxAiGenerations ?? null,
+      provider: env.AI_PROVIDER,
+      model: env.GEMINI_MODEL,
+    },
+    storage: { usedBytes: counter?.storageBytesUsed ?? 0, limitBytes: plan?.maxStorageBytes ?? null },
+    clients: { used: clientCount?.n ?? 0, limit: plan?.maxClients ?? null },
+    team: { used: userCount?.n ?? 0, limit: plan?.maxTeamMembers ?? null },
+    rateLimits: {
+      global: { max: rateLimitConfig.global.max, windowMs: rateLimitConfig.global.windowMs },
+      auth: { max: rateLimitConfig.auth.max, windowMs: rateLimitConfig.auth.windowMs },
+      ai: { max: rateLimitConfig.ai.max, windowMs: rateLimitConfig.ai.windowMs },
+    },
+  });
+});
 
-    const aiUsed = await db
-      .select({ n: count() })
-      .from(aiGenerations)
-      .where(
-        and(
-          eq(aiGenerations.agencyId, ctx.agencyId),
-          eq(aiGenerations.period, period),
-          eq(aiGenerations.status, 'succeeded'),
-        ),
-      );
+const auditQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(500).optional(),
+  action: z.string().max(80).optional(),
+});
 
-    const [clientCount] = await db
-      .select({ n: count() })
-      .from(clients)
-      .where(
-        and(
-          eq(clients.agencyId, ctx.agencyId),
-          eq(clients.status, 'active'),
-        ),
-      );
-    const [userCount] = await db
-      .select({ n: count() })
-      .from(users)
-      .where(eq(users.agencyId, ctx.agencyId));
-
-    ok(res, {
-      period,
-      planName: plan?.name ?? null,
-      ai: {
-        used: aiUsed[0]?.n ?? 0,
-        limit: plan?.maxAiGenerations ?? null,
-        provider: env.AI_PROVIDER,
-        model: env.GEMINI_MODEL,
-      },
-      storage: {
-        usedBytes: counter?.storageBytesUsed ?? 0,
-        limitBytes: plan?.maxStorageBytes ?? null,
-      },
-      clients: { used: clientCount?.n ?? 0, limit: plan?.maxClients ?? null },
-      team: { used: userCount?.n ?? 0, limit: plan?.maxTeamMembers ?? null },
-      rateLimits: {
-        global: {
-          max: rateLimitConfig.global.max,
-          windowMs: rateLimitConfig.global.windowMs,
-        },
-        auth: {
-          max: rateLimitConfig.auth.max,
-          windowMs: rateLimitConfig.auth.windowMs,
-        },
-        ai: {
-          max: rateLimitConfig.ai.max,
-          windowMs: rateLimitConfig.ai.windowMs,
-        },
-      },
-    });
-  },
-);
-
-// GET /agency/audit-log — recent events (owner/admin).
-agenciesRouter.get(
-  '/audit-log',
-  requireRole('owner', 'admin'),
-  async (req, res) => {
-    const ctx = getAuth(req);
-    const rows = await db
-      .select()
-      .from(auditLog)
-      .where(eq(auditLog.agencyId, ctx.agencyId))
-      .orderBy(auditLog.createdAt)
-      .limit(100);
-    ok(
-      res,
-      rows.map((a) => ({
+// GET /agency/audit-log — most recent events first.
+agenciesRouter.get('/audit-log', requires('organization.view_audit_log'), async (req, res) => {
+  const actor = getActor(req);
+  const q = auditQuery.parse(req.query);
+  const rows = await db
+    .select()
+    .from(auditLog)
+    .where(
+      q.action
+        ? and(eq(auditLog.agencyId, actor.agencyId), eq(auditLog.action, q.action))
+        : eq(auditLog.agencyId, actor.agencyId),
+    )
+    .orderBy(desc(auditLog.createdAt))
+    .limit(q.limit ?? 100);
+  ok(
+    res,
+    rows.map((a) => {
+      let metadata: unknown = null;
+      try {
+        metadata = a.metadataJson ? JSON.parse(a.metadataJson) : null;
+      } catch {
+        metadata = null;
+      }
+      return {
         id: a.id,
         actorType: a.actorType,
         actorId: a.actorId,
         action: a.action,
         entityType: a.entityType,
         entityId: a.entityId,
-        metadata: a.metadataJson ? JSON.parse(a.metadataJson) : null,
+        metadata,
         createdAt: toIso(a.createdAt),
-      })),
-    );
-  },
-);
-
-// ============================================================
-//  ROLES & PERMISSIONS (admin-managed role defaults)
-//  The module catalog is code-defined (single source of truth), so new
-//  modules appear here automatically. Per-role defaults are stored per agency
-//  and layered under each user's personal overrides.
-// ============================================================
-
-// GET /agency/roles — module catalog + the effective per-role permission matrix.
-agenciesRouter.get(
-  '/roles',
-  requireRole('owner', 'admin'),
-  requireModule('settings', 'view'),
-  async (req, res) => {
-    const ctx = getAuth(req);
-    const [agency] = await db
-      .select({ rolePermissionsJson: agencies.rolePermissionsJson })
-      .from(agencies)
-      .where(eq(agencies.id, ctx.agencyId))
-      .limit(1);
-    if (!agency) throw notFound('Agency not found.');
-    ok(res, {
-      modules: moduleCatalog(),
-      // owner is always full access (and not editable); admin + member are
-      // resolved from stored defaults, falling back to full access.
-      roles: resolveRolePermissions(agency.rolePermissionsJson),
-      // Predefined role templates the owner can apply in one click.
-      presets: rolePresetCatalog(),
-    });
-  },
-);
-
-// PUT /agency/roles — replace the admin/member role defaults.
-const rolesSchema = z.object({
-  admin: z.record(z.string(), z.string()).optional(),
-  member: z.record(z.string(), z.string()).optional(),
+      };
+    }),
+  );
 });
-
-agenciesRouter.put(
-  '/roles',
-  requireRole('owner', 'admin'),
-  requireModule('settings', 'manage'),
-  async (req, res) => {
-    const ctx = getAuth(req);
-    const body = rolesSchema.parse(req.body);
-
-    // Merge incoming role maps onto the existing stored defaults.
-    const [agency] = await db
-      .select({ rolePermissionsJson: agencies.rolePermissionsJson })
-      .from(agencies)
-      .where(eq(agencies.id, ctx.agencyId))
-      .limit(1);
-    if (!agency) throw notFound('Agency not found.');
-
-    const existing = parseRoleDefaults(agency.rolePermissionsJson);
-    const incoming = sanitizeRoleDefaults(body);
-    const merged = {
-      admin: { ...existing.admin, ...incoming.admin },
-      member: { ...existing.member, ...incoming.member },
-    };
-
-    await db
-      .update(agencies)
-      .set({
-        rolePermissionsJson: serializeRoleDefaults(merged),
-        updatedAt: new Date(),
-      })
-      .where(eq(agencies.id, ctx.agencyId));
-
-    await audit({
-      agencyId: ctx.agencyId,
-      actorType: ctx.role,
-      actorId: ctx.userId,
-      action: 'roles.update',
-      entityType: 'agency',
-      entityId: ctx.agencyId,
-      ip: req.ip,
-    });
-
-    ok(res, {
-      modules: moduleCatalog(),
-      roles: resolveRolePermissions(serializeRoleDefaults(merged)),
-    });
-  },
-);
-
-// ============================================================
-//  CUSTOM ROLES (named permission presets, owner/admin-managed)
-// ============================================================
-function serializeCustomRole(cr: typeof customRoles.$inferSelect) {
-  return {
-    id: cr.id,
-    name: cr.name,
-    colorToken: cr.colorToken,
-    baseRole: cr.baseRole,
-    // Effective module map (custom overrides over the base tier defaults).
-    permissions: resolvePermissions(cr.baseRole, null, null, cr.permissionsJson),
-  };
-}
-
-agenciesRouter.get(
-  '/custom-roles',
-  requireRole('owner', 'admin'),
-  requireModule('settings', 'view'),
-  async (req, res) => {
-    const ctx = getAuth(req);
-    const rows = await db
-      .select()
-      .from(customRoles)
-      .where(eq(customRoles.agencyId, ctx.agencyId))
-      .orderBy(customRoles.name);
-    ok(res, rows.map(serializeCustomRole));
-  },
-);
-
-const customRoleSchema = z.object({
-  name: z.string().trim().min(1).max(40),
-  colorToken: z.string().trim().max(20).optional(),
-  baseRole: z.enum(['admin', 'member']),
-  permissions: z.record(z.string(), z.string()).optional(),
-});
-
-agenciesRouter.post(
-  '/custom-roles',
-  requireRole('owner', 'admin'),
-  requireModule('settings', 'manage'),
-  async (req, res) => {
-    const ctx = getAuth(req);
-    const body = customRoleSchema.parse(req.body);
-    const [dupe] = await db
-      .select({ id: customRoles.id })
-      .from(customRoles)
-      .where(and(eq(customRoles.agencyId, ctx.agencyId), eq(customRoles.name, body.name)))
-      .limit(1);
-    if (dupe) throw conflict('A role with that name already exists.');
-    const id = newId('crl');
-    await db.insert(customRoles).values({
-      id,
-      agencyId: ctx.agencyId,
-      name: body.name,
-      colorToken: body.colorToken ?? 'pine',
-      baseRole: body.baseRole,
-      permissionsJson: serializeOverrides(body.permissions ?? {}),
-    });
-    await audit({
-      agencyId: ctx.agencyId,
-      actorType: ctx.role,
-      actorId: ctx.userId,
-      action: 'role.create',
-      entityType: 'custom_role',
-      entityId: id,
-      metadata: { name: body.name, baseRole: body.baseRole },
-      ip: req.ip,
-    });
-    const [row] = await db.select().from(customRoles).where(eq(customRoles.id, id));
-    created(res, serializeCustomRole(row!));
-  },
-);
-
-agenciesRouter.patch(
-  '/custom-roles/:id',
-  requireRole('owner', 'admin'),
-  requireModule('settings', 'manage'),
-  async (req, res) => {
-    const ctx = getAuth(req);
-    const id = param(req, 'id');
-    const body = customRoleSchema.partial().parse(req.body);
-    const patch: Partial<typeof customRoles.$inferInsert> = { updatedAt: new Date() };
-    if (body.name !== undefined) patch.name = body.name;
-    if (body.colorToken !== undefined) patch.colorToken = body.colorToken;
-    if (body.baseRole !== undefined) patch.baseRole = body.baseRole;
-    if (body.permissions !== undefined)
-      patch.permissionsJson = serializeOverrides(body.permissions);
-    await db
-      .update(customRoles)
-      .set(patch)
-      .where(and(eq(customRoles.id, id), eq(customRoles.agencyId, ctx.agencyId)));
-    // Changing the base tier re-tiers every user holding this role.
-    if (body.baseRole !== undefined) {
-      await db
-        .update(users)
-        .set({ role: body.baseRole, updatedAt: new Date() })
-        .where(and(eq(users.agencyId, ctx.agencyId), eq(users.customRoleId, id)));
-    }
-    const [row] = await db.select().from(customRoles).where(eq(customRoles.id, id));
-    if (!row) throw notFound('Role not found.');
-    ok(res, serializeCustomRole(row));
-  },
-);
-
-agenciesRouter.delete(
-  '/custom-roles/:id',
-  requireRole('owner', 'admin'),
-  requireModule('settings', 'manage'),
-  async (req, res) => {
-    const ctx = getAuth(req);
-    const id = param(req, 'id');
-    // Detach holders — they revert to their base tier with no preset.
-    await db
-      .update(users)
-      .set({ customRoleId: null, updatedAt: new Date() })
-      .where(and(eq(users.agencyId, ctx.agencyId), eq(users.customRoleId, id)));
-    await db
-      .delete(customRoles)
-      .where(and(eq(customRoles.id, id), eq(customRoles.agencyId, ctx.agencyId)));
-    ok(res, { deleted: true });
-  },
-);

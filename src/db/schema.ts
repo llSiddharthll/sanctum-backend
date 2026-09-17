@@ -59,6 +59,9 @@ export const agencies = sqliteTable(t('agencies'), {
   // { admin: { moduleKey: level }, member: { moduleKey: level } }.
   // NULL means "use built-in defaults" (full access). See lib/permissions.ts.
   rolePermissionsJson: text('role_permissions_json'),
+  // Set once the legacy module-level RBAC of this agency has been migrated into
+  // roles / role_permissions / user_roles (src/authz/migrate-legacy.ts).
+  authzMigratedAt: ts('authz_migrated_at'),
   createdAt: ts('created_at').notNull().default(now),
   updatedAt: ts('updated_at').notNull().default(now),
 });
@@ -121,6 +124,19 @@ export const users = sqliteTable(
     status: text('status', { enum: ['active', 'disabled'] })
       .notNull()
       .default('active'),
+    // Principal type. Authorization comes ONLY from role assignments
+    // (user_roles) + overrides; `role` above is legacy (display/compat only).
+    kind: text('kind', { enum: ['staff', 'client'] })
+      .notNull()
+      .default('staff'),
+    // Bumped whenever this user's effective authorization may have changed
+    // (roles, overrides, role edits, status). Keys the permission cache.
+    authzVersion: integer('authz_version').notNull().default(1),
+    // Client users only: 'all' projects of their brand, or only 'selected'
+    // (client_user_projects). 'selected' with no rows = no projects.
+    clientProjectAccess: text('client_project_access', {
+      enum: ['all', 'selected'],
+    }),
     // ---- HR / profile fields ----
     designation: text('designation'),
     department: text('department'),
@@ -350,6 +366,11 @@ export const portalTokens = sqliteTable(
     revokedAt: ts('revoked_at'),
     expiresAt: ts('expires_at'),
     lastUsedAt: ts('last_used_at'),
+    // Client role granted to whoever uses this link (roles.actor_type='client').
+    roleId: text('role_id'),
+    projectAccess: text('project_access', { enum: ['all', 'selected'] })
+      .notNull()
+      .default('all'),
     createdAt: ts('created_at').notNull().default(now),
   },
   (tbl) => [index('ix_tokens_agency_client').on(tbl.agencyId, tbl.clientId)],
@@ -766,7 +787,17 @@ export const auditLog = sqliteTable(
       .notNull()
       .references(() => agencies.id, { onDelete: 'cascade' }),
     actorType: text('actor_type', {
-      enum: ['owner', 'admin', 'member', 'client', 'client_token', 'system'],
+      enum: [
+        'owner',
+        'admin',
+        'member',
+        'client',
+        'client_token',
+        'system',
+        'staff',
+        'portal_link',
+        'integration',
+      ],
     }).notNull(),
     actorId: text('actor_id'),
     action: text('action').notNull(),
@@ -857,6 +888,11 @@ export const projectTasks = sqliteTable(
     projectId: text('project_id')
       .notNull()
       .references(() => projects.id, { onDelete: 'cascade' }),
+    // Creator: enables the `own` authorization scope. NULL for tasks created
+    // before 0038 (never matches `own`; fail closed).
+    createdBy: text('created_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
     // Optional link to a milestone in the SAME project. Cleared (set null)
     // if the milestone is deleted so a task is never orphaned to a stale id.
     milestoneId: text('milestone_id').references(
@@ -2486,3 +2522,163 @@ export type ProposalTemplate = typeof proposalTemplates.$inferSelect;
 export type Proposal = typeof proposals.$inferSelect;
 export type AgreementTemplate = typeof agreementTemplates.$inferSelect;
 export type Agreement = typeof agreements.$inferSelect;
+
+
+// ============================================================
+//  AUTHORIZATION (docs/authorization/README.md section H)
+//  roles are per-agency permission bundles; grants are (permission, scope)
+//  rows validated against src/authz/catalog.ts on every write.
+// ============================================================
+const SCOPE_ENUM = [
+  'own',
+  'assigned',
+  'project',
+  'client',
+  'organization',
+] as const;
+
+export const roles = sqliteTable(
+  t('roles'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    /** System role key (owner, admin, employee, client_approver, ...); NULL for custom roles. */
+    key: text('key'),
+    name: text('name').notNull(),
+    description: text('description'),
+    kind: text('kind', { enum: ['system', 'custom'] }).notNull(),
+    actorType: text('actor_type', { enum: ['staff', 'client'] }).notNull(),
+    isLocked: integer('is_locked', { mode: 'boolean' }).notNull().default(false),
+    colorToken: text('color_token').notNull().default('pine'),
+    templateKey: text('template_key'),
+    archivedAt: ts('archived_at'),
+    createdBy: text('created_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [
+    uniqueIndex('ux_roles_agency_key').on(tbl.agencyId, tbl.key),
+    index('ix_roles_agency').on(tbl.agencyId),
+  ],
+);
+
+export const rolePermissions = sqliteTable(
+  t('role_permissions'),
+  {
+    roleId: text('role_id')
+      .notNull()
+      .references(() => roles.id, { onDelete: 'cascade' }),
+    permission: text('permission').notNull(),
+    scope: text('scope', { enum: SCOPE_ENUM }).notNull(),
+  },
+  (tbl) => [primaryKey({ columns: [tbl.roleId, tbl.permission, tbl.scope] })],
+);
+
+export const userRoles = sqliteTable(
+  t('user_roles'),
+  {
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    roleId: text('role_id')
+      .notNull()
+      .references(() => roles.id, { onDelete: 'cascade' }),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    assignedBy: text('assigned_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: ts('created_at').notNull().default(now),
+  },
+  (tbl) => [
+    primaryKey({ columns: [tbl.userId, tbl.roleId] }),
+    index('ix_user_roles_agency_role').on(tbl.agencyId, tbl.roleId),
+  ],
+);
+
+export const userPermissionOverrides = sqliteTable(
+  t('user_permission_overrides'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    permission: text('permission').notNull(),
+    /** NULL only for effect='deny' (deny removes the permission at every scope). */
+    scope: text('scope', { enum: SCOPE_ENUM }),
+    effect: text('effect', { enum: ['grant', 'deny'] }).notNull(),
+    reason: text('reason'),
+    createdBy: text('created_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: ts('created_at').notNull().default(now),
+  },
+  (tbl) => [
+    uniqueIndex('ux_user_overrides').on(
+      tbl.userId,
+      tbl.permission,
+      tbl.effect,
+      sql`coalesce(${tbl.scope}, '')`,
+    ),
+    index('ix_user_overrides_agency_user').on(tbl.agencyId, tbl.userId),
+  ],
+);
+
+export const sessions = sqliteTable(
+  t('sessions'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    actorType: text('actor_type', {
+      enum: ['staff', 'client', 'portal_link'],
+    }).notNull(),
+    userId: text('user_id').references(() => users.id, { onDelete: 'cascade' }),
+    portalTokenId: text('portal_token_id').references(() => portalTokens.id, {
+      onDelete: 'cascade',
+    }),
+    refreshHash: text('refresh_hash').notNull(),
+    prevRefreshHash: text('prev_refresh_hash'),
+    createdAt: ts('created_at').notNull().default(now),
+    lastSeenAt: ts('last_seen_at'),
+    expiresAt: ts('expires_at').notNull(),
+    revokedAt: ts('revoked_at'),
+    revokedReason: text('revoked_reason'),
+    ip: text('ip'),
+    userAgent: text('user_agent'),
+  },
+  (tbl) => [
+    uniqueIndex('ux_sessions_refresh').on(tbl.refreshHash),
+    index('ix_sessions_prev_refresh').on(tbl.prevRefreshHash),
+    index('ix_sessions_user').on(tbl.userId),
+    index('ix_sessions_portal_token').on(tbl.portalTokenId),
+  ],
+);
+
+export const portalTokenProjects = sqliteTable(
+  t('portal_token_projects'),
+  {
+    tokenId: text('token_id')
+      .notNull()
+      .references(() => portalTokens.id, { onDelete: 'cascade' }),
+    projectId: text('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+  },
+  (tbl) => [primaryKey({ columns: [tbl.tokenId, tbl.projectId] })],
+);
+
+export type Role = typeof roles.$inferSelect;
+export type RolePermission = typeof rolePermissions.$inferSelect;
+export type UserRole = typeof userRoles.$inferSelect;
+export type UserPermissionOverride = typeof userPermissionOverrides.$inferSelect;
+export type Session = typeof sessions.$inferSelect;
