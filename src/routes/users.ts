@@ -564,7 +564,7 @@ usersRouter.post('/invite', requiresAny('users.invite', 'client_users.invite'), 
       email,
       passwordHash: await hashPassword(randomPassword),
       fullName: body.fullName,
-      role: isClient ? 'client' : body.role === 'admin' ? 'admin' : 'member',
+      role: isClient ? 'client' : 'member', // legacy display column; synced from roles below
       kind: isClient ? 'client' : 'staff',
       status: 'active',
       clientId: isClient ? body.clientId! : null,
@@ -591,7 +591,7 @@ usersRouter.post('/invite', requiresAny('users.invite', 'client_users.invite'), 
     id: newId('inv'),
     agencyId: actor.agencyId,
     email,
-    role: isClient ? 'client' : body.role === 'admin' ? 'admin' : 'member',
+    role: isClient ? 'client' : 'member', // legacy display column; synced from roles below
     clientId: isClient ? body.clientId! : null,
     projectScopeJson: isClient && clientScopeProjectIds.length ? JSON.stringify(clientScopeProjectIds) : null,
     tokenHash: hash,
@@ -857,7 +857,7 @@ usersRouter.patch('/:userId', requiresAny('users.update', 'users.disable', 'user
 
   if (body.role !== undefined) {
     if (!can(actor, 'users.assign_roles')) throw forbidden("You don't have permission to assign roles.");
-    const key: SystemRoleKey = body.role === 'owner' ? 'owner' : body.role === 'admin' ? 'admin' : 'employee';
+    const key: SystemRoleKey = body.role === 'owner' ? 'owner' : body.role === 'admin' ? 'admin' : 'employee'; // authz-lint-allow: legacy request field mapped to a system role (old app builds)
     const id = await systemRoleId(actor.agencyId, key);
     if (!id) throw notFound('Role not found.');
     await setUserRoles({ actor, target, roleIds: [id], ip: req.ip });
