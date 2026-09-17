@@ -1,6 +1,12 @@
 # Sanctum Authorization Redesign
 
-Status: **design + implementation in progress** on branch `authz-redesign` (backend, frontend, flutter). Nothing is deployed.
+Status: **implemented on branch `authz-redesign`** in sanctum-backend, sanctum-frontend and sanctum-flutter. Nothing is pushed or deployed. See [Rollout runbook](#rollout-runbook) and [Implementation status](#implementation-status).
+
+| Area | Verification |
+|---|---|
+| Backend | 508/508 tests, `tsc` clean, `pnpm authz:lint` clean, `pnpm authz:check` clean |
+| Web frontend | `tsc` clean, `next build` succeeds; no automated UI tests |
+| Flutter app | **Unverified**: no Flutter SDK was available. Run `flutter analyze` and `flutter test` before merging |
 
 This document is the specification for Sanctum's authorization architecture. It replaces the module-level `none/view/edit/manage` RBAC and its role shortcuts.
 
@@ -983,3 +989,67 @@ Taken to make progress; each is easy to revisit.
 6. **Storage view/archive** become platform-operator operations, restricted to the agency configured as `PLATFORM_AGENCY_ID`.
 7. **Refrens** sync is bound to `REFRENS_AGENCY_ID`. Other agencies get 403.
 8. **Peers with identical authority cannot manage each other**; only Owner holders manage Owner holders.
+
+---
+
+## Implementation status
+
+| Definition-of-done item | Status |
+|---|---|
+| Every protected backend action has explicit authorization | Done. `pnpm authz:lint` fails on unguarded routes (reviewed exceptions are listed with reasons) |
+| Object-level protection / IDOR | Done. Per-resource facts loaders bind child objects to URL parents and the tenant; SQL scope filters on lists |
+| Tenant boundaries | Done. Tenant-bound storage keys, Refrens bound to `REFRENS_AGENCY_ID`, storage ops bound to `PLATFORM_AGENCY_ID`, FK input validation |
+| Roles are permission bundles | Done. No role/persona/module-level checks remain (lint-enforced) |
+| Granular action permissions, explicit scopes, policies | Done. 175 permissions, 5 scopes, state machines and no-self-approval policies |
+| Custom roles cannot escalate; no self-escalation | Done. Grant ceiling, strict manageability, no editing roles you hold, Owner invariant (`test/authz/roles-admin.test.ts`) |
+| Fail closed | Done. Unknown permission/scope/actor, deleted/disabled users, revoked sessions, empty client project selection |
+| Frontend and apps use the same contract | Web done; Flutter written against the same contract, unverified |
+| Backend authoritative | Done |
+| Realtime | Done. Per-event authorization, room re-sync on changes, disconnect on revoke and token expiry |
+| Background jobs | Done. System actors with explicit grants, audited as `system` |
+| Permission changes propagate | Done. `authz_version` per request, `authz:changed` socket event, clients refetch |
+| Auditable | Done. `auditAuthz` with before/after on every role/assignment/override/session change |
+| Single source of truth for the catalog | Done. `src/authz/catalog.ts` generates docs, matrix and the web/Flutter catalogs (`pnpm authz:generate`) |
+| Old RBAC removed | Code removed. Legacy **columns** (`users.role`, `users.permissions_json`, `users.custom_role_id`, `custom_roles`, `agencies.role_permissions_json`) and legacy `/auth/me` fields remain only for the rollout window (below) |
+| Comprehensive authorization tests | Backend: `test/authz/*` (engine, sessions, roles/escalation, migration, and per-domain suites) plus updated domain suites. Web/Flutter: no automated UI tests |
+
+### Known follow-ups
+- `GET /me/tasks` rows have no `capabilities` (the app falls back to grant scopes).
+- The AI quota check lives only in the month-generation route; extract it into a service if other AI endpoints should count against it.
+- Rate limiting for `POST /attendance/email-reports` (only the range is capped).
+- Decide whether project **leads** should differ from plain members (today every member is `assigned`; a `project` role distinction would need contextual assignments, §F.6).
+- Share-link role selection has no staff→client ceiling (client permissions can never grant staff powers).
+- Client portal lost the rich proposal view (it used the public token page); render `proposal.content` in `/client/proposals` if needed.
+- `test/business_ui_test.dart` (Flutter) still expects a "Copy link" built from document tokens that the API no longer returns.
+
+## Rollout runbook
+
+1. **Configure environment** (backend):
+   - `REFRENS_AGENCY_ID`: agency that owns the Refrens credentials. Without it, Refrens sync is refused for everyone.
+   - `PLATFORM_AGENCY_ID`: agency allowed to use storage status/archive. Without it, nobody can.
+   - Optional `OAUTH_STATE_SECRET` and `UPLOAD_TOKEN_SECRET` (≥32 chars). Without them, purpose-derived keys from `JWT_ACCESS_SECRET` are used.
+   - `FRONTEND_ORIGIN` must list every production web origin. `*.netlify.app` / `*.vercel.app` are no longer trusted in production.
+2. **Back up the production database.**
+3. **Apply migration `0038_authorization.sql`** (additive: new tables and columns only).
+4. **Deploy the backend.**
+   - At boot it runs `migrateAllAgencies()` (per-agency, transactional, idempotent), syncs Owner roles with the catalog and purges invalid grants. Check the log line `[authz] migrated N agencies`.
+   - Effects:
+     - Existing users keep their effective access, except for the intentional fixes in §J.2.
+     - Synthetic share-link users are disabled, so share-link visitors must reopen their link.
+     - Share links without expiry get 90 days.
+   - Legacy access tokens keep working until they expire (≤15 min). Legacy refresh tokens are exchanged once for a session.
+   - Previously issued upload URLs and OAuth connect states stop verifying (new signing keys).
+5. **Deploy the web frontend** (`sanctum-frontend`, Netlify).
+6. **Ship the Flutter app** after `flutter analyze` and `flutter test` pass and a manual smoke test on a device (secure-storage token migration, resume refresh, socket reconnect after token expiry).
+7. **Verify in production:**
+   - Owner sees everything.
+   - An employee cannot edit someone else's task.
+   - An admin cannot open finance.
+   - A share link can only review/approve posts.
+   - Revoking a link ends its session.
+   - Disabling a user signs them out immediately.
+8. **After the rollout window** (≥30 days, and once old app builds are unsupported):
+   - Remove the legacy `/auth/me` fields (`role`, `persona`, `permissions`) and `src/authz/compat.ts`.
+   - Remove legacy token acceptance in `src/authz/http.ts` and `src/routes/auth.ts`, and `src/lib/jwt.ts`.
+   - Add a migration dropping `users.permissions_json`, `users.custom_role_id`, `custom_roles` and `agencies.role_permissions_json`. Keep or drop `users.role` once nothing reads it.
+   - Delete `src/authz/migrate-legacy.ts` together with the columns it reads.
