@@ -141,6 +141,7 @@ export const POST_CAPABILITIES = [
   'posts.submit_for_approval',
   'posts.schedule',
   'posts.publish',
+  'posts.restore',
   'media.upload',
   'post_comments.create',
 ] as const;

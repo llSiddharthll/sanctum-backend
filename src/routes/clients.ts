@@ -68,6 +68,7 @@ const CLIENT_CAPABILITIES = [
   'deals.view',
   'deals.create',
   'deals.view_value',
+  'deals.update_value',
   'tags.manage',
 ];
 
@@ -313,7 +314,7 @@ clientsRouter.get('/:clientId', requires('clients.view'), async (req, res) => {
     .from(projects)
     .where(and(eq(projects.agencyId, actor.agencyId), eq(projects.clientId, client.id)));
 
-  let invoiceCount = 0;
+  let invoiceCount: number | null = null;
   let outstanding: number | null = null;
   if (showFinancials) {
     const [ic] = await db

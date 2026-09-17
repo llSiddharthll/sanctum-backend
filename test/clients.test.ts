@@ -76,7 +76,7 @@ describe('clients workflow', () => {
     const viewer = data(await agent.get(`${BASE}/clients/${id}`));
     expect(viewer.gstNumber).toBeNull();
     expect(viewer.paymentTermsDays).toBeNull();
-    expect(viewer.invoiceCount).toBe(0);
+    expect(viewer.invoiceCount).toBeNull();
     expect(viewer.outstanding).toBeNull();
     expect(viewer.capabilities['clients.update']).toBe(true);
     expect(viewer.capabilities['clients.archive']).toBe(false);
