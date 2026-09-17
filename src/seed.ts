@@ -21,7 +21,9 @@ import { libsql, db, ensurePragmas, schema } from './db/client.js';
 import { newId, newOpaqueToken } from './lib/ids.js';
 import { hashPassword } from './lib/password.js';
 import { encryptSecret } from './services/vault.js';
-import { ROLE_PRESETS, serializeOverrides } from './lib/permissions.js';
+import { migrateAgency } from './authz/migrate-legacy.js';
+import { assignRoles, createRole, systemRoleId } from './authz/roles-store.js';
+import { ROLE_TEMPLATES } from './authz/catalog.js';
 
 const {
   plans,
@@ -302,33 +304,6 @@ async function main(): Promise<void> {
   });
 
   // -----------------------------------------------------------------
-  // 5. CUSTOM ROLES — Manager + Employee from ROLE_PRESETS
-  // -----------------------------------------------------------------
-  console.log('Seeding custom roles...');
-  const managerPreset = ROLE_PRESETS.find((p) => p.key === 'manager')!;
-  const employeePreset = ROLE_PRESETS.find((p) => p.key === 'employee')!;
-  const managerRoleId = newId('crl');
-  const employeeRoleId = newId('crl');
-  await db.insert(customRoles).values([
-    {
-      id: managerRoleId,
-      agencyId,
-      name: managerPreset.name,
-      colorToken: managerPreset.colorToken,
-      baseRole: managerPreset.baseRole,
-      permissionsJson: serializeOverrides(managerPreset.permissions),
-    },
-    {
-      id: employeeRoleId,
-      agencyId,
-      name: employeePreset.name,
-      colorToken: employeePreset.colorToken,
-      baseRole: employeePreset.baseRole,
-      permissionsJson: serializeOverrides(employeePreset.permissions),
-    },
-  ]);
-
-  // -----------------------------------------------------------------
   // 6. STAFF USERS — all password "Sanctum@123", status active
   // -----------------------------------------------------------------
   console.log('Seeding users (hashing passwords with argon2)...');
@@ -381,7 +356,6 @@ async function main(): Promise<void> {
       passwordHash,
       fullName: 'Rahul Nair',
       role: 'member',
-      customRoleId: managerRoleId,
       status: 'active',
       designation: 'Delivery Manager',
       department: 'Delivery',
@@ -398,7 +372,6 @@ async function main(): Promise<void> {
       passwordHash,
       fullName: 'Sneha Iyer',
       role: 'member',
-      customRoleId: employeeRoleId,
       status: 'active',
       designation: 'Senior Designer',
       department: 'Creative',
@@ -415,7 +388,6 @@ async function main(): Promise<void> {
       passwordHash,
       fullName: 'Vikram Rao',
       role: 'member',
-      customRoleId: employeeRoleId,
       status: 'active',
       designation: 'Content Writer',
       department: 'Content',
@@ -432,7 +404,6 @@ async function main(): Promise<void> {
       passwordHash,
       fullName: 'Ananya Gupta',
       role: 'member',
-      customRoleId: employeeRoleId,
       status: 'active',
       designation: 'Social Media Executive',
       department: 'Social',
@@ -1025,20 +996,37 @@ async function main(): Promise<void> {
   // -----------------------------------------------------------------
   // 16. PROJECT MEMBERS
   // -----------------------------------------------------------------
+  // -----------------------------------------------------------------
+  // AUTHORIZATION — run the real legacy→roles migration for the agency, then
+  // give the demo manager/employees roles from the catalog templates.
+  // -----------------------------------------------------------------
+  console.log('Seeding roles & assignments...');
+  await migrateAgency(agencyId);
+  const tpl = (key: string) => ROLE_TEMPLATES.find((t) => t.key === key)!;
+  const managerRoleId = await createRole(db, {
+    agencyId, name: 'Manager', kind: 'custom', actorType: 'staff',
+    colorToken: tpl('manager').colorToken, templateKey: 'manager', grants: tpl('manager').grants,
+  });
+  const employeeRoleId = await systemRoleId(agencyId, 'employee');
+  await assignRoles(db, { agencyId, userId: managerId, roleIds: [managerRoleId] });
+  for (const uid of [emp1Id, emp2Id, emp3Id]) {
+    await assignRoles(db, { agencyId, userId: uid, roleIds: [employeeRoleId!] });
+  }
+
   console.log('Seeding project members...');
   await db.insert(projectMembers).values([
     { id: newId('pmb'), agencyId, projectId: P.bloomLaunch, userId: managerId, role: 'lead' },
-    { id: newId('pmb'), agencyId, projectId: P.bloomLaunch, userId: emp1Id, role: 'contributor' },
-    { id: newId('pmb'), agencyId, projectId: P.bloomLaunch, userId: emp2Id, role: 'contributor' },
+    { id: newId('pmb'), agencyId, projectId: P.bloomLaunch, userId: emp1Id, role: 'member' },
+    { id: newId('pmb'), agencyId, projectId: P.bloomLaunch, userId: emp2Id, role: 'member' },
     { id: newId('pmb'), agencyId, projectId: P.auroraRebrand, userId: managerId, role: 'lead' },
-    { id: newId('pmb'), agencyId, projectId: P.auroraRebrand, userId: emp1Id, role: 'contributor' },
-    { id: newId('pmb'), agencyId, projectId: P.auroraRebrand, userId: emp3Id, role: 'contributor' },
+    { id: newId('pmb'), agencyId, projectId: P.auroraRebrand, userId: emp1Id, role: 'member' },
+    { id: newId('pmb'), agencyId, projectId: P.auroraRebrand, userId: emp3Id, role: 'member' },
     { id: newId('pmb'), agencyId, projectId: P.auroraRetainer, userId: emp2Id, role: 'lead' },
-    { id: newId('pmb'), agencyId, projectId: P.auroraRetainer, userId: emp3Id, role: 'contributor' },
+    { id: newId('pmb'), agencyId, projectId: P.auroraRetainer, userId: emp3Id, role: 'member' },
     { id: newId('pmb'), agencyId, projectId: P.novafitApp, userId: managerId, role: 'lead' },
-    { id: newId('pmb'), agencyId, projectId: P.novafitApp, userId: emp1Id, role: 'contributor' },
+    { id: newId('pmb'), agencyId, projectId: P.novafitApp, userId: emp1Id, role: 'member' },
     { id: newId('pmb'), agencyId, projectId: P.lumenWeb, userId: emp2Id, role: 'lead' },
-    { id: newId('pmb'), agencyId, projectId: P.lumenWeb, userId: emp3Id, role: 'contributor' },
+    { id: newId('pmb'), agencyId, projectId: P.lumenWeb, userId: emp3Id, role: 'member' },
   ]);
 
   // -----------------------------------------------------------------

@@ -101,20 +101,4 @@ export async function notifyPermissionHolders(
 
 export { usersWithPermission };
 
-/**
- * @deprecated TODO(authz): call sites must use notifyPermissionHolders with the
- * specific permission. Temporary capability-based stand-in for the old
- * owner/admin role query.
- */
-export async function agencyApprovers(agencyId: string, excludeUserId?: string): Promise<string[]> {
-  const perms = ['leaves.approve', 'regularizations.approve', 'checkout_requests.approve', 'posts.publish'];
-  const sets = await Promise.all(perms.map((p) => usersWithPermission(agencyId, p, { excludeUserId })));
-  return [...new Set(sets.flat())];
-}
-
-/** @deprecated TODO(authz): use notifyPermissionHolders(agencyId, '<business permission>', …). */
-export async function agencyOwners(agencyId: string): Promise<string[]> {
-  return usersWithPermission(agencyId, 'proposals.view');
-}
-
 export { serialize as serializeNotification };

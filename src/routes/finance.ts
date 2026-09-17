@@ -223,7 +223,6 @@ financeRouter.get('/owner-snapshot', requires('finance.view_overview'), async (r
     .select({
       id: users.id,
       name: users.fullName,
-      role: users.role,
       designation: users.designation,
       salary: users.monthlySalaryPaise,
     })
@@ -375,7 +374,6 @@ financeRouter.get('/owner-snapshot', requires('finance.view_overview'), async (r
       .map((s) => ({
         userId: s.id,
         name: s.name,
-        role: s.role,
         designation: s.designation,
         monthlySalaryPaise: Number(s.salary ?? 0),
       })),

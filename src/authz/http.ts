@@ -204,7 +204,7 @@ export async function actorFromAccessToken(token: string): Promise<{ actor: Acto
   return actorFromLegacyUser(claims.sub as string, claims.agencyId as string);
 }
 
-/** Authentication middleware. Sets req.actor (and the legacy req.auth shim). */
+/** Authentication middleware. Sets req.actor. */
 export async function authenticate(
   req: Request,
   _res: Response,
@@ -214,18 +214,8 @@ export async function authenticate(
     if (req.actor) return next();
     const token = readAccessToken(req);
     if (!token) throw unauthenticated('No access token.');
-    const { actor, legacyRole } = await actorFromAccessToken(token);
+    const { actor } = await actorFromAccessToken(token);
     req.actor = actor;
-    // Compatibility for routers not yet migrated to the engine.
-    // TODO(authz phase 10): delete req.auth.
-    if (actor.type === 'staff' || actor.type === 'client') {
-      req.auth = {
-        userId: actor.userId,
-        agencyId: actor.agencyId,
-        role: legacyRole ?? (actor.type === 'client' ? 'client' : 'member'),
-        clientId: actor.type === 'client' ? actor.clientId : null,
-      };
-    }
     next();
   } catch (err) {
     next(err);
