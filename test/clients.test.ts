@@ -53,6 +53,25 @@ describe('clients workflow', () => {
     expect(create.status).toBe(403);
   });
 
+  it('lists active clients by default; archived ones only on request', async () => {
+    const fresh = (await signupAgency()).agent;
+    const keep = data(await fresh.post(`${BASE}/clients`).send({ name: 'Working Co' })).id;
+    const gone = data(await fresh.post(`${BASE}/clients`).send({ name: 'Billing Only Co' })).id;
+    expect((await fresh.post(`${BASE}/clients/${gone}/archive`)).status).toBe(200);
+
+    const ids = async (query = '') =>
+      data(await fresh.get(`${BASE}/clients${query}`)).map((c: any) => c.id);
+
+    expect(await ids()).toEqual([keep]);
+    expect(await ids('?status=archived')).toEqual([gone]);
+    expect((await ids('?status=all')).sort()).toEqual([keep, gone].sort());
+    expect((await fresh.get(`${BASE}/clients?status=nonsense`)).status).toBe(422);
+
+    // Restoring puts it back in the default roster.
+    expect((await fresh.post(`${BASE}/clients/${gone}/restore`)).status).toBe(200);
+    expect((await ids()).sort()).toEqual([keep, gone].sort());
+  });
+
   it("isolates tenants — agency B cannot see agency A's clients", async () => {
     const a = (await signupAgency()).agent;
     const created = await a.post(`${BASE}/clients`).send({ name: 'Secret A' });

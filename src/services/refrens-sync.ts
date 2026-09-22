@@ -119,6 +119,11 @@ async function resolveClient(
     billingCity: billedTo?.city ?? null,
     billingPincode: billedTo?.pincode ?? null,
     refrensClientId: refKey,
+    // A Refrens invoice only proves someone was billed, not that the agency
+    // works with them. They arrive archived: the invoice keeps its client and
+    // the finance pages still resolve the name, but the Clients directory and
+    // every picker stay the real roster. Restore one when work actually starts.
+    status: 'archived' as const,
   };
   await db.insert(clients).values(row);
   rows.push(row as ClientRow); // so the next invoice for this brand reuses it

@@ -152,13 +152,25 @@ async function clientFor(
 
 // GET /clients — directory, filtered in SQL to the clients in the actor's
 // clients.view scope (organization → all; assigned → assigned/owned).
+// `?status=active|archived|all` — default `active`, so pickers and the app
+// never offer archived clients (billing-only contacts from Refrens land there).
+const listQuerySchema = z.object({
+  status: z.enum(['active', 'archived', 'all']).default('active'),
+});
 clientsRouter.get('/', requires('clients.view'), async (req, res) => {
   const actor = getStaffActor(req);
+  const { status } = listQuerySchema.parse(req.query ?? {});
   const scope = await clientScopeFilter(actor, 'clients.view', clients.id);
   const rows = await db
     .select()
     .from(clients)
-    .where(and(eq(clients.agencyId, actor.agencyId), scope));
+    .where(
+      and(
+        eq(clients.agencyId, actor.agencyId),
+        scope,
+        status === 'all' ? undefined : eq(clients.status, status),
+      ),
+    );
   const factsFor = await clientRowFactsBuilder(actor);
   ok(
     res,

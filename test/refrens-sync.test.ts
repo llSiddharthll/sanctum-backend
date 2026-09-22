@@ -178,6 +178,9 @@ describe('Refrens sync — pull + push', () => {
       .from(clients)
       .where(and(eq(clients.agencyId, agencyId), eq(clients.refrensClientId, '1763631981932')));
     expect(cli!.gstNumber).toBe('03AAACY7615G1ZH');
+    // Being billed is not the same as being a client: imported billing contacts
+    // arrive archived so the directory and the pickers stay the real roster.
+    expect(cli!.status).toBe('archived');
   });
 
   it('is idempotent — re-polling updates in place, never duplicates', async () => {
