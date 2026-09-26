@@ -221,6 +221,31 @@ describe('authz: business & finance', () => {
     expect(view.client.billingAddress).toBeUndefined();
   });
 
+  it('mints a fresh shareable link for staff who may send, retiring the previous one', async () => {
+    const p = await sentProposal();
+    const minted = await owner.post(`${BASE}/proposals/${p.id}/link`);
+    expect(minted.status).toBe(200);
+    const fresh = tokenOf(data(minted).url);
+    expect(fresh).not.toBe(p.token);
+    expect(data(minted).expiresAt).toBeTruthy();
+    expect((await anon().get(`${BASE}/proposals/public/${fresh}`)).status).toBe(200);
+    expect((await anon().get(`${BASE}/proposals/public/${p.token}`)).status).toBe(410);
+
+    const a = await sentAgreement();
+    const aLink = await owner.post(`${BASE}/agreements/${a.id}/link`);
+    expect(aLink.status).toBe(200);
+    const freshSign = tokenOf(data(aLink).url);
+    expect((await anon().get(`${BASE}/agreements/public/${freshSign}`)).status).toBe(200);
+    expect((await anon().get(`${BASE}/agreements/public/${a.token}`)).status).toBe(410);
+
+    // Needs the send permission, not merely view.
+    const viewer = await createMemberSession(owner, {
+      grants: [g('proposals.view'), g('agreements.view')],
+    });
+    expect((await viewer.agent.post(`${BASE}/proposals/${p.id}/link`)).status).toBe(403);
+    expect((await viewer.agent.post(`${BASE}/agreements/${a.id}/link`)).status).toBe(403);
+  });
+
   it('public document links: hashed, expire, revoked on resend, validUntil enforced, legacy tokens migrate once', async () => {
     const p = await sentProposal();
     // Only the hash is stored.

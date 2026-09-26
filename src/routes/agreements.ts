@@ -528,6 +528,38 @@ authRouter.post('/ai/generate', requires('agreements.create'), async (req, res) 
   ok(res, canOrg(actor, 'agreements.view_pricing') ? result : redactMoney(result));
 });
 
+// ---- MINT A SHAREABLE SIGNING LINK ----
+// Signing links are stored hashed and cannot be shown again, so this mints a
+// fresh one to paste into a chat and revokes the previous one.
+authRouter.post('/:id/link', requires('agreements.send'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const loaded = await loadAgreement(actor, param(req, 'id'));
+  authorize(actor, 'agreements.send', loaded?.facts, { view: 'agreements.view' });
+  const a = loaded!.row;
+  assertAgreementUnsigned(a);
+  if (a.expirationDate && a.expirationDate.getTime() <= Date.now()) {
+    throw invalidState('This agreement is past its expiration date. Update it before sharing.');
+  }
+  if (a.fileUrl && a.clientId) {
+    throw invalidState('This agreement is a file — share it from the client portal instead.');
+  }
+
+  const link = await mintDocumentLink({
+    agencyId: actor.agencyId,
+    objectType: 'agreement',
+    objectId: a.id,
+    expiresAt: defaultLinkExpiry(a.expirationDate),
+    createdBy: actor.userId,
+  });
+  await auditAgreement(actor, 'agreement.link_mint', a.id, req.ip, {
+    expiresAt: link.expiresAt.toISOString(),
+  });
+  ok(res, {
+    url: `${getFrontendOrigin(req)}/agreements/sign/${link.raw}`,
+    expiresAt: toIso(link.expiresAt),
+  });
+});
+
 // ---- AI TEXT ENHANCEMENT ----
 const aiEnhanceAgreementSchema = z.object({
   text: z.string().trim().min(1).max(4000),

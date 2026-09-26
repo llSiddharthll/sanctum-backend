@@ -13,7 +13,7 @@ import {
 } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
-import { notFound, badRequest, forbidden, conflict } from '../lib/errors.js';
+import { notFound, badRequest, forbidden, conflict, invalidState } from '../lib/errors.js';
 import { audit } from '../services/audit.js';
 import { notifyMany } from '../services/notifications.js';
 import { sendEmail, basicHtml } from '../services/email.js';
@@ -572,6 +572,36 @@ authRouter.post('/:id/send', requires('proposals.send'), async (req, res) => {
   });
 
   ok(res, { sent: true, publicUrl, linkExpiresAt: toIso(linkExpiresAt) });
+});
+
+// ---- MINT A SHAREABLE REVIEW LINK ----
+// Links are stored hashed, so an existing one can never be shown again. This
+// mints a fresh link to paste into WhatsApp/chat and revokes the previous one
+// (same as pressing Send), which is why it needs proposals.send.
+authRouter.post('/:id/link', requires('proposals.send'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const loaded = await loadProposal(actor, param(req, 'id'));
+  authorize(actor, 'proposals.send', loaded?.facts, { view: 'proposals.view' });
+  const p = loaded!.row;
+  assertProposalSendable(p);
+  if (p.fileUrl && p.clientId) {
+    throw invalidState('This proposal is a file — share it from the client portal instead.');
+  }
+
+  const link = await mintDocumentLink({
+    agencyId: actor.agencyId,
+    objectType: 'proposal',
+    objectId: p.id,
+    expiresAt: defaultLinkExpiry(p.validUntil),
+    createdBy: actor.userId,
+  });
+  await auditProposal(actor, 'proposal.link_mint', p.id, req.ip, {
+    expiresAt: link.expiresAt.toISOString(),
+  });
+  ok(res, {
+    url: `${getFrontendOrigin(req)}/proposals/view/${link.raw}`,
+    expiresAt: toIso(link.expiresAt),
+  });
 });
 
 // ---- CONVERT PROPOSAL TO AGREEMENT ----
