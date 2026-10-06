@@ -414,9 +414,11 @@ authRouter.get('/', requires('proposals.view'), async (req, res) => {
 
 // ---- CREATE PROPOSAL ----
 const proposalSchema = z.object({
-  clientId: z.string().optional(),
-  leadId: z.string().optional(),
-  templateId: z.string().optional(),
+  // Nullable so a form can say "this one has no client/lead" explicitly; an
+  // omitted field and an explicit null must not mean different things here.
+  clientId: z.string().nullable().optional(),
+  leadId: z.string().nullable().optional(),
+  templateId: z.string().nullable().optional(),
   title: z.string().trim().min(1).max(200),
   currency: z.string().trim().max(8).optional(),
   subtotalPaise: z.number().int().min(0).optional(),

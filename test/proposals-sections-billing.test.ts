@@ -152,4 +152,44 @@ describe('proposals: custom sections + per-line billing', () => {
     const agr = data(res);
     expect(agr.agreementId).toBeTruthy();
   });
+
+  it('moves a proposal from a client to a lead and back, clearing the old one', async () => {
+    const leadId = data(
+      await owner.post(`${BASE}/leads`).send({ name: 'Crafting Corners', source: 'referral' }),
+    ).id;
+    const p = data(
+      await owner.post(`${BASE}/proposals`).send({
+        title: 'Wrong recipient',
+        clientId,
+        content: { sections: [] },
+      }),
+    );
+    expect(p.clientId).toBe(clientId);
+
+    // Sent as explicit nulls, the way the form does: the old recipient must be
+    // cleared, or the proposal keeps showing against the wrong client.
+    const moved = data(
+      await owner.put(`${BASE}/proposals/${p.id}`).send({ clientId: null, leadId }),
+    );
+    expect(moved.leadId).toBe(leadId);
+    expect(moved.clientId).toBeNull();
+
+    const back = data(
+      await owner.put(`${BASE}/proposals/${p.id}`).send({ clientId, leadId: null }),
+    );
+    expect(back.clientId).toBe(clientId);
+    expect(back.leadId).toBeNull();
+
+    // A proposal can also be created straight onto a lead with a null client.
+    const onLead = data(
+      await owner.post(`${BASE}/proposals`).send({
+        title: 'Lead proposal',
+        clientId: null,
+        leadId,
+        content: { sections: [] },
+      }),
+    );
+    expect(onLead.leadId).toBe(leadId);
+    expect(onLead.clientId).toBeNull();
+  });
 });
