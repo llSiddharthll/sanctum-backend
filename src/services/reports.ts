@@ -1,12 +1,13 @@
 import { and, eq, or, gte, lte, inArray, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { roles, userRoles, users, timeLogs, projectTasks, taskAssignees } from '../db/schema.js';
+import { agencies, roles, userRoles, users, timeLogs, projectTasks, taskAssignees } from '../db/schema.js';
 import { forbidden } from '../lib/errors.js';
 import type { Actor } from '../authz/actor.js';
 import { canOrg } from '../authz/engine.js';
 import { usersWithPermission } from '../authz/resolver.js';
 import { loadPolicy, buildRange, summarizeDays, daysInRange } from './attendance.js';
 import { sendEmployeeReport, sendTeamReport } from './email.js';
+import { buildTeamReportPdf, buildTeamReportXlsx, reportFileStem } from './report-docs.js';
 
 export interface EmployeeReport {
   userId: string;
@@ -215,6 +216,36 @@ export async function emailEmployeeReports(
     if (r.ok) employees++;
   }
 
+  // One PDF + workbook per run, attached to every overview recipient.
+  const [agency] = await db
+    .select({ name: agencies.name })
+    .from(agencies)
+    .where(eq(agencies.id, agencyId))
+    .limit(1);
+  const docInput = {
+    agencyName: agency?.name ?? 'Your agency',
+    periodLabel,
+    reports,
+  };
+  const stem = reportFileStem(fromKey);
+  const attachments = await Promise.all([
+    buildTeamReportPdf(docInput).then((content) => ({
+      filename: `${stem}.pdf`,
+      content,
+      contentType: 'application/pdf',
+    })),
+    buildTeamReportXlsx(docInput).then((content) => ({
+      filename: `${stem}.xlsx`,
+      content,
+      contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    })),
+  ]).catch((err) => {
+    // A broken document must not cost people their report.
+    // eslint-disable-next-line no-console
+    console.error('[reports] could not build attachments:', (err as Error)?.message ?? err);
+    return [];
+  });
+
   const holderSets = await Promise.all(
     TEAM_OVERVIEW_PERMISSIONS.map(
       async (p) => new Set(await usersWithPermission(agencyId, p, { scope: 'organization' })),
@@ -229,6 +260,7 @@ export async function emailEmployeeReports(
       name: o.fullName ?? o.email,
       periodLabel,
       members: reports,
+      attachments,
     });
     if (r.ok) overviewCount++;
   }

@@ -1,8 +1,9 @@
-import { Router } from 'express';
+import { Router, type Response } from 'express';
 import { z } from 'zod';
 import { and, desc, eq } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
+  agencies,
   attendanceCheckoutRequests,
   attendancePolicy,
   attendanceRecords,
@@ -11,12 +12,19 @@ import {
 } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
+import { indianHolidaysFor } from '../lib/indian-holidays.js';
 import { conflict, forbidden, notFound, badRequest } from '../lib/errors.js';
 import { audit } from '../services/audit.js';
 import {
   buildAgencyReports,
   emailEmployeeReports,
+  formatPeriod,
 } from '../services/reports.js';
+import {
+  buildTeamReportPdf,
+  buildTeamReportXlsx,
+  reportFileStem,
+} from '../services/report-docs.js';
 import { notify, notifyPermissionHolders } from '../services/notifications.js';
 import { authenticate, getStaffActor, requires, requiresAny } from '../authz/http.js';
 import { authorize, canOrg, check } from '../authz/engine.js';
@@ -659,6 +667,65 @@ attendanceRouter.post('/holidays', requires('holidays.manage'), async (req, res)
   });
 });
 
+/**
+ * POST /attendance/holidays/import-indian {year?, nationalOnly?}
+ * Fills in India's fixed-date public holidays for a year in one go, skipping
+ * any date that already has a holiday (so it is safe to run twice, and never
+ * overwrites an agency's own entry). Movable festivals (Holi, Diwali, Eid,
+ * Dussehra…) shift every year and are added by hand.
+ */
+const importIndianSchema = z.object({
+  year: z.number().int().min(2000).max(2100).optional(),
+  nationalOnly: z.boolean().optional(),
+});
+
+attendanceRouter.post('/holidays/import-indian', requires('holidays.manage'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const body = importIndianSchema.parse(req.body ?? {});
+  const year = body.year ?? new Date().getFullYear();
+  const candidates = indianHolidaysFor(year, { nationalOnly: body.nationalOnly });
+
+  const taken = new Set(
+    (
+      await db
+        .select({ day: holidays.day })
+        .from(holidays)
+        .where(eq(holidays.agencyId, actor.agencyId))
+    ).map((h) => h.day),
+  );
+  const toAdd = candidates.filter((h) => !taken.has(h.day));
+
+  if (toAdd.length) {
+    await db.insert(holidays).values(
+      toAdd.map((h) => ({
+        id: newId('hol'),
+        agencyId: actor.agencyId,
+        day: h.day,
+        name: h.name,
+        recurring: true,
+        createdBy: actor.userId,
+      })),
+    );
+    await audit({
+      agencyId: actor.agencyId,
+      actorType: actor.type,
+      actorId: actor.userId,
+      action: 'attendance.holiday.import',
+      entityType: 'agency',
+      entityId: actor.agencyId,
+      metadata: { year, added: toAdd.map((h) => h.day) },
+      ip: req.ip,
+    });
+  }
+
+  ok(res, {
+    year,
+    added: toAdd.length,
+    skipped: candidates.length - toAdd.length,
+    holidays: toAdd.map((h) => ({ day: h.day, name: h.name })),
+  });
+});
+
 attendanceRouter.delete('/holidays/:id', requires('holidays.manage'), async (req, res) => {
   const actor = getStaffActor(req);
   const id = param(req, 'id');
@@ -924,6 +991,45 @@ attendanceRouter.get('/team-report', requires('attendance.view_reports'), async 
   }));
   ok(res, { from, to, members });
 });
+
+// GET /attendance/team-report.pdf|.xlsx — the same report as a document to
+// read or to open in Excel. Replaces the browser-built CSV, which nobody could
+// read on a phone. Needs time & task visibility because the document carries
+// both; without them use the JSON endpoint above.
+function reportDownload(pdf: boolean) {
+  return async (req: Parameters<typeof getStaffActor>[0], res: Response) => {
+    const actor = getStaffActor(req);
+    const { from, to } = resolveRange(req.query.from, req.query.to, 366);
+    const reports = await buildAgencyReports(actor, from, to);
+    const [agency] = await db
+      .select({ name: agencies.name })
+      .from(agencies)
+      .where(eq(agencies.id, actor.agencyId))
+      .limit(1);
+    const input = {
+      agencyName: agency?.name ?? 'Your agency',
+      periodLabel: formatPeriod(from, to),
+      reports,
+    };
+    const body = pdf ? await buildTeamReportPdf(input) : await buildTeamReportXlsx(input);
+    res
+      .status(200)
+      .type(
+        pdf
+          ? 'application/pdf'
+          : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      )
+      .setHeader(
+        'Content-Disposition',
+        `attachment; filename="${reportFileStem(from)}.${pdf ? 'pdf' : 'xlsx'}"`,
+      )
+      .send(body);
+  };
+}
+
+const REPORT_DOC_PERMISSIONS = ['attendance.view_reports', 'time_logs.view', 'tasks.view'] as const;
+attendanceRouter.get('/team-report.pdf', requires(...REPORT_DOC_PERMISSIONS), reportDownload(true));
+attendanceRouter.get('/team-report.xlsx', requires(...REPORT_DOC_PERMISSIONS), reportDownload(false));
 
 // POST /attendance/email-reports {from?,to?} — email each employee their report
 // + a combined overview to report holders. Range ≤ 31 days.

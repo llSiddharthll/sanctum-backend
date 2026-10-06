@@ -18,6 +18,7 @@ import { audit } from '../services/audit.js';
 import { notifyMany } from '../services/notifications.js';
 import { sendEmail, basicHtml } from '../services/email.js';
 import { getFrontendOrigin } from '../lib/frontend-url.js';
+import { broadcastPortalRefresh } from '../realtime/io.js';
 import { authenticate, getStaffActor, requires, requiresAny } from '../authz/http.js';
 import { authorize, canOrg, capabilities, check } from '../authz/engine.js';
 import { actorAuditId, type Actor } from '../authz/actor.js';
@@ -25,6 +26,7 @@ import { requireInAgency } from '../authz/tenancy.js';
 import {
   activeLinkExpiry,
   assertProposalConvertible,
+  assertProposalDeletable,
   assertProposalEditable,
   assertProposalRespondable,
   assertProposalSendable,
@@ -572,6 +574,31 @@ authRouter.post('/:id/send', requires('proposals.send'), async (req, res) => {
   });
 
   ok(res, { sent: true, publicUrl, linkExpiresAt: toIso(linkExpiresAt) });
+});
+
+// ---- DELETE A PROPOSAL ----
+// For proposals raised or sent by mistake. A converted proposal backs a real
+// agreement, so it stays. Any live review link dies with it, and an open client
+// portal is told to refetch rather than show a document that is gone.
+authRouter.delete('/:id', requires('proposals.delete'), async (req, res) => {
+  const actor = getStaffActor(req);
+  const loaded = await loadProposal(actor, param(req, 'id'));
+  if (!loaded) throw notFound('Proposal not found.');
+  authorize(actor, 'proposals.delete', loaded.facts, { view: 'proposals.view' });
+  const p = loaded.row;
+  assertProposalDeletable(p);
+
+  await revokeDocumentLinks(actor.agencyId, 'proposal', p.id);
+  await db.delete(proposals).where(and(eq(proposals.id, p.id), eq(proposals.agencyId, actor.agencyId)));
+  if (p.clientId) {
+    broadcastPortalRefresh(p.clientId, { type: 'proposal.deleted', proposalId: p.id });
+  }
+  await auditProposal(actor, 'proposal.delete', p.id, req.ip, {
+    status: p.status,
+    title: p.title,
+    proposalNumber: p.proposalNumber,
+  });
+  ok(res, { deleted: true, id: p.id });
 });
 
 // ---- MINT A SHAREABLE REVIEW LINK ----

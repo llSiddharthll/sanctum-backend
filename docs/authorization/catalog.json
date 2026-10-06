@@ -1,5 +1,5 @@
 {
-  "version": "13l768h",
+  "version": "6nv6xc",
   "scopes": [
     {
       "key": "own",
@@ -2747,7 +2747,7 @@
       "action": "update",
       "category": "business",
       "label": "Edit proposals",
-      "description": "Edit draft and sent proposals.",
+      "description": "Edit proposals up to conversion (accepted ones warn first).",
       "scopes": [
         "own",
         "organization"
@@ -2756,6 +2756,25 @@
         "staff"
       ],
       "sensitive": false,
+      "requires": [
+        "proposals.view"
+      ]
+    },
+    {
+      "key": "proposals.delete",
+      "resource": "proposals",
+      "action": "delete",
+      "category": "business",
+      "label": "Delete proposals",
+      "description": "Delete proposals that have not become an agreement.",
+      "scopes": [
+        "own",
+        "organization"
+      ],
+      "actors": [
+        "staff"
+      ],
+      "sensitive": true,
       "requires": [
         "proposals.view"
       ]

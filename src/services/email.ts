@@ -6,11 +6,18 @@
 import nodemailer, { type Transporter } from 'nodemailer';
 import { env, emailEnabled } from '../env.js';
 
+export interface EmailAttachment {
+  filename: string;
+  content: Buffer;
+  contentType: string;
+}
+
 export interface EmailMessage {
   to: string;
   subject: string;
   text: string;
   html?: string;
+  attachments?: EmailAttachment[];
 }
 
 let transporter: Transporter | null = null;
@@ -291,7 +298,9 @@ export async function sendEmail(msg: EmailMessage): Promise<{ ok: boolean }> {
   if (!tx) {
     // eslint-disable-next-line no-console
     console.log(
-      `[email:log-only] to=${msg.to} subject="${msg.subject}" (set EMAIL_USER/EMAIL_PASS to actually send)\n${msg.text}`,
+      `[email:log-only] to=${msg.to} subject="${msg.subject}"${
+        msg.attachments?.length ? ` +${msg.attachments.length} attachment(s)` : ''
+      } (set EMAIL_USER/EMAIL_PASS to actually send)\n${msg.text}`,
     );
     return { ok: true };
   }
@@ -302,6 +311,7 @@ export async function sendEmail(msg: EmailMessage): Promise<{ ok: boolean }> {
       subject: msg.subject,
       text: msg.text,
       html: msg.html,
+      ...(msg.attachments?.length ? { attachments: msg.attachments } : {}),
     });
     return { ok: true };
   } catch (err) {
@@ -467,6 +477,8 @@ export async function sendTeamReport(input: {
   name: string;
   periodLabel: string;
   members: ReportData[];
+  /** Full report as a PDF + spreadsheet; the body stays a short summary. */
+  attachments?: EmailAttachment[];
 }): Promise<{ ok: boolean }> {
   const lines = input.members.map((m) => {
     const a = m.attendance;
@@ -485,14 +497,21 @@ export async function sendTeamReport(input: {
     lines.join('\n\n') || '  No staff to report.',
   ].join('\n');
 
+  const withNote = input.attachments?.length
+    ? `${body}
+
+The full report is attached as a PDF and a spreadsheet.`
+    : body;
+
   return sendEmail({
     to: input.to,
     subject: `Team work summary · ${input.periodLabel}`,
-    text: body,
+    text: withNote,
     html: basicHtml({
       heading: 'Team work summary',
-      body,
+      body: withNote,
       preheader: `Per-employee tasks, time & attendance for ${input.periodLabel}.`,
     }),
+    ...(input.attachments?.length ? { attachments: input.attachments } : {}),
   });
 }

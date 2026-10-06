@@ -38,6 +38,8 @@ import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { AppError, notFound, conflict, forbidden } from '../lib/errors.js';
 import { audit } from '../services/audit.js';
+import { notifyMany } from '../services/notifications.js';
+import { getFrontendOrigin } from '../lib/frontend-url.js';
 import {
   MILESTONE_TEMPLATES,
   CONTINUOUS_SERVICES,
@@ -500,6 +502,32 @@ async function syncTaskAssignees(
 }
 
 /** Current assignee user ids of a task (join rows ∪ primary mirror). */
+/**
+ * Tell people a task landed on them — in-app, over the socket and as a device
+ * push (notify() fans out to all three). Never notifies the person who did it.
+ * Best-effort: a notification failure must not fail the task write.
+ */
+async function notifyTaskAssigned(
+  actor: Actor,
+  req: Request,
+  task: { id: string; title: string; dueDate: Date | null },
+  userIds: string[],
+): Promise<void> {
+  const me = actor.type === 'staff' ? actor.userId : null;
+  const recipients = [...new Set(userIds)].filter((u) => u && u !== me);
+  if (!recipients.length) return;
+  const due = task.dueDate ? ` · due ${task.dueDate.toISOString().slice(0, 10)}` : '';
+  await notifyMany(recipients, {
+    agencyId: actor.agencyId,
+    type: 'task.assigned',
+    title: `New task: ${task.title}`,
+    body: `Assigned to you${due}`,
+    entityType: 'task',
+    entityId: task.id,
+    link: `${getFrontendOrigin(req).replace(/\/$/, '')}/tasks`,
+  }).catch(() => undefined);
+}
+
 async function currentAssigneeIds(
   agencyId: string,
   task: { id: string; assigneeId: string | null },
@@ -1552,6 +1580,12 @@ projectsRouter.post('/:id/tasks', requires('tasks.create'), async (req, res) => 
 
   // Sync the M:N join table with the resolved assignee set.
   await syncTaskAssignees(actor.agencyId, id, assigneeIds);
+  await notifyTaskAssigned(
+    actor,
+    req,
+    { id, title: body.title, dueDate: body.dueDate ?? null },
+    assigneeIds,
+  );
 
   await auditAs(actor, req, {
     action: body.parentTaskId ? 'task.subtask_add' : 'task.create',
@@ -1818,9 +1852,21 @@ projectsRouter.patch('/:id/tasks/:taskId', requires('tasks.update'), async (req,
       ),
     );
 
-  // Replace the M:N join set when assignees were touched (either field).
+  // Replace the M:N join set when assignees were touched (either field), and
+  // tell whoever is NEW on the task (not those who were already on it).
   if (nextAssigneeIds !== undefined) {
+    const before = new Set(await currentAssigneeIds(actor.agencyId, task));
     await syncTaskAssignees(actor.agencyId, task.id, nextAssigneeIds);
+    await notifyTaskAssigned(
+      actor,
+      req,
+      {
+        id: task.id,
+        title: patch.title ?? task.title,
+        dueDate: patch.dueDate !== undefined ? patch.dueDate : task.dueDate,
+      },
+      nextAssigneeIds.filter((u) => !before.has(u)),
+    );
   }
 
   // Completing a task auto-stops running timers on it: the caller's own as the

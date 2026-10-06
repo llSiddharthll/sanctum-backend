@@ -165,6 +165,7 @@ Object-level policies (docs/authorization/README.md §G) apply on top: e.g. no s
 | `proposals.view` | org | — | — | — | — | — | — | — | — |
 | `proposals.create` | org | — | — | — | — | — | — | — | — |
 | `proposals.update` | org | — | — | — | — | — | — | — | — |
+| `proposals.delete` | org | — | — | — | — | — | — | — | — |
 | `proposals.send` | org | — | — | — | — | — | — | — | — |
 | `proposals.convert` | org | — | — | — | — | — | — | — | — |
 | `proposals.manage_templates` | org | — | — | — | — | — | — | — | — |

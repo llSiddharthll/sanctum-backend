@@ -570,6 +570,21 @@ export async function publishCalendarSheet(
             status: taskStatus,
           })
           .where(and(eq(projectTasks.id, rec.taskId), eq(projectTasks.agencyId, ctx.agencyId)));
+        // Who is on this task already? Anyone the re-publish ADDS gets told,
+        // exactly like a first publish — before this they were added silently.
+        const existing = new Set(
+          (
+            await db
+              .select({ userId: taskAssignees.userId })
+              .from(taskAssignees)
+              .where(
+                and(
+                  eq(taskAssignees.agencyId, ctx.agencyId),
+                  eq(taskAssignees.taskId, rec.taskId),
+                ),
+              )
+          ).map((r) => r.userId),
+        );
         await db
           .insert(taskAssignees)
           .values(
@@ -581,6 +596,19 @@ export async function publishCalendarSheet(
             })),
           )
           .onConflictDoNothing();
+        for (const userId of assignees) {
+          if (userId === ctx.userId || existing.has(userId)) continue;
+          await notify({
+            agencyId: ctx.agencyId,
+            userId,
+            type: 'task.assigned',
+            title: `New task: ${caption}`,
+            body: `Due ${date.toISOString().slice(0, 10)} · ${client.name}`,
+            entityType: 'task',
+            entityId: rec.taskId,
+            link: `${origin.replace(/\/$/, '')}/tasks`,
+          });
+        }
         // Record it durably (adopts a legacy row into the table on first pass).
         if (p.adopted) {
           await db

@@ -193,15 +193,19 @@ describe('authz: business & finance', () => {
     expect((await owner.post(`${BASE}/invoices/${doomed.id}/payments`).send({ amount: 1 })).status).toBe(409);
   });
 
-  it('proposal/agreement state guards: convert once, no edits after accept/sign', async () => {
+  it('proposal/agreement state guards: convert once, frozen once converted/signed', async () => {
     const p = await sentProposal();
     expect((await owner.post(`${BASE}/proposals/${p.id}/convert-to-agreement`).send({})).status).toBe(409);
     expect((await anon().post(`${BASE}/proposals/public/${p.token}/accept`).send({ acceptedBy: 'B' })).status).toBe(200);
-    expect((await owner.put(`${BASE}/proposals/${p.id}`).send({ title: 'tamper' })).status).toBe(409);
+    // Accepted is still editable (agencies correct details after a verbal yes);
+    // the web app warns that the client agreed to the version being replaced.
+    expect((await owner.put(`${BASE}/proposals/${p.id}`).send({ title: 'corrected' })).status).toBe(200);
     // A decided proposal cannot be rejected afterwards.
     expect((await anon().post(`${BASE}/proposals/public/${p.token}/reject`).send({})).status).toBe(409);
     expect((await owner.post(`${BASE}/proposals/${p.id}/convert-to-agreement`).send({})).status).toBe(201);
     expect((await owner.post(`${BASE}/proposals/${p.id}/convert-to-agreement`).send({})).status).toBe(409);
+    // Converted: the agreement is the contract, so the proposal is frozen.
+    expect((await owner.put(`${BASE}/proposals/${p.id}`).send({ title: 'tamper' })).status).toBe(409);
 
     const a = await sentAgreement();
     const sig = { signerName: 'Jane', signerEmail: 'jane@client.test', signatureDataUrl: 'data:image/png;base64,iVBORw0KGgo=' };
@@ -219,6 +223,33 @@ describe('authz: business & finance', () => {
     expect(view.signatureDataUrl).toBeUndefined();
     expect(view.createdBy).toBeUndefined();
     expect(view.client.billingAddress).toBeUndefined();
+  });
+
+  it('edits an accepted proposal but not a converted one, and deletes mistakes', async () => {
+    const p = await sentProposal();
+    // Accepted: still editable (the UI warns), because agencies do correct a
+    // price or a date after a verbal yes.
+    await db.update(proposals).set({ status: 'accepted' }).where(eq(proposals.id, p.id));
+    expect(
+      (await owner.put(`${BASE}/proposals/${p.id}`).send({ title: 'Corrected after accept' })).status,
+    ).toBe(200);
+
+    // Delete needs its own permission.
+    const editor = await createMemberSession(owner, {
+      grants: [g('proposals.view'), g('proposals.update')],
+    });
+    expect((await editor.agent.delete(`${BASE}/proposals/${p.id}`)).status).toBe(403);
+
+    expect((await owner.delete(`${BASE}/proposals/${p.id}`)).status).toBe(200);
+    expect((await owner.get(`${BASE}/proposals/${p.id}`)).status).toBe(404);
+    // Its client review link dies with it.
+    expect((await anon().get(`${BASE}/proposals/public/${p.token}`)).status).toBe(410);
+
+    // Converted proposals back an agreement, so they are frozen both ways.
+    const q = await sentProposal();
+    await db.update(proposals).set({ status: 'converted' }).where(eq(proposals.id, q.id));
+    expect((await owner.put(`${BASE}/proposals/${q.id}`).send({ title: 'nope' })).status).toBe(409);
+    expect((await owner.delete(`${BASE}/proposals/${q.id}`)).status).toBe(409);
   });
 
   it('mints a fresh shareable link for staff who may send, retiring the previous one', async () => {

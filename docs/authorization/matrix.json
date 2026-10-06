@@ -1,5 +1,5 @@
 {
-  "version": "13l768h",
+  "version": "6nv6xc",
   "note": "Default grants for new agencies (system roles) and role templates. Existing agencies may have edited roles.",
   "roles": [
     {
@@ -447,6 +447,9 @@
           "organization"
         ],
         "proposals.update": [
+          "organization"
+        ],
+        "proposals.delete": [
           "organization"
         ],
         "proposals.send": [

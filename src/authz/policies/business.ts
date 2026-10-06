@@ -171,19 +171,31 @@ export function invoiceScopeFilter(actor: Actor, permission = 'invoices.view'): 
 
 // ------------------------------------------------------------- state guards
 
-const PROPOSAL_EDITABLE = new Set(['draft', 'sent', 'viewed', 'rejected']);
+const PROPOSAL_EDITABLE = new Set(['draft', 'sent', 'viewed', 'rejected', 'accepted']);
+/** Converted proposals back an agreement; anything else may still be removed. */
+const PROPOSAL_DELETABLE = new Set(['draft', 'sent', 'viewed', 'rejected', 'accepted', 'expired']);
 const PROPOSAL_SENDABLE = new Set(['draft', 'sent', 'viewed']);
 const PROPOSAL_RESPONDABLE = new Set(['sent', 'viewed']);
 const AGREEMENT_UNSIGNED = new Set(['draft', 'sent']);
 
 /**
- * Staff edits: draft / sent (incl. viewed). A `rejected` (changes requested)
- * proposal may be revised — the update revives it to draft. Accepted, expired
- * and converted proposals are immutable.
+ * Staff edits: draft / sent (incl. viewed) / rejected — a `rejected` (changes
+ * requested) proposal may be revised, which revives it to draft — and
+ * `accepted`, which the UI warns about because the client agreed to the version
+ * being replaced. Once converted into an agreement the agreement is the
+ * contract, so the proposal behind it is frozen; expired ones must be revived
+ * by extending validity first.
  */
 export function assertProposalEditable(p: Pick<ProposalRow, 'status'>): void {
   if (!PROPOSAL_EDITABLE.has(p.status)) {
     throw invalidState(`A ${p.status} proposal can no longer be edited.`);
+  }
+}
+
+/** Deletion: anything that has not become an agreement. */
+export function assertProposalDeletable(p: Pick<ProposalRow, 'status'>): void {
+  if (!PROPOSAL_DELETABLE.has(p.status)) {
+    throw invalidState(`A ${p.status} proposal cannot be deleted — it backs an agreement.`);
   }
 }
 

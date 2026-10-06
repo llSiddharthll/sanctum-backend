@@ -773,3 +773,65 @@ describe('attendance: tenant isolation', () => {
     expect([403, 404]).toContain(cross.status);
   });
 });
+
+describe('Indian holiday import', () => {
+  let owner: Agent;
+  beforeAll(async () => {
+    owner = (await signupAgency()).agent;
+  });
+
+  it('fills the fixed-date Indian holidays for a year, and is safe to run twice', async () => {
+    const first = data(
+      await owner.post(`${BASE}/attendance/holidays/import-indian`).send({ year: 2027 }),
+    );
+    expect(first.added).toBeGreaterThanOrEqual(6);
+    expect(first.holidays.map((h: any) => h.day)).toContain('2027-01-26');
+    expect(first.holidays.map((h: any) => h.name)).toContain('Independence Day');
+
+    const list = data(await owner.get(`${BASE}/attendance/holidays?year=2027`));
+    const republic = list.find((h: any) => h.day === '2027-01-26');
+    expect(republic.name).toBe('Republic Day');
+
+    // Running again adds nothing and removes nothing.
+    const second = data(
+      await owner.post(`${BASE}/attendance/holidays/import-indian`).send({ year: 2027 }),
+    );
+    expect(second.added).toBe(0);
+    expect(second.skipped).toBe(first.added);
+    expect(data(await owner.get(`${BASE}/attendance/holidays?year=2027`))).toHaveLength(list.length);
+  });
+
+  it('never overwrites a holiday the agency already set on that date', async () => {
+    await owner
+      .post(`${BASE}/attendance/holidays`)
+      .send({ day: '2028-01-26', name: 'Office closed — our own note' });
+    const res = data(
+      await owner.post(`${BASE}/attendance/holidays/import-indian`).send({ year: 2028 }),
+    );
+    expect(res.holidays.map((h: any) => h.day)).not.toContain('2028-01-26');
+
+    const list = data(await owner.get(`${BASE}/attendance/holidays?year=2028`));
+    expect(list.find((h: any) => h.day === '2028-01-26').name).toBe('Office closed — our own note');
+  });
+
+  it('can import only the three gazetted national holidays', async () => {
+    const res = data(
+      await owner
+        .post(`${BASE}/attendance/holidays/import-indian`)
+        .send({ year: 2029, nationalOnly: true }),
+    );
+    expect(res.added).toBe(3);
+    expect(res.holidays.map((h: any) => h.name).sort()).toEqual([
+      'Gandhi Jayanti',
+      'Independence Day',
+      'Republic Day',
+    ]);
+  });
+
+  it('needs holidays.manage', async () => {
+    const { agent } = await createMemberSession(owner, { permissions: { attendance: 'view' } });
+    expect(
+      (await agent.post(`${BASE}/attendance/holidays/import-indian`).send({ year: 2027 })).status,
+    ).toBe(403);
+  });
+});

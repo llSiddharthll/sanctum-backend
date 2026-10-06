@@ -789,7 +789,10 @@ const ORG = ['organization'] as Scope[];
     legacy: ['O >organization', 'C >client'],
   });
   def(c, 'proposals.create', 'Create proposals', 'Create proposals.', { scopes: ORG, requires: ['proposals.view'], legacy: O });
-  def(c, 'proposals.update', 'Edit proposals', 'Edit draft and sent proposals.', { scopes: OWN_ORG, requires: ['proposals.view'], legacy: O });
+  def(c, 'proposals.update', 'Edit proposals', 'Edit proposals up to conversion (accepted ones warn first).', { scopes: OWN_ORG, requires: ['proposals.view'], legacy: O });
+  def(c, 'proposals.delete', 'Delete proposals', 'Delete proposals that have not become an agreement.', {
+    scopes: OWN_ORG, sensitive: true, requires: ['proposals.view'], legacy: O,
+  });
   def(c, 'proposals.send', 'Send proposals', 'Send proposals to clients.', {
     scopes: OWN_ORG, sensitive: true, requires: ['proposals.view'], legacy: O,
   });
