@@ -109,4 +109,73 @@ describe('proposal → agreement conversion', () => {
     expect(agreement.clientId).toBe(convertedLead.clientId);
     expect(data(await owner.get(`${BASE}/leads/${lead.id}`)).stage).toBe('converted');
   });
+
+  it("carries the proposal's authored sections into the agreement's terms", async () => {
+    const client = data(await owner.post(`${BASE}/clients`).send({ name: 'Sectioned Co' }));
+    const proposal = data(
+      await owner.post(`${BASE}/proposals`).send({
+        title: 'Rich Proposal',
+        clientId: client.id,
+        content: {
+          sections: [
+            { heading: 'Scope of work', html: '<p>Monthly <strong>social</strong> management.</p>' },
+            { heading: 'Ways of working', html: '<ul><li>Weekly calls</li></ul>' },
+          ],
+          scopeOverview: 'Monthly social management.',
+          deliverables: [{ title: '12 reels' }, { title: '20 statics' }],
+          terms: ['1. Payment: net 15.'],
+        },
+      }),
+    );
+    await sendAndAccept(owner, proposal.id);
+    const res = await owner.post(`${BASE}/proposals/${proposal.id}/convert-to-agreement`).send({});
+    expect(res.status).toBe(201);
+
+    const agreement = data(await owner.get(`${BASE}/agreements/${data(res).agreementId}`));
+    const sections = agreement.terms.sections as Array<{ heading: string; html: string }>;
+    expect(sections[0]).toEqual({
+      heading: 'Scope of work',
+      html: '<p>Monthly <strong>social</strong> management.</p>',
+    });
+    expect(sections[1]!.heading).toBe('Ways of working');
+    // Deliverables become their own section rather than being lost.
+    const deliverables = sections.find((s) => s.heading === 'Deliverables');
+    expect(deliverables?.html).toContain('<li>12 reels</li>');
+    // The plain-text scope mirror survives for older viewers.
+    expect(agreement.terms.scope).toContain('Monthly social management.');
+    expect(agreement.terms.clauses).toContain('1. Payment: net 15.');
+  });
+
+  it('keeps editing the converted agreement open, including its sections', async () => {
+    const client = data(await owner.post(`${BASE}/clients`).send({ name: 'Editable Co' }));
+    const proposal = data(
+      await owner.post(`${BASE}/proposals`).send({
+        title: 'Editable Proposal',
+        clientId: client.id,
+        content: { sections: [{ heading: 'Scope', html: '<p>Original</p>' }] },
+      }),
+    );
+    await sendAndAccept(owner, proposal.id);
+    const { agreementId } = data(
+      await owner.post(`${BASE}/proposals/${proposal.id}/convert-to-agreement`).send({}),
+    );
+
+    // Add a section and keep an unrelated key: both survive the round trip.
+    const patched = await owner.put(`${BASE}/agreements/${agreementId}`).send({
+      terms: {
+        scope: 'Original',
+        sections: [
+          { heading: 'Scope', html: '<p>Original</p>' },
+          { heading: 'Payment terms', html: '<p>50% upfront.</p>' },
+        ],
+        clauses: ['1. Term: 12 months.'],
+        customKey: 'kept',
+      },
+    });
+    expect(patched.status).toBe(200);
+    const reloaded = data(await owner.get(`${BASE}/agreements/${agreementId}`));
+    expect(reloaded.terms.sections).toHaveLength(2);
+    expect(reloaded.terms.sections[1].heading).toBe('Payment terms');
+    expect(reloaded.terms.customKey).toBe('kept');
+  });
 });

@@ -714,6 +714,33 @@ authRouter.post(
       ? `${overview}\n\nDeliverables: ${deliverableTitles.join('; ')}.`
       : overview;
 
+    // The proposal's authored sections carry over 1:1, so the agreement starts
+    // as the document the client already agreed to and staff edit it from
+    // there rather than retyping it. `scope` above stays as the plain-text
+    // mirror for older viewers.
+    const sections = Array.isArray(proposalContent.sections)
+      ? proposalContent.sections
+          .filter((s: unknown): s is Record<string, unknown> => !!s && typeof s === 'object')
+          .map((s: Record<string, unknown>) => ({
+            heading: typeof s.heading === 'string' ? s.heading : '',
+            html:
+              typeof s.html === 'string'
+                ? s.html
+                : typeof s.body === 'string'
+                  ? s.body // plain-text section authored on the phone
+                  : '',
+          }))
+          .filter((s: { heading: string; html: string }) => s.heading || s.html)
+      : [];
+    if (deliverableTitles.length) {
+      sections.push({
+        heading: 'Deliverables',
+        html: `<ul>${deliverableTitles
+          .map((t: string) => `<li>${escapeHtml(t)}</li>`)
+          .join('')}</ul>`,
+      });
+    }
+
     const clauses: string[] = Array.isArray(proposalContent.terms)
       ? proposalContent.terms.filter(
           (c: unknown): c is string => typeof c === 'string' && c.trim().length > 0,
@@ -754,7 +781,7 @@ authRouter.post(
         totalValuePaise: p.totalPaise,
         retainerPaise: p.billingType === 'retainer' ? p.recurringPaise : 0,
         currency: p.currency,
-        termsJson: JSON.stringify({ scope, clauses }),
+        termsJson: JSON.stringify({ scope, sections, clauses }),
         token: null,
         createdBy: actor.userId,
       });
