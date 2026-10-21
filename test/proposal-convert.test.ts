@@ -86,7 +86,10 @@ describe('proposal → agreement conversion', () => {
     expect(reload.convertedAgreementId).toBe(agreementId);
   });
 
-  it('rejects converting a lead-only proposal (no client) with a clear 400', async () => {
+  it('converts a lead-only proposal by making the lead a client', async () => {
+    // An agreement belongs to a client, but a proposal usually starts on a
+    // lead — winning the deal IS the moment that lead becomes a client, so the
+    // conversion does it rather than refusing (it used to 400 here).
     const lead = data(await owner.post(`${BASE}/leads`).send({ name: 'Prospect X' }));
     const proposal = data(
       await owner.post(`${BASE}/proposals`).send({
@@ -97,7 +100,13 @@ describe('proposal → agreement conversion', () => {
     );
     await sendAndAccept(owner, proposal.id);
     const res = await owner.post(`${BASE}/proposals/${proposal.id}/convert-to-agreement`).send({});
-    expect(res.status).toBe(400);
-    expect(String(res.body?.error?.message ?? '')).toMatch(/client/i);
+    expect(res.status).toBe(201);
+    const { agreementId, convertedLead } = data(res);
+    expect(convertedLead.leadId).toBe(lead.id);
+    expect(convertedLead.clientName).toBe('Prospect X');
+
+    const agreement = data(await owner.get(`${BASE}/agreements/${agreementId}`));
+    expect(agreement.clientId).toBe(convertedLead.clientId);
+    expect(data(await owner.get(`${BASE}/leads/${lead.id}`)).stage).toBe('converted');
   });
 });

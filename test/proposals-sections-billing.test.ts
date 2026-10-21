@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import supertest from 'supertest';
+import { eq } from 'drizzle-orm';
 import { app, BASE, signupAgency, data, type Agent } from './helpers';
+import { db } from '../src/db/client.js';
+import { proposals } from '../src/db/schema.js';
 
 async function sendForToken(owner: Agent, id: string): Promise<string> {
   const sent = await owner.post(`${BASE}/proposals/${id}/send`).send({ recipientEmail: 'buyer@client.test' });
@@ -191,5 +194,91 @@ describe('proposals: custom sections + per-line billing', () => {
     );
     expect(onLead.leadId).toBe(leadId);
     expect(onLead.clientId).toBeNull();
+  });
+
+  it('converts a proposal that sits on a lead, promoting the lead to a client', async () => {
+    const lead = data(
+      await owner.post(`${BASE}/leads`).send({
+        name: 'Harpreet Aulakh',
+        company: 'Aulakh Hospitality',
+        email: 'harpreet@aulakh.test',
+        source: 'referral',
+      }),
+    );
+    const p = data(
+      await owner.post(`${BASE}/proposals`).send({
+        title: 'Hospitality retainer',
+        leadId: lead.id,
+        clientId: null,
+        content: { scopeOverview: 'Social media', deliverables: [{ title: 'Reels' }] },
+      }),
+    );
+    const sent = await owner
+      .post(`${BASE}/proposals/${p.id}/send`)
+      .send({ recipientEmail: 'harpreet@aulakh.test' });
+    expect(sent.status).toBe(200);
+    const token = String(data(sent).publicUrl).split('/').pop();
+    expect(
+      (await supertest(app).post(`${BASE}/proposals/public/${token}/accept`).send({ acceptedBy: 'Harpreet' })).status,
+    ).toBe(200);
+
+    // The agreement needs a client; the lead becomes one here.
+    const res = await owner.post(`${BASE}/proposals/${p.id}/convert-to-agreement`).send({});
+    expect([200, 201]).toContain(res.status);
+    const body = data(res);
+    expect(body.agreementId).toBeTruthy();
+    expect(body.convertedLead?.leadId).toBe(lead.id);
+    expect(body.convertedLead?.clientName).toBe('Aulakh Hospitality');
+
+    // The new client carries the agreement, and the proposal now points at it.
+    const agreement = data(await owner.get(`${BASE}/agreements/${body.agreementId}`));
+    expect(agreement.clientId).toBe(body.convertedLead.clientId);
+    expect(data(await owner.get(`${BASE}/proposals/${p.id}`)).clientId).toBe(
+      body.convertedLead.clientId,
+    );
+
+    // The lead itself is marked converted and linked to the client.
+    const updatedLead = data(await owner.get(`${BASE}/leads/${lead.id}`));
+    expect(updatedLead.stage).toBe('converted');
+    expect(updatedLead.convertedClientId).toBe(body.convertedLead.clientId);
+  });
+
+  it('reuses the existing client when the lead was already converted', async () => {
+    const lead = data(
+      await owner.post(`${BASE}/leads`).send({ name: 'Second Timer', company: 'Repeat Co' }),
+    );
+    const { clientId: existingClientId } = data(
+      await owner.post(`${BASE}/leads/${lead.id}/convert`).send({}),
+    );
+    const p = data(
+      await owner.post(`${BASE}/proposals`).send({
+        title: 'Repeat work',
+        leadId: lead.id,
+        content: { sections: [] },
+      }),
+    );
+    const sent = await owner
+      .post(`${BASE}/proposals/${p.id}/send`)
+      .send({ recipientEmail: 'repeat@co.test' });
+    const token = String(data(sent).publicUrl).split('/').pop();
+    await supertest(app).post(`${BASE}/proposals/public/${token}/accept`).send({ acceptedBy: 'R' });
+
+    const res = await owner.post(`${BASE}/proposals/${p.id}/convert-to-agreement`).send({});
+    expect([200, 201]).toContain(res.status);
+    // No second client: it adopts the one the lead already produced.
+    expect(data(res).convertedLead).toBeNull();
+    expect(data(await owner.get(`${BASE}/agreements/${data(res).agreementId}`)).clientId).toBe(
+      existingClientId,
+    );
+  });
+
+  it('refuses clearly when there is neither client nor lead', async () => {
+    const p = data(
+      await owner.post(`${BASE}/proposals`).send({ title: 'Orphan', content: { sections: [] } }),
+    );
+    await db.update(proposals).set({ status: 'accepted' }).where(eq(proposals.id, p.id));
+    const res = await owner.post(`${BASE}/proposals/${p.id}/convert-to-agreement`).send({});
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(res.body)).toContain('no client or lead');
   });
 });

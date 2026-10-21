@@ -6,8 +6,6 @@ import {
   leads,
   leadActivities,
   clients,
-  clientContacts,
-  clientNotes,
   users,
   LEAD_STAGES,
 } from '../db/schema.js';
@@ -19,6 +17,7 @@ import { authenticate, getStaffActor, requires } from '../authz/http.js';
 import { authorize, canOrg, capabilities, check, requirePermission } from '../authz/engine.js';
 import { actorAuditId, type Actor } from '../authz/actor.js';
 import { requireActiveStaff } from '../authz/tenancy.js';
+import { convertLeadToClient } from '../services/lead-convert.js';
 import {
   leadFactsOf,
   loadLead,
@@ -507,98 +506,20 @@ leadsRouter.post('/:id/convert', requires('leads.convert', 'clients.create'), as
   const row = lead!.row;
   const body = convertSchema.parse(req.body ?? {});
 
-  // Idempotent: if already converted, return the existing client.
-  if (row.convertedClientId) {
-    return ok(res, { clientId: row.convertedClientId, leadId: row.id, already: true });
-  }
-  if (row.stage === 'lost' || row.stage === 'spam') {
-    throw invalidState(`A ${row.stage} lead cannot be converted.`);
-  }
-
-  const clientId = newId('cli');
-  const newClientName = body.name?.trim() || row.company || row.name;
-  // Keep the account owner only when it is still an active teammate.
-  let ownerId: string = actor.userId;
-  if (row.ownerId) {
-    try {
-      await requireActiveStaff(actor.agencyId, [row.ownerId]);
-      ownerId = row.ownerId;
-    } catch {
-      ownerId = actor.userId;
-    }
-  }
-  // The budget only travels into client notes when the converter may see it.
-  const showValue = check(actor, 'leads.view_value', lead!.facts);
-  const summary = [
-    row.source ? `Source: ${row.source}` : null,
-    row.service ? `Interested in: ${row.service}` : null,
-    showValue && row.budget ? `Budget: ${row.budget}` : null,
-  ]
-    .filter(Boolean)
-    .join(' · ');
-
-  await db.insert(clients).values({
-    id: clientId,
-    agencyId: actor.agencyId,
-    name: newClientName,
-    contactEmail: row.email || null,
-    phone: row.phone || null,
-    ...(body.industry ? { industry: body.industry } : {}),
-    clientSource: 'inbound',
-    ownerId,
-    internalNotes: `Converted from lead — ${row.name}${summary ? ' · ' + summary : ''}`,
+  const result = await convertLeadToClient({
+    actor,
+    lead: row,
+    facts: lead!.facts,
+    name: body.name,
+    industry: body.industry,
   });
+  // Idempotent: an already-converted lead returns its existing client.
+  if (result.already) {
+    return ok(res, { clientId: result.clientId, leadId: row.id, already: true });
+  }
 
-  // Carry the person over as a primary contact.
-  try {
-    await db.insert(clientContacts).values({
-      id: newId('cnt'),
-      agencyId: actor.agencyId,
-      clientId,
-      name: row.name,
-      email: row.email || null,
-      phone: row.phone || null,
-      isPrimary: true,
-    });
-  } catch {}
-
-  // Preserve the original enquiry as a client note.
-  try {
-    const noteBody =
-      [row.message, summary].filter(Boolean).join('\n\n') ||
-      'Converted from an inbound lead.';
-    await db.insert(clientNotes).values({
-      id: newId('nte'),
-      agencyId: actor.agencyId,
-      clientId,
-      authorId: actor.userId,
-      type: 'note',
-      body: noteBody,
-    });
-  } catch {}
-
-  // Flip the lead to converted, keep it linked (history stays on the lead).
-  await db
-    .update(leads)
-    .set({
-      stage: 'converted',
-      convertedClientId: clientId,
-      lastActivityAt: new Date(),
-      updatedAt: new Date(),
-    })
-    .where(and(eq(leads.id, row.id), eq(leads.agencyId, actor.agencyId)));
-
-  await db.insert(leadActivities).values({
-    id: newId('lac'),
-    agencyId: actor.agencyId,
-    leadId: row.id,
-    authorId: actor.userId,
-    type: 'stage_change',
-    body: `Converted to client "${newClientName}"`,
-  });
-  await auditLead(actor, 'lead.convert', row.id, req.ip, { clientId });
-
-  created(res, { clientId, leadId: row.id });
+  await auditLead(actor, 'lead.convert', row.id, req.ip, { clientId: result.clientId });
+  created(res, { clientId: result.clientId, leadId: row.id });
 });
 
 // ============================================================

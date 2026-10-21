@@ -18,6 +18,7 @@ import { audit } from '../services/audit.js';
 import { notifyMany } from '../services/notifications.js';
 import { sendEmail, basicHtml } from '../services/email.js';
 import { getFrontendOrigin } from '../lib/frontend-url.js';
+import { convertLeadToClient } from '../services/lead-convert.js';
 import { broadcastPortalRefresh } from '../realtime/io.js';
 import { authenticate, getStaffActor, requires, requiresAny } from '../authz/http.js';
 import { authorize, canOrg, capabilities, check } from '../authz/engine.js';
@@ -35,6 +36,7 @@ import {
   defaultLinkExpiry,
   deliverViaPortalLogin,
   escapeHtml,
+  loadLead,
   loadProposal,
   mintDocumentLink,
   objectViewerIds,
@@ -643,8 +645,48 @@ authRouter.post(
     authorize(actor, 'proposals.convert', loaded?.facts, { view: 'proposals.view' });
     const p = loaded!.row;
     assertProposalConvertible(p);
-    if (!p.clientId) {
-      throw badRequest('Please convert or assign this proposal to an active client first.');
+
+    // An agreement is signed by a CLIENT, but most proposals are written for a
+    // LEAD — the deal is won at exactly this moment, so promote the lead to a
+    // client here instead of refusing and making the user do it by hand. An
+    // already-converted lead simply reuses its client.
+    let clientId = p.clientId;
+    let convertedLead: { leadId: string; clientId: string; clientName: string } | null = null;
+    if (!clientId) {
+      if (!p.leadId) {
+        throw badRequest(
+          'This proposal has no client or lead. Assign it to one before creating an agreement.',
+        );
+      }
+      const lead = await loadLead(actor, p.leadId);
+      if (!lead) throw badRequest('The lead on this proposal no longer exists.');
+      if (!lead.row.convertedClientId) {
+        // Creating a client from the lead is a real act: hold the permissions
+        // for it, or say plainly what is missing.
+        if (!check(actor, 'leads.convert', lead.facts) || !canOrg(actor, 'clients.create')) {
+          throw forbidden(
+            `"${lead.row.company || lead.row.name}" is still a lead. Converting it to a client needs the lead-conversion and client-creation permissions — ask an owner, or convert the lead from the Leads page first.`,
+          );
+        }
+      }
+      const converted = await convertLeadToClient({ actor, lead: lead.row, facts: lead.facts });
+      clientId = converted.clientId;
+      if (!converted.already) {
+        convertedLead = {
+          leadId: lead.row.id,
+          clientId: converted.clientId,
+          clientName: converted.clientName,
+        };
+        await auditProposal(actor, 'lead.convert', lead.row.id, req.ip, {
+          clientId: converted.clientId,
+          viaProposal: p.id,
+        });
+      }
+      // Keep the proposal pointing at the client it just produced.
+      await db
+        .update(proposals)
+        .set({ clientId, updatedAt: new Date() })
+        .where(and(eq(proposals.id, p.id), eq(proposals.agencyId, actor.agencyId)));
     }
 
     const agreementId = newId('agr');
@@ -704,7 +746,7 @@ authRouter.post(
       await db.insert(agreements).values({
         id: agreementId,
         agencyId: actor.agencyId,
-        clientId: p.clientId,
+        clientId,
         proposalId: p.id,
         agreementNumber,
         title: `Agreement for ${p.title}`,
@@ -727,9 +769,14 @@ authRouter.post(
 
     // Converted is terminal for the client-facing link.
     await revokeDocumentLinks(actor.agencyId, 'proposal', p.id);
-    await auditProposal(actor, 'proposal.convert_to_agreement', p.id, req.ip, { agreementId });
+    await auditProposal(actor, 'proposal.convert_to_agreement', p.id, req.ip, {
+      agreementId,
+      ...(convertedLead ? { convertedLeadId: convertedLead.leadId, clientId } : {}),
+    });
 
-    created(res, { agreementId, agreementNumber });
+    // `convertedLead` lets the UI say that a client was created along the way,
+    // rather than leaving a new client to be discovered by accident.
+    created(res, { agreementId, agreementNumber, convertedLead });
   },
 );
 
