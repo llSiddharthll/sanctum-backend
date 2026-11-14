@@ -48,6 +48,8 @@ import { refrensRouter } from './routes/refrens.js';
 import { intakeRouter } from './routes/intake.js';
 import { socialRouter } from './routes/social.js';
 import { oauthRouter } from './routes/oauth.js';
+import { dashboardRouter } from './routes/dashboard.js';
+import { mountMcp, mcpConnectRouter } from './mcp/router.js';
 
 export function createApp() {
   const app = express();
@@ -56,6 +58,8 @@ export function createApp() {
   app.set('trust proxy', 1);
 
   app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+  // MCP server for AI assistants (bearer-token OAuth; own CORS) — see src/mcp.
+  mountMcp(app);
   app.use(corsMw);
 
   // Self-hosted media (STORAGE_DRIVER=local): the raw-body upload endpoint is
@@ -132,6 +136,8 @@ export function createApp() {
   api.use('/attendance', attendanceRouter);
   api.use('/notifications', notificationsRouter);
   api.use('/crm', crmRouter);
+  api.use('/dashboard', dashboardRouter);
+  api.use('/mcp-connect', mcpConnectRouter);
 
   // Public client portal (token-auth, no cookies).
   api.use('/portal', portalRouter);

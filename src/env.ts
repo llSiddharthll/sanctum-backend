@@ -100,6 +100,12 @@ const envSchema = z.object({
   MEDIA_DIR: z.string().default('./.local-data/media'),
   MEDIA_PUBLIC_BASE: z.string().optional(), // e.g. https://api.creativemonk.in/media
   MEDIA_UPLOAD_BASE: z.string().optional(), // e.g. https://api.creativemonk.in (defaults to request origin)
+  // MCP server (AI assistants). Public origin of this API as MCP clients see it,
+  // e.g. https://api.creativemonk.in (defaults to the request's own origin), and
+  // the web app origin hosting the /connect consent page (defaults to the first
+  // https FRONTEND_ORIGIN).
+  MCP_PUBLIC_URL: z.string().url().optional(),
+  MCP_APP_URL: z.string().url().optional(),
   // How long (days) media stays hot before the archive job may delete it.
   MEDIA_RETENTION_DAYS: z.coerce.number().int().positive().default(60),
   // Weekly auto-archive+delete of media older than the retention window. Off by

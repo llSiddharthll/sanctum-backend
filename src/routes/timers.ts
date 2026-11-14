@@ -1,8 +1,9 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, desc, eq } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, lt } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
+  clients,
   projects,
   projectTasks,
   timeLogs,
@@ -12,16 +13,18 @@ import {
 } from '../db/schema.js';
 import { ok, created, toIso, param } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
-import { notFound, conflict, forbidden } from '../lib/errors.js';
+import { badRequest, notFound, conflict, forbidden } from '../lib/errors.js';
 import { audit } from '../services/audit.js';
 import {
   resolvePolicy,
   dayKeyInTz,
   minutesIntoDayInTz,
+  isWorkingDayKey,
+  weekdayForDayKey,
   type ResolvedPolicy,
 } from '../lib/attendance.js';
-import { authenticate, getActor, requires } from '../authz/http.js';
-import { authorize, check } from '../authz/engine.js';
+import { authenticate, getActor, requires, requiresAny } from '../authz/http.js';
+import { authorize, can, canOrg, check } from '../authz/engine.js';
 import {
   actorAuditId,
   actorUserId,
@@ -527,12 +530,466 @@ timersRouter.get('/active', requires('timers.use'), async (req, res) => {
   ok(res, running ? serializeRunning(running) : null);
 });
 
+
 // ============================================================
-//  PATCH /timers/logs/:logId — edit a logged entry's note.
-//  time_logs.update on the log (own, or organization).
+//  TIMESHEET — day math in the agency's attendance timezone
+// ============================================================
+const dayKeySchema = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, 'Use a YYYY-MM-DD date.')
+  .refine((d) => !Number.isNaN(Date.parse(`${d}T00:00:00Z`)), 'Not a real date.');
+const clockSchema = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Use HH:MM (24h).');
+
+/** Longest range a timesheet query may cover (about a quarter). */
+const MAX_RANGE_DAYS = 92;
+
+async function agencyPolicy(agencyId: string): Promise<ResolvedPolicy> {
+  const [row] = await db
+    .select()
+    .from(attendancePolicy)
+    .where(eq(attendancePolicy.agencyId, agencyId))
+    .limit(1);
+  return resolvePolicy(row ?? null);
+}
+
+/** Offset (ms) of `timezone` from UTC at `instant` (local wall clock − UTC). */
+function tzOffsetMs(instant: Date, timezone: string): number {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).formatToParts(instant);
+  const n = (type: string) => Number(parts.find((p) => p.type === type)?.value ?? '0');
+  const asUtc = Date.UTC(n('year'), n('month') - 1, n('day'), n('hour') % 24, n('minute'), n('second'));
+  return asUtc - Math.floor(instant.getTime() / 1000) * 1000;
+}
+
+/** The UTC instant of local midnight starting `day` in `timezone`. */
+export function dayStartInTz(day: string, timezone: string): Date {
+  const [y, m, d] = day.split('-').map(Number) as [number, number, number];
+  const guess = Date.UTC(y, m - 1, d);
+  let t = guess - tzOffsetMs(new Date(guess), timezone);
+  t = guess - tzOffsetMs(new Date(t), timezone); // settle across a DST edge
+  return new Date(t);
+}
+
+/** `day` shifted by `n` calendar days ('YYYY-MM-DD'). */
+export function addDays(day: string, n: number): string {
+  const [y, m, d] = day.split('-').map(Number) as [number, number, number];
+  return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10);
+}
+
+/** Every day key from `from` to `to` inclusive. */
+function daysBetween(from: string, to: string): string[] {
+  const out: string[] = [];
+  for (let d = from; d <= to; d = addDays(d, 1)) out.push(d);
+  return out;
+}
+
+interface DayRange {
+  from: string;
+  to: string;
+  days: string[];
+  start: Date;
+  /** Exclusive end instant (local midnight after `to`). */
+  end: Date;
+}
+
+/** Resolve ?from&to (defaults: the current Mon–Sun week in the agency tz). */
+function resolveRange(
+  from: string | undefined,
+  to: string | undefined,
+  timezone: string,
+): DayRange {
+  const today = dayKeyInTz(new Date(), timezone);
+  const monday = addDays(today, -((weekdayForDayKey(today) + 6) % 7));
+  const f = from ?? (to ? addDays(to, -6) : monday);
+  const t = to ?? addDays(f, 6);
+  if (f > t) throw badRequest('"from" must be on or before "to".');
+  const days = daysBetween(f, t);
+  if (days.length > MAX_RANGE_DAYS) {
+    throw badRequest(`Pick a range of ${MAX_RANGE_DAYS} days or less.`);
+  }
+  return {
+    from: f,
+    to: t,
+    days,
+    start: dayStartInTz(f, timezone),
+    end: dayStartInTz(addDays(t, 1), timezone),
+  };
+}
+
+/** Expected minutes over the range: full-day minutes × working days. */
+function targetFor(policy: ResolvedPolicy, days: string[]) {
+  const workingDays = days.filter((d) => isWorkingDayKey(policy, d));
+  return {
+    dailyTargetMinutes: policy.fullDayMinutes,
+    workingDays,
+    targetMinutes: workingDays.length * policy.fullDayMinutes,
+  };
+}
+
+/** A staff member of the actor's agency (404 otherwise — never leaks tenants). */
+async function requireAgencyStaff(agencyId: string, userId: string) {
+  const [u] = await db
+    .select({ id: users.id, fullName: users.fullName })
+    .from(users)
+    .where(and(eq(users.id, userId), eq(users.agencyId, agencyId), eq(users.kind, 'staff')))
+    .limit(1);
+  if (!u) throw notFound('Team member not found.');
+  return u;
+}
+
+const logSelection = {
+  id: timeLogs.id,
+  userId: timeLogs.userId,
+  userName: users.fullName,
+  projectId: timeLogs.projectId,
+  projectName: projects.name,
+  clientName: clients.name,
+  taskId: timeLogs.taskId,
+  taskTitle: projectTasks.title,
+  minutes: timeLogs.minutes,
+  workDate: timeLogs.workDate,
+  note: timeLogs.note,
+  createdAt: timeLogs.createdAt,
+};
+
+type LogRow = {
+  id: string;
+  userId: string;
+  userName: string | null;
+  projectId: string | null;
+  projectName: string | null;
+  clientName: string | null;
+  taskId: string | null;
+  taskTitle: string | null;
+  minutes: number;
+  workDate: Date;
+  note: string | null;
+  createdAt: Date;
+};
+
+function logQuery() {
+  return db
+    .select(logSelection)
+    .from(timeLogs)
+    .leftJoin(users, eq(users.id, timeLogs.userId))
+    .leftJoin(projects, eq(projects.id, timeLogs.projectId))
+    .leftJoin(clients, eq(clients.id, projects.clientId))
+    .leftJoin(projectTasks, eq(projectTasks.id, timeLogs.taskId));
+}
+
+function serializeLog(actor: Actor, r: LogRow, timezone: string) {
+  const facts = { agencyId: actor.agencyId, ownerIds: [r.userId] };
+  return {
+    id: r.id,
+    userId: r.userId,
+    userName: r.userName,
+    projectId: r.projectId,
+    projectName: r.projectName,
+    clientName: r.clientName,
+    taskId: r.taskId,
+    taskTitle: r.taskTitle,
+    minutes: r.minutes,
+    workDate: toIso(r.workDate),
+    day: dayKeyInTz(r.workDate, timezone),
+    note: r.note,
+    createdAt: toIso(r.createdAt),
+    capabilities: {
+      'time_logs.update': check(actor, 'time_logs.update', facts),
+      'time_logs.delete': check(actor, 'time_logs.delete', facts),
+    },
+  };
+}
+
+async function fetchLog(actor: Actor, logId: string): Promise<LogRow | null> {
+  const [row] = await logQuery()
+    .where(and(eq(timeLogs.id, logId), eq(timeLogs.agencyId, actor.agencyId)))
+    .limit(1);
+  return (row as LogRow | undefined) ?? null;
+}
+
+/** The project (projects.view) and optional task (tasks.view, in that project). */
+async function requireLoggableTarget(
+  actor: Actor,
+  projectId: string,
+  taskId: string | null | undefined,
+): Promise<void> {
+  const pf = await projectFacts(actor, projectId);
+  authorize(actor, 'projects.view', pf);
+  if (taskId) {
+    const tf = await taskFacts(actor, taskId);
+    authorize(actor, 'tasks.view', tf);
+    if (tf!.task.projectId !== projectId) {
+      throw conflict('Task does not belong to the given project.');
+    }
+  }
+}
+
+/** May the actor see their OWN time (self-service via timers.use, or time_logs.view own). */
+function canSeeOwnTime(actor: Actor, uid: string): boolean {
+  return (
+    can(actor, 'timers.use') ||
+    check(actor, 'time_logs.view', { agencyId: actor.agencyId, ownerIds: [uid] })
+  );
+}
+
+// ============================================================
+//  GET /timers/logs?from&to[&userId] — a person's time entries over a range
+//  (default: this Mon–Sun week, agency timezone), across every project.
+//  Own entries: timers.use or time_logs.view (own). Someone else's: only with
+//  organization-wide time_logs.view (managers/owners), same agency only.
+// ============================================================
+const logsQuerySchema = z.object({
+  from: dayKeySchema.optional(),
+  to: dayKeySchema.optional(),
+  userId: z.string().min(1).optional(),
+});
+
+timersRouter.get('/logs', requiresAny('timers.use', 'time_logs.view'), async (req, res) => {
+  const actor = getActor(req);
+  const uid = requireUserId(actor);
+  const q = logsQuerySchema.parse(req.query);
+  const policy = await agencyPolicy(actor.agencyId);
+  const range = resolveRange(q.from, q.to, policy.timezone);
+
+  const targetId = q.userId ?? uid;
+  let person: { id: string; fullName: string | null };
+  if (targetId === uid) {
+    if (!canSeeOwnTime(actor, uid)) throw forbidden('You cannot view time logs.');
+    person = await requireAgencyStaff(actor.agencyId, uid);
+  } else {
+    if (!canOrg(actor, 'time_logs.view')) {
+      throw forbidden("Only managers can see other people's time.");
+    }
+    person = await requireAgencyStaff(actor.agencyId, targetId);
+  }
+
+  const rows = (await logQuery()
+    .where(
+      and(
+        eq(timeLogs.agencyId, actor.agencyId),
+        eq(timeLogs.userId, targetId),
+        gte(timeLogs.workDate, range.start),
+        lt(timeLogs.workDate, range.end),
+      ),
+    )
+    .orderBy(desc(timeLogs.workDate), desc(timeLogs.createdAt))) as LogRow[];
+
+  const logs = rows.map((r) => serializeLog(actor, r, policy.timezone));
+  const perDay = new Map(range.days.map((d) => [d, 0]));
+  for (const l of logs) perDay.set(l.day, (perDay.get(l.day) ?? 0) + l.minutes);
+
+  ok(res, {
+    from: range.from,
+    to: range.to,
+    timezone: policy.timezone,
+    ...targetFor(policy, range.days),
+    user: { id: person.id, name: person.fullName },
+    totalMinutes: logs.reduce((s, l) => s + l.minutes, 0),
+    days: range.days.map((date) => ({ date, minutes: perDay.get(date) ?? 0 })),
+    logs,
+  });
+});
+
+// ============================================================
+//  GET /timers/summary?from&to — team view: per-person and per-day totals.
+//  Organization-wide time_logs.view only (managers/owners). Running timers
+//  are included per person when the actor also has timers.view (organization).
+// ============================================================
+const summaryQuerySchema = z.object({
+  from: dayKeySchema.optional(),
+  to: dayKeySchema.optional(),
+});
+
+timersRouter.get('/summary', requires('time_logs.view'), async (req, res) => {
+  const actor = getActor(req);
+  if (!canOrg(actor, 'time_logs.view')) {
+    throw forbidden('Only managers can see the team timesheet.');
+  }
+  const q = summaryQuerySchema.parse(req.query);
+  const policy = await agencyPolicy(actor.agencyId);
+  const range = resolveRange(q.from, q.to, policy.timezone);
+
+  const staff = await db
+    .select({ id: users.id, fullName: users.fullName, status: users.status })
+    .from(users)
+    .where(and(eq(users.agencyId, actor.agencyId), eq(users.kind, 'staff')))
+    .orderBy(asc(users.fullName));
+
+  const rows = await db
+    .select({ userId: timeLogs.userId, minutes: timeLogs.minutes, workDate: timeLogs.workDate })
+    .from(timeLogs)
+    .where(
+      and(
+        eq(timeLogs.agencyId, actor.agencyId),
+        gte(timeLogs.workDate, range.start),
+        lt(timeLogs.workDate, range.end),
+      ),
+    );
+
+  type Person = {
+    userId: string;
+    name: string | null;
+    totalMinutes: number;
+    entries: number;
+    days: Record<string, number>;
+    running: { projectName: string | null; taskTitle: string | null; startedAt: string | null } | null;
+  };
+  const blankDays = () => Object.fromEntries(range.days.map((d) => [d, 0])) as Record<string, number>;
+  const people = new Map<string, Person>();
+  for (const u of staff) {
+    if (u.status !== 'active') continue;
+    people.set(u.id, { userId: u.id, name: u.fullName, totalMinutes: 0, entries: 0, days: blankDays(), running: null });
+  }
+  const names = new Map(staff.map((u) => [u.id, u.fullName]));
+  const perDay = new Map(range.days.map((d) => [d, 0]));
+  for (const r of rows) {
+    let p = people.get(r.userId);
+    if (!p) {
+      // Logged time by someone since disabled: still counts toward the totals.
+      p = { userId: r.userId, name: names.get(r.userId) ?? null, totalMinutes: 0, entries: 0, days: blankDays(), running: null };
+      people.set(r.userId, p);
+    }
+    const day = dayKeyInTz(r.workDate, policy.timezone);
+    p.totalMinutes += r.minutes;
+    p.entries += 1;
+    p.days[day] = (p.days[day] ?? 0) + r.minutes;
+    perDay.set(day, (perDay.get(day) ?? 0) + r.minutes);
+  }
+
+  if (canOrg(actor, 'timers.view')) {
+    const running = await db
+      .select({
+        userId: timers.userId,
+        projectName: projects.name,
+        taskTitle: projectTasks.title,
+        startedAt: timers.startedAt,
+      })
+      .from(timers)
+      .leftJoin(projects, eq(projects.id, timers.projectId))
+      .leftJoin(projectTasks, eq(projectTasks.id, timers.taskId))
+      .where(eq(timers.agencyId, actor.agencyId));
+    for (const t of running) {
+      const p = people.get(t.userId);
+      if (p) p.running = { projectName: t.projectName, taskTitle: t.taskTitle, startedAt: toIso(t.startedAt) };
+    }
+  }
+
+  const list = [...people.values()].sort(
+    (a, b) => b.totalMinutes - a.totalMinutes || (a.name ?? '').localeCompare(b.name ?? ''),
+  );
+  ok(res, {
+    from: range.from,
+    to: range.to,
+    timezone: policy.timezone,
+    ...targetFor(policy, range.days),
+    totalMinutes: list.reduce((s, p) => s + p.totalMinutes, 0),
+    days: range.days.map((date) => ({ date, minutes: perDay.get(date) ?? 0 })),
+    people: list,
+  });
+});
+
+// ============================================================
+//  POST /timers/logs — add a manual entry for YOURSELF (forgot the timer).
+//  Self-service like the timer itself: timers.use, or time_logs.create (own).
+//  Give `minutes`, or `startTime` + `endTime` (HH:MM, agency timezone).
+// ============================================================
+const createLogSchema = z
+  .object({
+    projectId: z.string().min(1),
+    taskId: z.string().min(1).nullable().optional(),
+    date: dayKeySchema,
+    minutes: z.number().int().min(1).max(1440).optional(),
+    startTime: clockSchema.optional(),
+    endTime: clockSchema.optional(),
+    note: z.string().trim().max(2000).optional(),
+  })
+  .superRefine((b, ctx) => {
+    if (b.startTime || b.endTime) {
+      if (!b.startTime || !b.endTime) {
+        ctx.addIssue({ code: 'custom', path: ['endTime'], message: 'Give both a start and an end time.' });
+      } else if (b.endTime <= b.startTime) {
+        ctx.addIssue({ code: 'custom', path: ['endTime'], message: 'End time must be after the start time.' });
+      }
+    } else if (b.minutes == null) {
+      ctx.addIssue({ code: 'custom', path: ['minutes'], message: 'Give the time spent, or a start and end time.' });
+    }
+  });
+
+function clockToMinutes(hhmm: string): number {
+  const [h, m] = hhmm.split(':').map(Number) as [number, number];
+  return h * 60 + m;
+}
+
+timersRouter.post('/logs', requiresAny('timers.use', 'time_logs.create'), async (req, res) => {
+  const actor = getActor(req);
+  const uid = requireUserId(actor);
+  const allowed =
+    can(actor, 'timers.use') ||
+    check(actor, 'time_logs.create', { agencyId: actor.agencyId, ownerIds: [uid] });
+  if (!allowed) throw forbidden('You cannot log time.');
+  const body = createLogSchema.parse(req.body);
+  const policy = await agencyPolicy(actor.agencyId);
+
+  if (body.date > dayKeyInTz(new Date(), policy.timezone)) {
+    throw badRequest("You can't log time for a future date.");
+  }
+  await requireLoggableTarget(actor, body.projectId, body.taskId);
+
+  const startMin = body.startTime ? clockToMinutes(body.startTime) : null;
+  const minutes =
+    body.startTime && body.endTime
+      ? clockToMinutes(body.endTime) - clockToMinutes(body.startTime)
+      : body.minutes!;
+  // Anchor the entry inside its day: at the start time, else midday.
+  const workDate = new Date(
+    dayStartInTz(body.date, policy.timezone).getTime() + (startMin ?? 12 * 60) * 60000,
+  );
+
+  const id = newId('tlg');
+  const note = body.note && body.note.length > 0 ? body.note : null;
+  await db.insert(timeLogs).values({
+    id,
+    agencyId: actor.agencyId,
+    userId: uid,
+    projectId: body.projectId,
+    taskId: body.taskId ?? null,
+    minutes,
+    workDate,
+    note,
+  });
+  await audit({
+    agencyId: actor.agencyId,
+    actorType: actor.type,
+    actorId: actorAuditId(actor),
+    action: 'timer.log.create',
+    entityType: 'time_log',
+    entityId: id,
+    metadata: { projectId: body.projectId, taskId: body.taskId ?? null, minutes, manual: true },
+    ip: req.ip,
+  });
+
+  const row = await fetchLog(actor, id);
+  created(res, serializeLog(actor, row!, policy.timezone));
+});
+
+// ============================================================
+//  PATCH /timers/logs/:logId — edit an entry (note, time spent, date,
+//  project/task). time_logs.update on the log (own, or organization).
 // ============================================================
 const editLogSchema = z.object({
-  note: z.string().trim().max(2000).nullable(),
+  note: z.string().trim().max(2000).nullable().optional(),
+  minutes: z.number().int().min(1).max(1440).optional(),
+  date: dayKeySchema.optional(),
+  projectId: z.string().min(1).optional(),
+  taskId: z.string().min(1).nullable().optional(),
 });
 
 timersRouter.patch('/logs/:logId', requires('time_logs.update'), async (req, res) => {
@@ -542,12 +999,36 @@ timersRouter.patch('/logs/:logId', requires('time_logs.update'), async (req, res
   authorize(actor, 'time_logs.update', facts, { view: 'time_logs.view' });
   const existing = facts!.log;
   const body = editLogSchema.parse(req.body);
+  const policy = await agencyPolicy(actor.agencyId);
 
-  const note = body.note && body.note.length > 0 ? body.note : null;
-  await db
-    .update(timeLogs)
-    .set({ note })
-    .where(and(eq(timeLogs.id, logId), eq(timeLogs.agencyId, actor.agencyId)));
+  const patch: Partial<typeof timeLogs.$inferInsert> = {};
+  if (body.note !== undefined) patch.note = body.note && body.note.length > 0 ? body.note : null;
+  if (body.minutes !== undefined) patch.minutes = body.minutes;
+  if (body.date !== undefined) {
+    if (body.date > dayKeyInTz(new Date(), policy.timezone)) {
+      throw badRequest("You can't log time for a future date.");
+    }
+    // Keep the entry's time of day; move it to the new date.
+    const minuteOfDay = minutesIntoDayInTz(existing.workDate, policy.timezone);
+    patch.workDate = new Date(dayStartInTz(body.date, policy.timezone).getTime() + minuteOfDay * 60000);
+  }
+  const projectChanged = body.projectId !== undefined && body.projectId !== existing.projectId;
+  if (projectChanged || body.taskId !== undefined) {
+    const projectId = body.projectId ?? existing.projectId;
+    if (!projectId) throw badRequest('Pick a project for this entry.');
+    // A task that isn't in the new project is dropped unless a new one is given.
+    const taskId = body.taskId !== undefined ? body.taskId : projectChanged ? null : existing.taskId;
+    await requireLoggableTarget(actor, projectId, taskId);
+    patch.projectId = projectId;
+    patch.taskId = taskId ?? null;
+  }
+
+  if (Object.keys(patch).length > 0) {
+    await db
+      .update(timeLogs)
+      .set(patch)
+      .where(and(eq(timeLogs.id, logId), eq(timeLogs.agencyId, actor.agencyId)));
+  }
 
   await audit({
     agencyId: actor.agencyId,
@@ -557,17 +1038,49 @@ timersRouter.patch('/logs/:logId', requires('time_logs.update'), async (req, res
     entityType: 'time_log',
     entityId: logId,
     metadata: {
-      projectId: existing.projectId,
-      taskId: existing.taskId,
+      projectId: patch.projectId ?? existing.projectId,
+      taskId: patch.taskId !== undefined ? patch.taskId : existing.taskId,
+      fields: Object.keys(patch),
+      ...(patch.minutes !== undefined ? { minutes: patch.minutes, previousMinutes: existing.minutes } : {}),
       ...(existing.userId !== actorUserId(actor) ? { logUserId: existing.userId } : {}),
     },
     ip: req.ip,
   });
 
-  ok(res, {
-    id: logId,
-    note,
-    projectId: existing.projectId,
-    taskId: existing.taskId,
+  const row = await fetchLog(actor, logId);
+  ok(res, serializeLog(actor, row!, policy.timezone));
+});
+
+// ============================================================
+//  DELETE /timers/logs/:logId — remove an entry.
+//  time_logs.delete on the log (own, or organization).
+// ============================================================
+timersRouter.delete('/logs/:logId', requires('time_logs.delete'), async (req, res) => {
+  const actor = getActor(req);
+  const logId = param(req, 'logId');
+  const facts = await timeLogFacts(actor, logId);
+  authorize(actor, 'time_logs.delete', facts, { view: 'time_logs.view' });
+  const existing = facts!.log;
+
+  await db
+    .delete(timeLogs)
+    .where(and(eq(timeLogs.id, logId), eq(timeLogs.agencyId, actor.agencyId)));
+
+  await audit({
+    agencyId: actor.agencyId,
+    actorType: actor.type,
+    actorId: actorAuditId(actor),
+    action: 'timer.log.delete',
+    entityType: 'time_log',
+    entityId: logId,
+    metadata: {
+      projectId: existing.projectId,
+      taskId: existing.taskId,
+      minutes: existing.minutes,
+      ...(existing.userId !== actorUserId(actor) ? { logUserId: existing.userId } : {}),
+    },
+    ip: req.ip,
   });
+
+  ok(res, { id: logId, deleted: true });
 });

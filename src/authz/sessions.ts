@@ -83,6 +83,8 @@ export async function createSession(input: {
   /** Hard cap (e.g. the share link's own expiry). */
   notAfter?: Date | null;
   req?: Request;
+  /** Overrides the stored user agent (e.g. "AI connector · Claude" for MCP sessions). */
+  userAgent?: string;
 }): Promise<IssuedSession> {
   const ttl =
     input.actorType === 'portal_link' ? LINK_SESSION_TTL_SECONDS : USER_SESSION_TTL_SECONDS;
@@ -100,7 +102,7 @@ export async function createSession(input: {
     expiresAt,
     lastSeenAt: new Date(),
     ip: input.req?.ip ?? null,
-    userAgent: input.req?.headers['user-agent']?.slice(0, 300) ?? null,
+    userAgent: (input.userAgent ?? input.req?.headers['user-agent'])?.slice(0, 300) ?? null,
   });
   const access = await signSessionAccessToken({
     sessionId,
@@ -202,6 +204,19 @@ export async function rotateRefresh(
 }
 
 // ------------------------------------------------------------ revocation
+
+/** Revoke the session a raw refresh token belongs to (OAuth token revocation). */
+export async function revokeSessionByRefreshToken(rawRefresh: string, reason: string): Promise<boolean> {
+  const hash = hashToken(rawRefresh);
+  const [row] = await db
+    .select({ id: sessions.id })
+    .from(sessions)
+    .where(eq(sessions.refreshHash, hash))
+    .limit(1);
+  if (!row) return false;
+  await revokeSessions([row.id], reason);
+  return true;
+}
 
 let onRevoked: ((sessionIds: string[]) => void) | undefined;
 export function setSessionRevokeHook(fn: (sessionIds: string[]) => void): void {
