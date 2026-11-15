@@ -9,19 +9,20 @@ import {
   projects,
   projectTasks,
   projectMilestones,
+  users,
 } from '../db/schema.js';
 import { ok, created } from '../lib/http.js';
 import { newId } from '../lib/ids.js';
 import { notFound } from '../lib/errors.js';
 import { aiLimiter } from '../middleware/rate-limit.js';
-import { authenticate, getStaffActor, requires } from '../authz/http.js';
+import { authenticate, getStaffActor, readAccessToken, requires } from '../authz/http.js';
+import { runAgent } from '../services/ai-agent.js';
 import { authorize, canOrg, check, type ObjectFacts } from '../authz/engine.js';
 import type { StaffActor } from '../authz/actor.js';
 import { clientFacts, clientScopeFilter } from '../authz/policies/clients.js';
 import {
   DOCUMENT_TYPES,
   REPURPOSE_TARGETS,
-  generateChatReply,
   generateDocument,
   generateTaskBreakdown,
   generateCaptions,
@@ -172,6 +173,12 @@ const chatSchema = z.object({
     .min(1),
   projectId: z.string().min(1).optional(),
   clientId: z.string().min(1).optional(),
+  /** Pathname the person is viewing (helps "this project" questions). */
+  page: z.string().max(300).optional(),
+  /** Run a create/update/delete the assistant proposed and the person confirmed. */
+  confirm: z
+    .object({ tool: z.string().min(1).max(80), args: z.record(z.string(), z.unknown()) })
+    .optional(),
 });
 
 /**
@@ -322,12 +329,26 @@ aiAssistantRouter.post('/chat', requires('ai.use_assistant'), aiLimiter, async (
     body.projectId,
     body.clientId,
   );
-  const result = await generateChatReply({
-    systemContext,
+  const [me] = await db
+    .select({ fullName: users.fullName })
+    .from(users)
+    .where(eq(users.id, ctx.userId))
+    .limit(1);
+
+  // Agent: looks things up with the person's own permissions; changes come
+  // back as `pendingAction` and only run once confirmed (body.confirm).
+  const result = await runAgent({
+    actor: ctx,
+    token: readAccessToken(req)!,
+    clientIp: req.ip,
     messages: body.messages,
+    systemContext,
+    page: body.page,
+    userName: me?.fullName ?? null,
+    confirm: body.confirm,
   });
 
-  ok(res, { reply: result.reply, source: result.source });
+  ok(res, result);
 });
 
 // ============================================================
