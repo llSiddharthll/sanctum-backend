@@ -48,6 +48,32 @@ async function loadType(actor: StaffActor, id: string) {
   return row;
 }
 
+/** Leave types a workspace starts with (editable in Settings → Attendance policy). */
+const DEFAULT_LEAVE_TYPES = [
+  { name: 'Casual', colorToken: 'sky', paid: true, annualQuota: 12, sortOrder: 0 },
+  { name: 'Sick', colorToken: 'rose', paid: true, annualQuota: 12, sortOrder: 1 },
+  { name: 'Earned', colorToken: 'pine', paid: true, annualQuota: 18, sortOrder: 2 },
+  // annualQuota 0 = no limit.
+  { name: 'Unpaid', colorToken: 'slate', paid: false, annualQuota: 0, sortOrder: 3 },
+];
+
+/**
+ * A workspace that never set up leave types gets the defaults, so people can
+ * apply for leave straight away. Idempotent and race-safe (unique agency+name).
+ */
+export async function ensureDefaultLeaveTypes(agencyId: string): Promise<void> {
+  const [existing] = await db
+    .select({ id: leaveTypes.id })
+    .from(leaveTypes)
+    .where(eq(leaveTypes.agencyId, agencyId))
+    .limit(1);
+  if (existing) return;
+  await db
+    .insert(leaveTypes)
+    .values(DEFAULT_LEAVE_TYPES.map((t) => ({ id: newId('lvt'), agencyId, active: true, ...t })))
+    .onConflictDoNothing();
+}
+
 // ============================================================
 //  LEAVE TYPES
 // ============================================================
@@ -56,6 +82,7 @@ leavesRouter.get(
   requiresAny('leaves.request', 'leaves.view', 'leave_types.manage'),
   async (req, res) => {
     const actor = getStaffActor(req);
+    await ensureDefaultLeaveTypes(actor.agencyId);
     const rows = await db
       .select()
       .from(leaveTypes)
@@ -314,6 +341,7 @@ leavesRouter.get('/', requires('leaves.view'), async (req, res) => {
 // `remaining` = quota − used − pending (what can still be requested).
 leavesRouter.get('/balances', requires('leaves.view'), async (req, res) => {
   const actor = getStaffActor(req);
+  await ensureDefaultLeaveTypes(actor.agencyId);
   const userId = await resolveSubjectForRead(
     actor,
     'leaves.view',

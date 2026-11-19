@@ -14,6 +14,12 @@ describe('MCP tools — end-to-end workflow', () => {
   let memberToken: string;
   const today = new Date().toISOString().slice(0, 10);
   const inDays = (n: number) => new Date(Date.now() + n * 86_400_000).toISOString().slice(0, 10);
+  /** First Monday–Friday on or after n days from now (leave can't start on a weekend). */
+  const weekdayIn = (n: number) => {
+    const d = new Date(Date.now() + n * 86_400_000);
+    while (d.getUTCDay() === 0 || d.getUTCDay() === 6) d.setUTCDate(d.getUTCDate() + 1);
+    return d.toISOString().slice(0, 10);
+  };
   const ids: Record<string, string> = {};
 
   beforeAll(async () => {
@@ -134,11 +140,11 @@ describe('MCP tools — end-to-end workflow', () => {
     if (typeList.length) {
       const leave = await useTool(memberToken, 'leaves_apply', {
         leaveTypeId: typeList[0].id,
-        startDay: inDays(10),
-        endDay: inDays(10),
+        startDay: weekdayIn(10),
+        endDay: weekdayIn(10),
         reason: 'Family function',
       });
-      await t('leaves_decide', { leaveId: leave.id, decision: 'approve' });
+      await t('leaves_decide', { leaveId: leave.id, decision: 'approved' });
     }
     await t('documents_add_link', { name: 'Brand guidelines', fileUrl: 'https://example.com/brand.pdf', clientId: ids.client });
 

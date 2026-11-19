@@ -1032,7 +1032,13 @@ export const ROLE_TEMPLATES: RoleTemplate[] = [
   {
     key: 'manager', name: 'Manager', actorType: 'staff', colorToken: 'ocean',
     description: 'Runs delivery: clients, projects, content, attendance approvals and messages. No finance, business or agency settings.',
-    grants: grantsFromLegacy({ role: 'member', levels: MANAGER_LEVELS }),
+    // Managers approve their team's leave (the member baseline alone only lets
+    // them see and request their own).
+    grants: [
+      ...grantsFromLegacy({ role: 'member', levels: MANAGER_LEVELS }),
+      g('leaves.view', 'organization'),
+      g('leaves.approve', 'organization'),
+    ],
   },
   {
     key: 'employee', name: 'Employee', actorType: 'staff', colorToken: 'pine',
