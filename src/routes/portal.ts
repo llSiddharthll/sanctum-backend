@@ -48,6 +48,7 @@ import {
   postFactsFromRow,
   requireClientSide,
 } from '../authz/policies/client-portal.js';
+import { normalizePlatforms } from '../lib/platforms.js';
 
 /**
  * Share-link API (`Authorization: Bearer pzt_…`, no session). The token is
@@ -473,7 +474,7 @@ portalRouter.get('/resolve', async (req, res) => {
       id: post.id,
       postType: post.postType,
       caption: post.caption,
-      platforms: safeArr(post.platformsJson),
+      platforms: normalizePlatforms(safeArr(post.platformsJson)),
       scheduledAt: toIso(post.scheduledAt),
       status: post.status,
       media: (mediaByPost.get(post.id) ?? []).map((m) => ({
@@ -527,7 +528,7 @@ portalRouter.get('/posts/:postId', async (req, res) => {
     id: post.id,
     postType: post.postType,
     caption: post.caption,
-    platforms: safeArr(post.platformsJson),
+    platforms: normalizePlatforms(safeArr(post.platformsJson)),
     scheduledAt: toIso(post.scheduledAt),
     status: post.status,
     media: media.map((m) => ({

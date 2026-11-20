@@ -19,6 +19,7 @@ import type { StaffActor } from '../authz/actor.js';
 import { canOrg, check, requirePermission, type ObjectFacts } from '../authz/engine.js';
 import { clientFacts, isAssignedToClient } from '../authz/policies/clients.js';
 import { isProjectMember, postFactsMany, taskFactsMany } from '../authz/policies/sheets.js';
+import { normalizePlatforms } from '../lib/platforms.js';
 
 /**
  * Publish a "content calendar" sheet: each row with a date becomes a content
@@ -77,6 +78,14 @@ function makeDate(year: number, mon: number, day: number): Date | null {
   return d;
 }
 
+/** Year for a date typed without one: this year, or next year if it's >2 months past. */
+function withInferredYear(mon: number, day: number, now = new Date()): Date | null {
+  const year = now.getUTCFullYear();
+  const d = makeDate(year, mon, day);
+  if (!d) return null;
+  return d.getTime() < now.getTime() - 60 * 86_400_000 ? makeDate(year + 1, mon, day) : d;
+}
+
 /**
  * Parse a calendar-cell date, permissively, across the formats people actually
  * type. Numeric dates are day-first (DD-MM-YYYY — the Indian default the grid
@@ -115,7 +124,24 @@ export function parseDate(raw: unknown): Date | null {
     return makeDate(fullYear(+m[3]), MONTHS[m[1].toLowerCase()], +m[2]);
   }
 
-  // Fallback: let the JS engine try (ISO datetimes, RFC strings, etc.).
+  // No year typed ("4 Nov", "Nov 4", "4/11"): the JS engine would invent 2001.
+  // A content calendar is about now, so use this year — or next year when the
+  // date is already well past (e.g. typing "5 Jan" in December).
+  m = /^(\d{1,2})(?:st|nd|rd|th)?[\s.\-]+([A-Za-z]+)\.?$/.exec(s);
+  if (m && MONTHS[m[2].toLowerCase()]) return withInferredYear(MONTHS[m[2].toLowerCase()], +m[1]);
+  m = /^([A-Za-z]+)\.?[\s.\-]+(\d{1,2})(?:st|nd|rd|th)?$/.exec(s);
+  if (m && MONTHS[m[1].toLowerCase()]) return withInferredYear(MONTHS[m[1].toLowerCase()], +m[2]);
+  m = /^(\d{1,2})[/.](\d{1,2})$/.exec(s);
+  if (m) {
+    let day = +m[1];
+    let mon = +m[2];
+    if (day <= 12 && mon > 12) [day, mon] = [mon, day];
+    return withInferredYear(mon, day);
+  }
+
+  // Fallback: let the JS engine try (ISO datetimes, RFC strings, etc.), but only
+  // when a 4-digit year is present — otherwise it silently picks 2001.
+  if (!/\b(19|20)\d{2}\b/.test(s)) return null;
   const d = new Date(s);
   return Number.isNaN(d.getTime()) ? null : d;
 }
@@ -436,7 +462,8 @@ export async function publishCalendarSheet(
       .toLowerCase();
     // Platform + Assignee are multi-select in the grid: one cell can hold
     // several comma-separated choices.
-    const platforms = splitMulti(val(row, platformCol));
+    // "Instagram, FB" → ['instagram', 'facebook'] — the form and publisher only know canonical keys.
+    const platforms = normalizePlatforms(splitMulti(val(row, platformCol)));
     const pickedAssignees = splitMulti(val(row, assigneeCol)).filter((u) => staffIds.has(u));
 
     // Already published? Via the durable table, or adopted from a legacy row.

@@ -26,6 +26,7 @@ import {
   type PostRow,
   type PostStatus,
 } from '../authz/policies/posts.js';
+import { normalizePlatforms } from '../lib/platforms.js';
 
 // mergeParams so :clientId from the parent mount is available here.
 // Mounted at /clients/:clientId/posts; the clients router no longer gates
@@ -44,7 +45,7 @@ function serializePost(
     clientId: p.clientId,
     postType: p.postType,
     caption: p.caption,
-    platforms: safeArr(p.platformsJson),
+    platforms: normalizePlatforms(safeArr(p.platformsJson)),
     scheduledAt: toIso(p.scheduledAt),
     status: p.status,
     createdBy: p.createdBy,
@@ -272,7 +273,7 @@ postsRouter.post('/', requires('posts.create'), async (req, res) => {
     clientId,
     postType: body.postType,
     caption: body.caption ?? null,
-    platformsJson: JSON.stringify(body.platforms),
+    platformsJson: JSON.stringify(normalizePlatforms(body.platforms)),
     scheduledAt: body.scheduledAt ? new Date(body.scheduledAt) : null,
     status: 'draft',
     createdBy: actor.userId,
@@ -357,7 +358,7 @@ postsRouter.patch('/:postId', requires('posts.update'), async (req, res) => {
     contentChanged = true;
   }
   if (body.platforms !== undefined) {
-    const next = JSON.stringify(body.platforms);
+    const next = JSON.stringify(normalizePlatforms(body.platforms));
     if (next !== JSON.stringify(safeArr(post.platformsJson))) {
       patch.platformsJson = next;
       contentChanged = true;

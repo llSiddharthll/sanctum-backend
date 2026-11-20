@@ -34,6 +34,7 @@ import { audit } from './audit.js';
 import { actorAuditId, systemActor } from '../authz/actor.js';
 import { can } from '../authz/engine.js';
 import { postApprovalIsValid } from '../authz/policies/posts.js';
+import { normalizePlatform } from '../lib/platforms.js';
 
 /** Explicit, minimal grant of the auto-publish job (design §I.4). */
 export const AUTO_PUBLISH_GRANTS = [{ permission: 'posts.publish', scope: 'organization' as const }];
@@ -72,7 +73,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 function platformsOf(json: string): Set<string> {
   try {
     const a = JSON.parse(json);
-    return new Set(Array.isArray(a) ? a.map((p) => String(p).trim().toLowerCase()) : []);
+    return new Set(Array.isArray(a) ? a.map((p) => normalizePlatform(p) ?? String(p).trim().toLowerCase()) : []);
   } catch {
     return new Set();
   }

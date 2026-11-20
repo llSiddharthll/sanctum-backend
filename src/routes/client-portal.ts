@@ -67,6 +67,7 @@ import {
   notifyPortalActivity,
 } from './portal.js';
 import { broadcastPortalRefresh } from '../realtime/io.js';
+import { normalizePlatforms } from '../lib/platforms.js';
 
 /**
  * Client-portal API for CLIENT-SIDE actors only: logged-in client users
@@ -109,7 +110,7 @@ function safePlatforms(json: string | null): string[] {
   if (!json) return [];
   try {
     const v = JSON.parse(json);
-    return Array.isArray(v) ? v.map(String) : [];
+    return Array.isArray(v) ? normalizePlatforms(v) : [];
   } catch {
     return [];
   }
