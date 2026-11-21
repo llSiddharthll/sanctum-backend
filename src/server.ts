@@ -1,7 +1,8 @@
 import http from 'node:http';
 import { createApp } from './app.js';
 import { env } from './env.js';
-import { ensurePragmas } from './db/client.js';
+import { applyDataPatches } from './db/data-patches.js';
+import { ensurePragmas, libsql } from './db/client.js';
 import { initSocket } from './realtime/socket.js';
 import { startScheduler } from './services/scheduler.js';
 import { migrateAllAgencies } from './authz/migrate-legacy.js';
@@ -10,6 +11,9 @@ import { purgeInvalidGrants, syncOwnerRoles } from './authz/roles-store.js';
 async function main() {
   // Enable SQLite FK enforcement before serving traffic (best-effort).
   await ensurePragmas();
+
+  // Run-once data fixes (role defaults, small additive tables).
+  await applyDataPatches(libsql, (m) => console.log(m));
 
   // Authorization bootstrap (idempotent): migrate legacy RBAC for agencies that
   // haven't been migrated, keep Owner roles in sync with the catalog, and drop

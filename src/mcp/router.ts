@@ -97,7 +97,8 @@ const mcpHandler: RequestHandler = async (req, res) => {
     });
     return;
   }
-  const token = req.auth!.token;
+  // `auth` is set by the MCP SDK's requireBearerAuth (OAuth token info), not the legacy session context.
+  const { token } = (req as unknown as { auth: { token: string } }).auth;
   const { actor } = await actorFromAccessToken(token);
   if (actor.type !== 'staff') {
     res.status(403).json({ jsonrpc: '2.0', error: { code: -32001, message: 'Team members only.' }, id: null });

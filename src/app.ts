@@ -40,6 +40,7 @@ import { attendanceRouter } from './routes/attendance.js';
 import { notificationsRouter } from './routes/notifications.js';
 import { crmRouter } from './routes/crm.js';
 import { meRouter } from './routes/me.js';
+import { todosRouter } from './routes/todos.js';
 import { pushRouter } from './routes/push.js';
 import { proposalsRouter } from './routes/proposals.js';
 import { agreementsRouter } from './routes/agreements.js';
@@ -112,6 +113,8 @@ export function createApp() {
   api.use('/client', clientPortalRouter);
   api.use('/projects', projectsRouter);
   api.use('/timers', timersRouter);
+  // Self-service private checklist ("My to-dos").
+  api.use('/me/todos', todosRouter);
   api.use('/me', meRouter);
   api.use('/push', pushRouter);
   api.use('/intake', intakeRouter);

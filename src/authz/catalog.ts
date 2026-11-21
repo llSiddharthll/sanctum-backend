@@ -1043,7 +1043,8 @@ export const ROLE_TEMPLATES: RoleTemplate[] = [
   {
     key: 'employee', name: 'Employee', actorType: 'staff', colorToken: 'pine',
     description: 'Does the work: own and assigned tasks, time tracking, content, documents, attendance.',
-    grants: grantsFromLegacy({ role: 'member', levels: EMPLOYEE_LEVELS }),
+    // Employees can add tasks to any project they can see (not only their own).
+    grants: [...grantsFromLegacy({ role: 'member', levels: EMPLOYEE_LEVELS }), g('tasks.create', 'organization')],
   },
   {
     key: 'accountant', name: 'Accountant', actorType: 'staff', colorToken: 'brass',
@@ -1135,7 +1136,8 @@ export const SYSTEM_ROLES: SystemRoleDef[] = [
   {
     key: 'employee', name: 'Employee', actorType: 'staff', locked: false, colorToken: 'pine',
     description: 'Default role for new team members.',
-    grants: () => grantsFromLegacy({ role: 'member', levels: EMPLOYEE_LEVELS }),
+    // Employees can add tasks to any project they can see (not only their own).
+    grants: () => [...grantsFromLegacy({ role: 'member', levels: EMPLOYEE_LEVELS }), g('tasks.create', 'organization')],
   },
   {
     key: 'client_approver', name: 'Client (approver)', actorType: 'client', locked: false, colorToken: 'rose',

@@ -2711,3 +2711,30 @@ export type RolePermission = typeof rolePermissions.$inferSelect;
 export type UserRole = typeof userRoles.$inferSelect;
 export type UserPermissionOverride = typeof userPermissionOverrides.$inferSelect;
 export type Session = typeof sessions.$inferSelect;
+
+// ============================================================
+//  PERSONAL_TODOS ("My to-dos": a private checklist per team member)
+//  Created on existing databases by data patch 2026-11-22-personal-todos.
+// ============================================================
+export const personalTodos = sqliteTable(
+  t('personal_todos'),
+  {
+    id: text('id').primaryKey(),
+    agencyId: text('agency_id')
+      .notNull()
+      .references(() => agencies.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    title: text('title').notNull(),
+    notes: text('notes'),
+    /** YYYY-MM-DD, optional. */
+    dueDay: text('due_day'),
+    done: integer('done', { mode: 'boolean' }).notNull().default(false),
+    doneAt: ts('done_at'),
+    sortOrder: integer('sort_order').notNull().default(0),
+    createdAt: ts('created_at').notNull().default(now),
+    updatedAt: ts('updated_at').notNull().default(now),
+  },
+  (tbl) => [index('ix_personal_todos_user').on(tbl.agencyId, tbl.userId, tbl.done)],
+);

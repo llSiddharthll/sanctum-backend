@@ -30,6 +30,10 @@ export default async function setup() {
     }
   }
 
+  // Run-once data patches (as the server does at start-up).
+  const { applyDataPatches } = await import('../src/db/data-patches.js');
+  await applyDataPatches(db);
+
   // Plan catalog — signup attaches the first plan (lowest sort_order) as a
   // trial subscription. Client/team caps are raised so integration suites can
   // create many fixtures in one tenant without hitting QUOTA_EXCEEDED; the AI
