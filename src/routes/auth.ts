@@ -31,7 +31,7 @@ import {
 } from '../lib/errors.js';
 import { env } from '../env.js';
 import { REFRESH_COOKIE } from '../middleware/auth.js';
-import { authLimiter } from '../middleware/rate-limit.js';
+import { authLimiter, loginLimiter, refreshLimiter } from '../middleware/rate-limit.js';
 import { audit } from '../services/audit.js';
 import {
   authenticate,
@@ -179,7 +179,7 @@ const loginSchema = z.object({
   password: z.string().min(1),
 });
 
-authRouter.post('/login', authLimiter, async (req, res) => {
+authRouter.post('/login', authLimiter, loginLimiter, async (req, res) => {
   const body = loginSchema.parse(req.body);
   const email = body.email.toLowerCase();
 
@@ -488,7 +488,7 @@ function readRefreshToken(req: Request): string | undefined {
 }
 
 // POST /auth/refresh — rotate the refresh token; reuse revokes the session.
-authRouter.post('/refresh', authLimiter, async (req, res) => {
+authRouter.post('/refresh', refreshLimiter, async (req, res) => {
   const token = readRefreshToken(req);
   if (!token) throw unauthenticated('No refresh token.');
 

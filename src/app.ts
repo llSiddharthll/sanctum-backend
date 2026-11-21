@@ -10,7 +10,7 @@ import {
   notFoundHandler,
   requestId,
 } from './middleware/error.js';
-import { globalLimiter } from './middleware/rate-limit.js';
+import { globalIpLimiter, globalLimiter } from './middleware/rate-limit.js';
 
 import { healthRouter } from './routes/health.js';
 import { authRouter } from './routes/auth.js';
@@ -84,7 +84,8 @@ export function createApp() {
   app.use('/health', healthRouter);
 
   const api = express.Router();
-  api.use(globalLimiter);
+  // Per person (session), with a generous per-IP backstop — see rate-limit.ts.
+  api.use(globalIpLimiter, globalLimiter);
 
   // Staff surfaces reject client users / share links (they use /client, /portal).
   api.use(
