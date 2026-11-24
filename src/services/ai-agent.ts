@@ -15,6 +15,7 @@ import type { StaffActor } from '../authz/actor.js';
 import { createApiClient, type ApiClient } from '../mcp/api-client.js';
 import { explainError, visibleTools } from '../mcp/server.js';
 import type { SanctumTool, ToolKind } from '../mcp/tool-kit.js';
+import { geminiGenerate } from './gemini-client.js';
 
 export interface AgentMessage {
   role: 'user' | 'assistant';
@@ -60,6 +61,11 @@ export interface AgentInput {
 }
 
 const MAX_STEPS = 6;
+/** Longest a single model call may take before the next model is tried. */
+const STEP_TIMEOUT_MS = 20_000;
+/** The whole answer (all steps) must be ready within this, so the app never
+ *  waits on a stuck model. */
+const TURN_BUDGET_MS = 60_000;
 const MAX_TOOLS = 64;
 const MAX_RESULT_CHARS = 14_000;
 
@@ -200,38 +206,30 @@ function declarations(tools: SanctumTool[]) {
   });
 }
 
-async function callGemini(system: string, contents: GeminiContent[], tools: SanctumTool[]): Promise<GeminiReply | null> {
+async function callGemini(
+  system: string,
+  contents: GeminiContent[],
+  tools: SanctumTool[],
+  deadline: number,
+): Promise<GeminiReply | null> {
   if (!aiEnabled || !env.GEMINI_API_KEY || env.AI_PROVIDER !== 'gemini') return null;
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(env.GEMINI_MODEL)}:generateContent`;
-  const send = () =>
-    fetch(url, {
-      method: 'POST',
-      headers: { 'X-goog-api-key': env.GEMINI_API_KEY!, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: system }] },
-        contents,
-        tools: tools.length ? [{ functionDeclarations: declarations(tools) }] : undefined,
-        toolConfig: tools.length ? { functionCallingConfig: { mode: 'AUTO' } } : undefined,
-        generationConfig: { temperature: 0.3 },
-      }),
-    });
-  try {
-    let resp = await send();
-    // Older model versions only accept the OpenAPI-subset `parameters` field.
-    if (resp.status === 400 && !useLegacyParameters) {
-      const text = await resp.text();
-      if (/parametersJsonSchema|Unknown name|Invalid JSON payload/i.test(text)) {
-        useLegacyParameters = true;
-        resp = await send();
-      } else {
-        return null;
-      }
+  const body = () => ({
+    systemInstruction: { parts: [{ text: system }] },
+    contents,
+    tools: tools.length ? [{ functionDeclarations: declarations(tools) }] : undefined,
+    toolConfig: tools.length ? { functionCallingConfig: { mode: 'AUTO' } } : undefined,
+    generationConfig: { temperature: 0.3 },
+  });
+  // Falls back to other models and gives up at `deadline` (gemini-client.ts).
+  let res = await geminiGenerate(body(), { timeoutMs: STEP_TIMEOUT_MS, deadline });
+  // Older model versions only accept the OpenAPI-subset `parameters` field.
+  if (!res.ok && res.status === 400 && !useLegacyParameters) {
+    if (/parametersJsonSchema|Unknown name|Invalid JSON payload/i.test(res.text)) {
+      useLegacyParameters = true;
+      res = await geminiGenerate(body(), { timeoutMs: STEP_TIMEOUT_MS, deadline });
     }
-    if (!resp.ok) return null;
-    return (await resp.json()) as GeminiReply;
-  } catch {
-    return null;
   }
+  return res.ok ? (res.json as GeminiReply) : null;
 }
 
 // ------------------------------------------------------------ tool execution
@@ -475,8 +473,10 @@ export async function runAgent(input: AgentInput): Promise<AgentResult> {
   const system = systemPrompt(input);
   const contents = toContents(messages);
 
+  const deadline = Date.now() + TURN_BUDGET_MS;
   for (let i = 0; i < MAX_STEPS; i++) {
-    const reply = await callGemini(system, contents, tools);
+    if (deadline - Date.now() < 3_000) break;
+    const reply = await callGemini(system, contents, tools, deadline);
     const content = reply?.candidates?.[0]?.content;
     if (!content) break;
     const parts = content.parts ?? [];

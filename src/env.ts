@@ -158,6 +158,9 @@ const envSchema = z.object({
   // local template generator instead of failing.
   GEMINI_API_KEY: z.string().optional(),
   GEMINI_MODEL: z.string().default('gemini-flash-latest'),
+  // Tried in order when GEMINI_MODEL is overloaded (503/429), erroring or
+  // too slow. Comma-separated; empty disables fallback.
+  GEMINI_FALLBACK_MODELS: z.string().default('gemini-2.5-flash,gemini-2.5-flash-lite'),
 
   // Which provider to prefer. 'gemini' is the only live provider; any other
   // value forces the deterministic fallback. Kept for forward-compat.

@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { env, aiEnabled } from '../env.js';
+import { geminiGenerate } from './gemini-client.js';
 
 /**
  * AI content generation for monthly content calendars.
@@ -199,27 +200,18 @@ async function tryGemini(
     return null;
   }
 
-  const model = env.GEMINI_MODEL;
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-    model,
-  )}:generateContent`;
   const prompt = buildPrompt(input);
 
   try {
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'X-goog-api-key': env.GEMINI_API_KEY,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-      }),
-    });
+    // A month plan is a long answer: allow more time per model.
+    const res = await geminiGenerate(
+      { contents: [{ parts: [{ text: prompt }] }] },
+      { timeoutMs: 60_000, deadline: Date.now() + 100_000 },
+    );
+    if (!res.ok) return null;
+    const model = res.model;
 
-    if (!resp.ok) return null;
-
-    const json = (await resp.json()) as GeminiResponse;
+    const json = res.json as GeminiResponse;
     const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
     if (typeof text !== 'string' || !text.trim()) return null;
 
@@ -383,19 +375,9 @@ async function callGeminiText(opts: {
     return null;
   }
 
-  const model = env.GEMINI_MODEL;
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-    model,
-  )}:generateContent`;
-
   try {
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'X-goog-api-key': env.GEMINI_API_KEY,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
+    const res = await geminiGenerate(
+      {
         ...(opts.system
           ? { systemInstruction: { parts: [{ text: opts.system }] } }
           : {}),
@@ -403,12 +385,12 @@ async function callGeminiText(opts: {
           role: c.role,
           parts: [{ text: c.text }],
         })),
-      }),
-    });
+      },
+      { timeoutMs: 30_000, deadline: Date.now() + 75_000 },
+    );
+    if (!res.ok) return null;
 
-    if (!resp.ok) return null;
-
-    const json = (await resp.json()) as GeminiResponse;
+    const json = res.json as GeminiResponse;
     const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
     if (typeof text !== 'string' || !text.trim()) return null;
     return text;
