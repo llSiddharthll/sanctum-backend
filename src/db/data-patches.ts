@@ -47,6 +47,16 @@ export const DATA_PATCHES: DataPatch[] = [
       `CREATE INDEX IF NOT EXISTS ix_personal_todos_user ON sanctum_personal_todos (agency_id, user_id, done)`,
     ],
   },
+  {
+    // Dates sent as null were stored as 1 Jan 1970 (epoch 0): tasks created on
+    // the web without a due date showed as overdue. No real record is due then.
+    key: '2026-11-24-clear-epoch-dates',
+    statements: [
+      `UPDATE sanctum_project_tasks SET due_date = NULL WHERE due_date = 0`,
+      `UPDATE sanctum_project_milestones SET due_date = NULL WHERE due_date = 0`,
+      `UPDATE sanctum_invoices SET due_date = NULL WHERE due_date = 0`,
+    ],
+  },
 ];
 
 export async function applyDataPatches(client: Client, log: (m: string) => void = () => {}): Promise<string[]> {

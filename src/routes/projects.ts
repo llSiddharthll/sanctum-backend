@@ -82,6 +82,7 @@ import {
   type ProjectFacts,
   type TaskFacts,
 } from '../authz/policies/projects.js';
+import { optionalDate } from '../lib/zod-dates.js';
 
 // mergeParams keeps any parent params available (none today, but consistent
 // with the other nested routers).
@@ -909,7 +910,7 @@ const createSchema = z.object({
       z.object({
         title: z.string().trim().min(1).max(200),
         description: z.string().trim().max(1000).optional(),
-        dueDate: z.coerce.date().optional(),
+        dueDate: optionalDate(),
       }),
     )
     .max(30)
@@ -1522,7 +1523,7 @@ const createTaskSchema = z.object({
   priority: z.enum(TASK_PRIORITIES).optional(),
   estimateMinutes: z.number().int().min(0).nullable().optional(),
   startDate: z.coerce.date().nullable().optional(),
-  dueDate: z.coerce.date().optional(),
+  dueDate: optionalDate(),
   parentTaskId: z.string().min(1).nullable().optional(),
   position: z.number().int().min(0).optional(),
 });
@@ -2678,7 +2679,7 @@ projectsRouter.get('/:id/milestones', requires('projects.view'), async (req, res
 const createMilestoneSchema = z.object({
   title: z.string().min(1).max(200),
   description: z.string().max(5000).optional(),
-  dueDate: z.coerce.date().optional(),
+  dueDate: optionalDate(),
   status: z.enum(MILESTONE_STATUSES).optional(),
   position: z.number().int().min(0).optional(),
 });

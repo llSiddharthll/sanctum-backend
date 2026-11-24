@@ -12,6 +12,7 @@ import { authorize, capabilities } from '../authz/engine.js';
 import { actorAuditId, type Actor } from '../authz/actor.js';
 import { requireInAgency } from '../authz/tenancy.js';
 import { expenseFactsOf, ownScopeFilter } from '../authz/policies/business.js';
+import { optionalDate } from '../lib/zod-dates.js';
 
 export const expensesRouter = Router();
 expensesRouter.use(authenticate);
@@ -110,8 +111,8 @@ const listQuery = z.object({
   category: z.enum(EXPENSE_CATEGORIES).optional(),
   projectId: z.string().optional(),
   clientId: z.string().optional(),
-  from: z.coerce.date().optional(),
-  to: z.coerce.date().optional(),
+  from: optionalDate(),
+  to: optionalDate(),
   search: z.string().optional(),
 });
 

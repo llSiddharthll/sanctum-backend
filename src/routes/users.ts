@@ -62,6 +62,7 @@ import {
 } from '../authz/roles-store.js';
 import { SCOPES, type SystemRoleKey } from '../authz/catalog.js';
 import { clientFacts, clientScopeFilter } from '../authz/policies/clients.js';
+import { optionalDate } from '../lib/zod-dates.js';
 
 export const usersRouter = Router();
 usersRouter.use(authenticate);
@@ -1019,7 +1020,7 @@ const createTimeLogSchema = z.object({
   minutes: z.number().int().positive(),
   projectId: z.string().min(1).optional(),
   taskId: z.string().min(1).optional(),
-  workDate: z.coerce.date().optional(),
+  workDate: optionalDate(),
   note: z.string().trim().max(2000).optional(),
 });
 

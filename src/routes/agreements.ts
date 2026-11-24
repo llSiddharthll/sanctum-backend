@@ -43,6 +43,7 @@ import {
   revokeDocumentLinks,
 } from '../authz/policies/business.js';
 import { generateAiAgreementDraft, enhanceTextWithAi } from '../services/ai.js';
+import { optionalDate } from '../lib/zod-dates.js';
 
 export const agreementsRouter = Router();
 
@@ -352,8 +353,8 @@ const createAgreementSchema = z.object({
   projectId: z.string().optional(),
   templateId: z.string().optional(),
   title: z.string().trim().min(1).max(200),
-  effectiveDate: z.coerce.date().optional(),
-  expirationDate: z.coerce.date().optional(),
+  effectiveDate: optionalDate(),
+  expirationDate: optionalDate(),
   retainerPaise: z.number().int().min(0).optional(),
   totalValuePaise: z.number().int().min(0).optional(),
   currency: z.string().trim().max(8).optional(),
@@ -583,7 +584,7 @@ const updateAgreementSchema = z.object({
   clientId: z.string().optional(),
   projectId: z.string().optional().nullable(),
   templateId: z.string().optional().nullable(),
-  effectiveDate: z.coerce.date().optional(),
+  effectiveDate: optionalDate(),
   expirationDate: z.coerce.date().optional().nullable(),
   retainerPaise: z.number().int().min(0).optional(),
   totalValuePaise: z.number().int().min(0).optional(),

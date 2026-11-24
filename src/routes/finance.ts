@@ -15,6 +15,7 @@ import { ok, param, toIso } from '../lib/http.js';
 import { authenticate, getStaffActor, requires } from '../authz/http.js';
 import { authorize, canOrg } from '../authz/engine.js';
 import { clientFacts } from '../authz/policies/clients.js';
+import { optionalDate } from '../lib/zod-dates.js';
 
 export const financeRouter = Router();
 financeRouter.use(authenticate);
@@ -25,8 +26,8 @@ financeRouter.use(authenticate);
  * financial year (Apr 1 -> Mar 31) when from/to are omitted.
  */
 const overviewQuery = z.object({
-  from: z.coerce.date().optional(),
-  to: z.coerce.date().optional(),
+  from: optionalDate(),
+  to: optionalDate(),
 });
 
 /** Current Indian FY window [Apr 1, next Apr 1). */

@@ -61,6 +61,7 @@ import {
   autoResetStalePunches,
   type CalendarDay,
 } from '../services/attendance.js';
+import { optionalDate } from '../lib/zod-dates.js';
 
 export const attendanceRouter = Router();
 attendanceRouter.use(authenticate);
@@ -760,8 +761,8 @@ const markSchema = z.object({
   status: z
     .enum(['present', 'late', 'half_day', 'absent', 'on_leave', 'holiday', 'weekly_off'])
     .optional(),
-  checkInAt: z.coerce.date().optional(),
-  checkOutAt: z.coerce.date().optional(),
+  checkInAt: optionalDate(),
+  checkOutAt: optionalDate(),
   note: z.string().trim().max(500).optional(),
 });
 

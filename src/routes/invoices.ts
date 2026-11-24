@@ -34,6 +34,7 @@ import {
   invoiceTransitionError,
   loadInvoice,
 } from '../authz/policies/business.js';
+import { optionalDate } from '../lib/zod-dates.js';
 
 export const invoicesRouter = Router();
 invoicesRouter.use(authenticate);
@@ -427,8 +428,8 @@ function prepareItems(agencyId: string, invoiceId: string, items: ItemInput[], i
 const createInvoiceSchema = z.object({
   clientId: z.string().min(1),
   projectId: z.string().optional(),
-  issueDate: z.coerce.date().optional(),
-  dueDate: z.coerce.date().optional(),
+  issueDate: optionalDate(),
+  dueDate: optionalDate(),
   isInterstate: z.boolean().default(false),
   currency: z.string().trim().max(8).default('INR'),
   notes: z.string().trim().max(2000).optional(),
@@ -518,7 +519,7 @@ invoicesRouter.get('/:id', requires('invoices.view'), async (req, res) => {
 // ---- RECORD PAYMENT ----
 const paymentSchema = z.object({
   amount: z.number().int().positive(), // paise
-  paidAt: z.coerce.date().optional(),
+  paidAt: optionalDate(),
   method: z.enum(['bank_transfer', 'upi', 'cash', 'card', 'cheque', 'other']).default('bank_transfer'),
   reference: z.string().trim().max(120).optional(),
   notes: z.string().trim().max(500).optional(),
@@ -587,7 +588,7 @@ invoicesRouter.post('/:id/payments', requires('invoices.record_payment'), async 
 const updateInvoiceSchema = z.object({
   clientId: z.string().min(1).optional(),
   projectId: z.string().nullable().optional(),
-  issueDate: z.coerce.date().optional(),
+  issueDate: optionalDate(),
   dueDate: z.coerce.date().nullable().optional(),
   isInterstate: z.boolean().optional(),
   currency: z.string().trim().max(8).optional(),

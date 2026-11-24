@@ -51,6 +51,7 @@ import {
   enhanceTextWithAi,
   generateMarketingProposal,
 } from '../services/ai.js';
+import { optionalDate } from '../lib/zod-dates.js';
 
 export const proposalsRouter = Router();
 
@@ -428,7 +429,7 @@ const proposalSchema = z.object({
   totalPaise: z.number().int().min(0).optional(),
   billingType: z.enum(['one_time', 'retainer']).optional(),
   recurringPaise: z.number().int().min(0).nullable().optional(),
-  validUntil: z.coerce.date().optional(),
+  validUntil: optionalDate(),
   content: z.record(z.string(), z.any()),
 });
 

@@ -26,6 +26,7 @@ import {
   subjectFacts,
   subjectScopeFilter,
 } from '../authz/policies/attendance.js';
+import { optionalDate } from '../lib/zod-dates.js';
 
 // Mounted under /attendance (which authenticates). Every route declares its
 // permission.
@@ -130,8 +131,8 @@ regularizationsRouter.get('/', requires('regularizations.view'), async (req, res
 const raiseSchema = z.object({
   day: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   type: z.enum(['missed_punch', 'late', 'short_hours', 'half_day', 'wrong_status']),
-  requestedCheckInAt: z.coerce.date().optional(),
-  requestedCheckOutAt: z.coerce.date().optional(),
+  requestedCheckInAt: optionalDate(),
+  requestedCheckOutAt: optionalDate(),
   requestedStatus: z.enum(['present', 'half_day', 'on_leave']).optional(),
   reason: z.string().trim().min(3).max(500),
 });
